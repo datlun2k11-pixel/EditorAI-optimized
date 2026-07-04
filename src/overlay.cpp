@@ -465,30 +465,134 @@ void exampleIdsWidget() {
     }
 }
 
-// Model field per provider: combo where mod.json constrains it (one-of),
-// free text otherwise. Free-text model edits auto-enable the char bypasses.
+// Model picker: a combo of presets PLUS a "custom..." entry. Picking a preset
+// writes it immediately; picking "custom..." (or already holding a value that
+// isn't a preset) reveals a text field so ANY model id can be typed. Gives
+// every provider both quick presets and free custom entry.
+void settingModelCombo(const char* id,
+                       const std::vector<const char*>& presets,
+                       const char* tip) {
+    std::string cur = editoraiGetStr(id);
+    bool curIsPreset = false;
+    for (auto* opt : presets) if (cur == opt) { curIsPreset = true; break; }
+    // "custom" sticky state: on once the value leaves the preset set, until a
+    // preset is picked again. Per-setting so switching provider resets it.
+    static std::unordered_map<std::string, bool> customMode;
+    bool& custom = customMode[id];
+    if (!cur.empty() && !curIsPreset) custom = true;
+
+    const char* preview = custom ? "custom..."
+                        : (cur.empty() ? "(none)" : cur.c_str());
+    ImGui::SetNextItemWidth(210.f);
+    if (ImGui::BeginCombo(fmt::format("model##{}", id).c_str(), preview)) {
+        for (auto* opt : presets) {
+            bool sel = !custom && cur == opt;
+            if (ImGui::Selectable(opt, sel)) { editoraiSetStr(id, opt); custom = false; }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::Separator();
+        if (ImGui::Selectable("custom...", custom)) custom = true;
+        ImGui::EndCombo();
+    }
+    tipIfHovered(tip);
+    if (custom)
+        settingText("custom id", id, "type any model id", false,
+                    "Any model id this provider accepts.", true);
+}
+
+// Ollama/Platinum model selector. A dropdown of the models the server
+// actually has (fetched live) instead of a text box — with a loading state,
+// an explicit "none available" message, and a Refresh button. Auto-fetches
+// the first time it's shown. A custom-tag text field stays available for
+// anyone pointing at a model the list doesn't surface.
+void ollamaModelSelector() {
+    static bool s_autoFetched = false;
+    if (!s_autoFetched) { s_autoFetched = true; editoraiRefreshOllamaModels(); }
+
+    bool platinum = editoraiGetBool("use-platinum");
+    std::vector<std::string> models;
+    int state = editoraiGetOllamaModels(models);   // 0 none,1 loading,2 empty,3 have,4 error
+    std::string cur = editoraiGetStr("ollama-model");
+
+    const char* preview = cur.empty() ? "(pick a model)" : cur.c_str();
+    ImGui::SetNextItemWidth(210.f);
+    if (ImGui::BeginCombo("model##ollama-model", preview)) {
+        if (state == 3) {
+            for (auto& m : models) {
+                bool sel = (cur == m);
+                if (ImGui::Selectable(m.c_str(), sel)) editoraiSetStr("ollama-model", m);
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+        } else {
+            ImGui::TextDisabled("%s",
+                state == 1 ? "loading..." :
+                state == 2 ? (platinum ? "no Platinum models available"
+                                       : "no local models installed") :
+                state == 4 ? "couldn't reach the server" :
+                             "tap Refresh to load");
+        }
+        ImGui::EndCombo();
+    }
+    tipIfHovered("Which model to run. The list is fetched live from the "
+                 "server - pick one, or type a custom tag below.");
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton(state == 1 ? "..." : "Refresh"))
+        editoraiRefreshOllamaModels();
+    tipIfHovered("Re-fetch the model list from the server.");
+
+    // Explicit empty/error line under the combo so it's visible without
+    // opening the dropdown.
+    if (state == 2)
+        ImGui::TextColored(COL_WARN, platinum
+            ? "No Platinum models available - the server may be down or idle."
+            : "No local models - run `ollama pull <model>` first.");
+    else if (state == 4)
+        ImGui::TextColored(COL_ERR, "Couldn't reach the server. Check it's "
+            "running, then Refresh.");
+
+    // Custom tag escape hatch (auto-bypass on, like other model fields).
+    settingText("custom tag", "ollama-model", "or type a model tag",
+                false, "Use any tag the server has, even if it's not in the "
+                "list above.", true);
+}
+
+// Model field per provider: preset combo + custom entry for hosted providers,
+// free text for local/BYOPAK. Free-text model edits auto-enable char bypasses.
 void providerModelWidget(const std::string& p) {
     const char* tip = "Which model this provider runs. Bigger = better "
-                      "levels, slower and pricier.";
+                      "levels, slower and pricier. Pick 'custom...' to type "
+                      "any model id.";
     if (p == "gemini")
-        settingCombo("model", "gemini-model", {"gemini-3-flash", "gemini-3-pro"}, tip);
+        settingModelCombo("gemini-model",
+            {"gemini-3-flash", "gemini-3-pro", "gemini-2.5-flash", "gemini-2.5-pro"}, tip);
     else if (p == "claude")
-        settingCombo("model", "claude-model", {"claude-sonnet-4-6", "claude-opus-4-6"}, tip);
+        settingModelCombo("claude-model",
+            {"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"}, tip);
     else if (p == "openai")
-        settingCombo("model", "openai-model", {"gpt-4o", "gpt-4.1-mini"}, tip);
+        settingModelCombo("openai-model",
+            {"gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini"}, tip);
     else if (p == "ministral")
-        settingCombo("model", "ministral-model",
+        settingModelCombo("ministral-model",
             {"ministral-3b-latest", "ministral-8b-latest", "mistral-small-latest",
              "mistral-medium-latest", "mistral-large-latest"}, tip);
     else if (p == "deepseek")
-        settingCombo("model", "deepseek-model",
+        settingModelCombo("deepseek-model",
             {"deepseek-chat", "deepseek-reasoner", "deepseek-coder"}, tip);
+    else if (p == "groq")
+        settingModelCombo("groq-model",
+            {"llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+             "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+             "moonshotai/kimi-k2-instruct"}, tip);
     else if (p == "huggingface")
-        settingText("model", "huggingface-model", "org/model-name", false, tip, true);
+        settingModelCombo("huggingface-model",
+            {"meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"}, tip);
     else if (p == "openrouter")
-        settingText("model", "openrouter-model", "vendor/model", false, tip, true);
+        settingModelCombo("openrouter-model",
+            {"google/gemini-2.5-flash", "anthropic/claude-sonnet-4",
+             "openai/gpt-4o", "meta-llama/llama-3.3-70b-instruct"}, tip);
     else if (p == "ollama")
-        settingText("model", "ollama-model", "entity12208/editorai:deepseek", false, tip, true);
+        ollamaModelSelector();
     else if (p == "lm-studio")
         settingText("model", "lm-studio-model", "default", false, tip, true);
     else if (p == "llama-cpp")
@@ -1053,10 +1157,11 @@ void composerBody(float dt) {
 void tabSettings() {
     static const std::vector<const char*> PROVIDERS = {
         "gemini", "claude", "openai", "openrouter", "ministral",
-        "huggingface", "deepseek", "ollama", "lm-studio", "llama-cpp", "custom", "manual"};
+        "huggingface", "deepseek", "groq", "ollama", "lm-studio", "llama-cpp",
+        "custom", "manual"};
     static const std::vector<const char*> SUB_PROVIDERS = {
         "", "gemini", "claude", "openai", "openrouter", "ministral",
-        "huggingface", "deepseek", "ollama", "lm-studio", "llama-cpp"};
+        "huggingface", "deepseek", "groq", "ollama", "lm-studio", "llama-cpp"};
 
     ImGui::BeginChild("settingsScroll", ImVec2(0, 0));
 
@@ -1130,19 +1235,38 @@ void tabSettings() {
         settingInt("max objects", "max-objects", 10, 1000000,
             "Hard ceiling on objects per generation. Higher = more detail, "
             "slower spawning.", ImGuiSliderFlags_Logarithmic);
+        exampleIdsWidget();
+        settingToggle("compact prompts (cheaper)", "compact-prompts",
+            "Sends a ~3 KB prompt instead of ~60 KB. Cheaper and faster; "
+            "the full prompt knows more object names.");
+    }
+
+    if (ImGui::CollapsingHeader("Placement & Editor")) {
+        settingToggle("live block placement", "live-placement",
+            "Blocks appear in the editor as the AI produces each round - "
+            "you watch the level grow instead of waiting for the end. "
+            "Accept/Deny still reviews the whole build when it finishes.");
         settingInt("spawn speed", "spawn-batch-size", 1, 100,
             "Ghost objects placed per tick while a blueprint appears. "
             "Higher = faster, choppier on weak devices.");
         settingInt("ground Y", "ai-ground-y", 15, 300,
             "The Y coordinate the AI treats as ground level (GD default 105).");
-        exampleIdsWidget();
-        settingToggle("compact prompts (cheaper)", "compact-prompts",
-            "Sends a ~3 KB prompt instead of ~60 KB. Cheaper and faster; "
-            "the full prompt knows more object names.");
+        settingInt("edit workload target", "edit-target-ops", 0, 5000,
+            "When the AI reworks an existing level it must total at least "
+            "this many edits (objects moved + deleted + restyled + added) - "
+            "it is asked to continue until it gets there. Small follow-up "
+            "tweaks (under 30 edits) stage immediately. 0 = off.");
+    }
+
+    if (ImGui::CollapsingHeader("AI Behavior")) {
         settingToggle("AI tools (search, level fetch, analysis)", "enable-ai-tools",
             "Lets the AI call tools mid-generation: web search, downloading "
-            "reference levels, physics simulation, passability checks. The AI "
-            "runs as many tool rounds as it needs - there is no limit.");
+            "reference levels, physics simulation, passability checks, song "
+            "BPM/waveform analysis, scratch memory, and self-set goals. The "
+            "AI runs as many tool rounds as it needs - there is no limit.");
+        settingToggle("show AI goal & tasks", "show-goal-tasks",
+            "When the AI sets itself a goal (set_goal tool), mirror its goal "
+            "and task checklist in the status line and session log.");
         settingInt("refinement rounds", "refinement-rounds", 0, 10,
             "Extra self-review passes after the first draft. More rounds = "
             "better quality, more tokens.");
@@ -1159,17 +1283,15 @@ void tabSettings() {
             "Image-capable models (Claude, Gemini, GPT-4o, LLaVA...) get a "
             "rendered snapshot of the level on review and follow-up turns - "
             "they fix what they can SEE, not just coordinates.");
-        settingInt("edit workload target", "edit-target-ops", 0, 5000,
-            "When the AI reworks an existing level it must total at least "
-            "this many edits (objects moved + deleted + restyled + added) - "
-            "it is asked to continue until it gets there. Small follow-up "
-            "tweaks (under 30 edits) stage immediately. 0 = off.");
-    }
-
-    if (ImGui::CollapsingHeader("Workflow")) {
         settingToggle("copilot mode (auto-fix while editing)", "copilot-mode",
             "While you edit, the AI watches for impossible sections and "
             "proposes fixes when the editor goes idle.");
+    }
+
+    if (ImGui::CollapsingHeader("Workflow")) {
+        settingToggle("check for updates", "check-updates",
+            "Once a day, check GitHub for a newer EditorAI release and offer "
+            "a one-click install. Nothing installs without confirmation.");
         settingToggle("rate generations", "enable-rating",
             "Ask for a 1-10 rating after each generation. Ratings become "
             "few-shot examples that teach the AI your taste.");
@@ -1184,6 +1306,9 @@ void tabSettings() {
             "fire two API calls.");
         settingInt("rate limit (s)", "rate-limit-seconds", 1, 60,
             "Seconds between allowed generations.");
+    }
+
+    if (ImGui::CollapsingHeader("Privacy")) {
         settingToggle("auto-share generations (opt-in telemetry)", "allow-telemetry",
             "While ON, EVERY generation uploads automatically to the "
             "community training collector: prompt + settings + objects + "
@@ -1386,18 +1511,47 @@ void drawOverlay() {
         g_keyCapture   = false;          // never leave a capture armed
     }
 
-    // Header strip: running indicator.
-    int running = 0;
-    for (auto& s : genSessions())
-        if (s && s->state == GenSession::State::Running) ++running;
-    if (running > 0)
-        ImGui::TextColored(COL_WARN, "%d generation%s running",
-                           running, running == 1 ? "" : "s");
-    else if (uiMobile())
-        ImGui::TextColored(COL_DIM, "idle  -  the AI bubble or X hides this panel");
-    else
-        ImGui::TextColored(COL_DIM, "idle  -  %s hides this panel",
-                           keySeqDisplayName(overlayToggleSeq()).c_str());
+    // ── Header bar: status beacon + state text + right-aligned hide hint ──
+    {
+        int running = 0;
+        for (auto& s : genSessions())
+            if (s && s->state == GenSession::State::Running) ++running;
+
+        // Status beacon: steady dim dot when idle, pulsing warm dot while
+        // generating — readable at a glance without parsing any text.
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float  h = ImGui::GetTextLineHeight();
+        float  r = h * 0.32f;
+        ImU32  dotCol;
+        if (running > 0) {
+            float pulse = 0.55f + 0.45f * std::sin((float)ImGui::GetTime() * 4.f);
+            dotCol = ImGui::GetColorU32(ImVec4(COL_WARN.x, COL_WARN.y,
+                                               COL_WARN.z, pulse));
+        } else {
+            dotCol = ImGui::GetColorU32(ImVec4(COL_DIM.x, COL_DIM.y,
+                                               COL_DIM.z, 0.9f));
+        }
+        ImGui::GetWindowDrawList()->AddCircleFilled(
+            ImVec2(p.x + r + 1.f, p.y + h * 0.55f), r, dotCol);
+        ImGui::Dummy(ImVec2(r * 2.f + 7.f, h));
+        ImGui::SameLine(0.f, 4.f);
+
+        if (running > 0)
+            ImGui::TextColored(COL_WARN, "%d generation%s running",
+                               running, running == 1 ? "" : "s");
+        else
+            ImGui::TextColored(COL_DIM, "idle");
+
+        // Right-aligned dismiss hint, out of the reading path.
+        std::string hint = uiMobile()
+            ? std::string("bubble / X hides")
+            : fmt::format("{} hides", keySeqDisplayName(overlayToggleSeq()));
+        float hw = ImGui::CalcTextSize(hint.c_str()).x;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.f,
+                                 ImGui::GetContentRegionMax().x - hw));
+        ImGui::TextColored(ImVec4(COL_DIM.x, COL_DIM.y, COL_DIM.z, 0.65f),
+                           "%s", hint.c_str());
+    }
 
     if (ImGui::BeginTabBar("##tabs")) {
         if (ImGui::BeginTabItem("Chat")) {
@@ -1499,17 +1653,29 @@ class $modify(EAIOverlayKeys, CCKeyboardDispatcher) {
 static void editoraiOverlaySetup() {
     ImGuiCocos::get().setup([] {
         auto& style = ImGui::GetStyle();
-        style.FrameRounding     = 5.f;
-        style.WindowRounding    = 8.f;
-        style.ChildRounding     = 8.f;
-        style.PopupRounding     = 6.f;
-        style.GrabRounding      = 4.f;
-        style.TabRounding       = 5.f;
-        style.ScrollbarRounding = 8.f;
-        style.ScrollbarSize     = 12.f;
-        style.FramePadding      = ImVec2(8, 5);
-        style.ItemSpacing       = ImVec2(8, 7);
-        style.WindowPadding     = ImVec2(12, 10);
+        // Card-like chrome: generous rounding, soft padding, no hard borders.
+        style.FrameRounding     = 6.f;
+        style.WindowRounding    = 12.f;
+        style.ChildRounding     = 10.f;
+        style.PopupRounding     = 8.f;
+        style.GrabRounding      = 6.f;
+        style.TabRounding       = 6.f;
+        style.ScrollbarRounding = 10.f;
+        style.ScrollbarSize     = 11.f;
+        style.FramePadding      = ImVec2(10, 6);
+        style.ItemSpacing       = ImVec2(10, 8);
+        style.ItemInnerSpacing  = ImVec2(8, 6);
+        style.WindowPadding     = ImVec2(14, 12);
+        style.CellPadding       = ImVec2(8, 5);
+        style.GrabMinSize       = 12.f;
+        style.WindowTitleAlign  = ImVec2(0.5f, 0.5f);
+        style.SeparatorTextBorderSize = 2.f;
+        style.SeparatorTextPadding    = ImVec2(18, 2);
+        style.WindowBorderSize  = 0.f;
+        style.ChildBorderSize   = 1.f;
+        style.PopupBorderSize   = 0.f;
+        style.FrameBorderSize   = 0.f;
+        style.TabBarBorderSize  = 0.f;
         // Colors come from applyThemeFrame() every frame (user-tunable).
     }).draw([] {
         drawOverlay();

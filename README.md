@@ -33,6 +33,7 @@ For hosted providers, pick one and either press **Sign in with browser** (OpenRo
 | OpenAI | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | Mistral | [console.mistral.ai](https://console.mistral.ai/api-keys/) |
 | DeepSeek | [platform.deepseek.com](https://platform.deepseek.com) |
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) *(free tier, fastest inference)* |
 | Gemini | [aistudio.google.com](https://aistudio.google.com/api-keys) *(tight rate limits)* |
 
 LM Studio, llama.cpp, and any OpenAI-compatible endpoint work too — point the URL at your server.
@@ -43,11 +44,13 @@ LM Studio, llama.cpp, and any OpenAI-compatible endpoint work too — point the 
 2. Pick a target: the current editor, a brand-new level, or any of your created levels
 3. Describe what you want, set difficulty/style/length (or type your own), press **Generate**
 4. Watch it think and work live in **Sessions** — you can close the panel, or even the editor, while it runs
-5. The result appears on its own editor layer (the rest of the level fades back): **Accept**, **Edit**, or **Deny**
+5. With **live block placement** (default on) blocks appear in the editor while the AI is still building; the result lands on its own editor layer (the rest of the level fades back): **Accept**, **Edit**, or **Deny**
 6. Keep talking to it in Sessions to refine, plan, or just ask questions
 7. Rate generations when asked — your ratings teach the AI your taste over time
 
 Every option in the panel has a hover tooltip explaining what it does.
+
+While it works, the AI can analyze your level's **song** (BPM + waveform) to sync gameplay to the music, keep **scratch memory** between generations, and set itself a **goal with a task checklist** that it grinds through until done — watch the checklist tick off in the status line and session log.
 
 ## Fine-tune your own model
 

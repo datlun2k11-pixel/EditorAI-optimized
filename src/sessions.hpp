@@ -144,6 +144,15 @@ bool editoraiIsGDTextInputActive();
 //         >= 0 = index into the local-levels list below.
 struct LocalLevelInfo { std::string name; int objectCount = 0; };
 std::vector<LocalLevelInfo> editoraiListLocalLevels();
+
+// Ollama/Platinum model list for the overlay's provider selector. Fills `out`
+// with the available model tags and returns a state code:
+//   0 = not fetched yet   1 = loading   2 = fetched, none available
+//   3 = have models       4 = fetch error
+// The URL follows the current Platinum/local toggle. Call the refresh function
+// to (re)fetch; it's a no-op while one is already in flight.
+int  editoraiGetOllamaModels(std::vector<std::string>& out);
+void editoraiRefreshOllamaModels();
 // Starts (or queues) a generation against the chosen target. Opens the
 // editor scene when needed; generation begins once the editor is ready.
 // Returns false with a human-readable reason in err. For target >= 0 pass

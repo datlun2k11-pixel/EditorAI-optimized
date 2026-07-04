@@ -13,7 +13,7 @@ Open the panel, go to <cy>Settings</c>, and choose a provider. Two are free with
 - <cy>Platinum</c> (free, community-run — servers by VLT GG): set provider to <cg>ollama</c> and enable <cg>Use Platinum</c>. Prompts run on volunteer machines, so keep personal info out of them.
 - <cy>Ollama</c> (free, fully local): install Ollama, pull a model, set provider to <cg>ollama</c>. Nothing leaves your machine.
 
-For hosted providers (Claude, OpenAI, Mistral, DeepSeek, Gemini, and more), paste an API key — or use the <cg>Sign in with browser</c> button for OpenRouter and HuggingFace, no key-copying needed.
+For hosted providers (Claude, OpenAI, Mistral, DeepSeek, Groq, Gemini, and more), paste an API key — or use the <cg>Sign in with browser</c> button for OpenRouter and HuggingFace, no key-copying needed.
 
 ## Use it
 

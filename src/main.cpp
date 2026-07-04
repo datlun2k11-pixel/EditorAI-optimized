@@ -14,6 +14,9 @@
 // macOS/iOS and fails to link there.
 #include <Geode/cocos/support/zip_support/ZipUtils.h>
 #include <Geode/utils/base64.hpp>
+#include <Geode/fmod/fmod.hpp>
+#include <filesystem>
+#include <fstream>
 #include <span>
 // ── BEGIN inlined headers (formerly src/json_lenient.hpp, src/example_sections_data.hpp, src/tool_use.hpp) ─────────
 // Lenient JSON parser for AI output.
@@ -789,7 +792,7 @@ namespace toolUse {
 // in AIGeneratorPopup::doToolRound for the structural runaway guards.
 
 // Tools the AI can call. Anything outside this list is rejected during dispatch.
-inline constexpr std::array<std::string_view, 12> KNOWN_TOOL_NAMES = {
+inline constexpr std::array<std::string_view, 24> KNOWN_TOOL_NAMES = {
     "web_search",
     "download_level",
     "search_newgrounds",
@@ -802,7 +805,36 @@ inline constexpr std::array<std::string_view, 12> KNOWN_TOOL_NAMES = {
     "simulate_physics",
     "ask_subagent",
     "get_level_region",
+    // Music sync
+    "get_bpm",
+    "get_waveform",
+    // Editor facts
+    "get_ground_y",
+    // Scratch memory
+    "save_memory",
+    "get_memory",
+    // Goal / task agenda
+    "set_goal",
+    "task_add",
+    "task_get",
+    "task_mark",
+    "task_unmark",
+    "verify",
+    "goal_done",
 };
+
+// ── AI scratch memory ────────────────────────────────────────────────────────
+// Session-scoped key→value store for save_memory / get_memory. Survives
+// across generations within one game session (never written to disk), so the
+// model can carry style notes or measurements between prompts. Capped hard —
+// this rides inside tool results, i.e. inside the context window.
+inline std::vector<std::pair<std::string, std::string>>& scratchMemory() {
+    static std::vector<std::pair<std::string, std::string>> mem;
+    return mem;
+}
+inline constexpr size_t MEMORY_MAX_ENTRIES = 40;
+inline constexpr size_t MEMORY_MAX_KEY     = 64;
+inline constexpr size_t MEMORY_MAX_VALUE   = 2000;
 
 // ── JSON schema for the tool catalog ─────────────────────────────────────────
 // Returned in OpenAI-compatible "tools" array form. Claude/Gemini have
@@ -955,6 +987,109 @@ inline matjson::Value buildToolCatalog() {
          {"x_end",   {"integer", "Right edge of the X range."}}},
         {"x_start", "x_end"}
     ));
+    arr.push(openAIToolSchema(
+        "get_bpm",
+        "Analyze the level's current song (decoded locally) and return its "
+        "estimated BPM, confidence, first-beat offset, and the exact X-unit "
+        "spacing of one beat at 1x speed. Call this BEFORE building if you "
+        "want gameplay synced to the music — put hazards/orbs on beat "
+        "multiples of the returned beat_spacing_x.",
+        {},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "get_waveform",
+        "Text waveform of the level's song: one digit (0-9) per 0.1s of "
+        "loudness, 10s per row, with each row's starting X coordinate at 1x "
+        "speed plus the strongest sync points (drops/kicks) as t→X pairs. "
+        "Use it to place drops, speed changes, and calm sections exactly "
+        "where the music does. Max 60s per call — call again with a later "
+        "start_sec for longer songs.",
+        {{"start_sec",    {"number", "Song time to start at (default 0)."}},
+         {"duration_sec", {"number", "Seconds to render, 5-60 (default 30)."}}},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "get_ground_y",
+        "Return the exact ground Y coordinate objects should stand on (the "
+        "user can reconfigure it), plus the 30-unit grid rules. Use this "
+        "instead of assuming Y=105.",
+        {},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "save_memory",
+        "Save a note to your scratch memory under a key (overwrites the same "
+        "key). Memory survives across generations this game session — use it "
+        "for style decisions, measurements, or plans you'll need later. Keys "
+        "≤64 chars, values ≤2000 chars, 40 entries max.",
+        {{"key",   {"string", "Short identifier, e.g. 'theme' or 'part2-plan'."}},
+         {"value", {"string", "The note to store."}}},
+        {"key", "value"}
+    ));
+    arr.push(openAIToolSchema(
+        "get_memory",
+        "Read your scratch memory: pass a key for one entry, or omit it to "
+        "list every stored key with its value.",
+        {{"key", {"string", "Key to read (omit for all entries)."}}},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "set_goal",
+        "Set a working goal and start a goal loop: after each of your "
+        "answers the mod will prompt you to CONTINUE working until you call "
+        "goal_done (or the safety cap trips). Optionally seed the task list "
+        "(one task per line in 'tasks'). Use task_add/task_mark to manage "
+        "tasks, verify to self-check, then goal_done to finish.",
+        {{"goal",  {"string", "One sentence describing the finished state."}},
+         {"tasks", {"string", "Optional initial tasks, one per line."}}},
+        {"goal"}
+    ));
+    arr.push(openAIToolSchema(
+        "task_add",
+        "Insert a task into the goal task list at the given position "
+        "(omit index to append). Returns the updated numbered list.",
+        {{"text",  {"string",  "The task description."}},
+         {"index", {"integer", "0-based insert position (default: end)."}}},
+        {"text"}
+    ));
+    arr.push(openAIToolSchema(
+        "task_get",
+        "Read the goal task list: pass an index for one task, omit it for "
+        "the whole numbered list with completion marks.",
+        {{"index", {"integer", "0-based task index (omit for all)."}}},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "task_mark",
+        "Mark a task complete by index. Returns the updated list.",
+        {{"index", {"integer", "0-based task index."}}},
+        {"index"}
+    ));
+    arr.push(openAIToolSchema(
+        "task_unmark",
+        "Re-open a task (mark it NOT complete) by index.",
+        {{"index", {"integer", "0-based task index."}}},
+        {"index"}
+    ));
+    arr.push(openAIToolSchema(
+        "verify",
+        "Self-verification brief for a task (or the whole goal if index is "
+        "omitted): returns the task text alongside LIVE level measurements "
+        "(length, object count, passability). Confirm against those numbers "
+        "— if the work isn't actually done, task_unmark it and fix it before "
+        "calling goal_done.",
+        {{"index", {"integer", "0-based task index (omit to verify the goal)."}}},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "goal_done",
+        "End the goal loop: call ONLY when every task is marked complete and "
+        "verify confirms the level matches the goal. Your next message "
+        "should be the final answer.",
+        {{"summary", {"string", "One-line summary of what was accomplished."}}},
+        {}
+    ));
     // (No "think" tool: reasoning belongs in plain assistant text, which the
     // overlay streams to the user live. A think tool just burned rounds.)
     return arr;
@@ -1013,7 +1148,7 @@ inline bool supportsToolUse(const std::string& provider) {
     return provider == "openai"     || provider == "ministral"  ||
            provider == "huggingface"|| provider == "openrouter" ||
            provider == "deepseek"   || provider == "lm-studio"  ||
-           provider == "llama-cpp"  ||
+           provider == "llama-cpp"  || provider == "groq"       ||
            provider == "claude"     ||
            provider == "gemini"     ||
            provider == "ollama";
@@ -1045,7 +1180,8 @@ inline bool isOpenAICompat(const std::string& provider) {
     return provider == "openai"     || provider == "ministral"  ||
            provider == "huggingface"|| provider == "openrouter" ||
            provider == "deepseek"   || provider == "lm-studio"  ||
-           provider == "llama-cpp"  || provider == "ollama";
+           provider == "llama-cpp"  || provider == "ollama"     ||
+           provider == "groq";
 }
 
 // Which token-limit field each OpenAI-compatible provider accepts, and how
@@ -1101,6 +1237,7 @@ inline std::string urlFor(const std::string& provider, const std::string& model)
     if (provider == "huggingface") return "https://router.huggingface.co/v1/chat/completions";
     if (provider == "openrouter")  return "https://openrouter.ai/api/v1/chat/completions";
     if (provider == "deepseek")    return "https://api.deepseek.com/v1/chat/completions";
+    if (provider == "groq")        return "https://api.groq.com/openai/v1/chat/completions";
     if (provider == "lm-studio") {
         std::string base = geode::Mod::get()->getSettingValue<std::string>("lm-studio-url");
         return base + "/v1/chat/completions";
@@ -1835,6 +1972,7 @@ inline ParsedResponse parseResponse(const std::string& provider,
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/EditorPauseLayer.hpp>
 #include <Geode/modify/CCTextInputNode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/utils/web.hpp>
@@ -2432,6 +2570,7 @@ static std::string makeErrorCode(const std::string& provider, int category, int 
     else if (provider == "lm-studio")   p = 'S';
     else if (provider == "llama-cpp")   p = 'Y';
     else if (provider == "openrouter")  p = 'R';
+    else if (provider == "groq")        p = 'Q';   // G is taken by Gemini
     else if (provider == "custom")      p = 'U';   // U for User-defined
     return fmt::format("EAI-{}{:02d}{:02d}", p, category, specific);
 }
@@ -2613,6 +2752,7 @@ static std::string getProviderApiKey(const std::string& provider) {
     if (provider == "huggingface")  return Mod::get()->getSettingValue<std::string>("huggingface-api-key");
     if (provider == "openrouter")   return Mod::get()->getSettingValue<std::string>("openrouter-api-key");
     if (provider == "deepseek")     return Mod::get()->getSettingValue<std::string>("deepseek-api-key");
+    if (provider == "groq")         return Mod::get()->getSettingValue<std::string>("groq-api-key");
     if (provider == "custom")       return Mod::get()->getSettingValue<std::string>("custom-provider-api-key");
     return ""; // ollama / local — no key needed
 }
@@ -2628,6 +2768,7 @@ static std::string getProviderModel(const std::string& provider) {
     if (provider == "llama-cpp")    return Mod::get()->getSettingValue<std::string>("llama-cpp-model");
     if (provider == "openrouter")   return Mod::get()->getSettingValue<std::string>("openrouter-model");
     if (provider == "deepseek")     return Mod::get()->getSettingValue<std::string>("deepseek-model");
+    if (provider == "groq")         return Mod::get()->getSettingValue<std::string>("groq-model");
     if (provider == "custom")       return Mod::get()->getSettingValue<std::string>("custom-provider-model");
     return "unknown";
 }
@@ -2812,7 +2953,8 @@ static void applyProviderAuth(web::WebRequest& req,
         req.header("x-api-key", apiKey);
         req.header("anthropic-version", "2023-06-01");
     } else if (provider == "openai"     || provider == "ministral" ||
-               provider == "huggingface"|| provider == "deepseek")
+               provider == "huggingface"|| provider == "deepseek"  ||
+               provider == "groq")
     {
         req.header("Authorization", fmt::format("Bearer {}", apiKey));
     } else if (provider == "openrouter") {
@@ -2901,6 +3043,214 @@ static float getGroundY() {
 // has a concrete duration to hit. The enforcement loop in runToolLoop rejects
 // final answers shorter than target_min and asks the AI for more.
 static constexpr float GD_PLAYER_SPEED_1X = 311.58f;
+
+// ─── Song analysis (BPM + waveform) ─────────────────────────────────────────
+// Decodes the level's song through GD's own FMOD instance and derives a
+// low-rate loudness envelope, an onset-autocorrelation BPM estimate, and a
+// 10 Hz envelope for the text waveform the AI reads. One decode per song per
+// game session — everything downstream reads the cache.
+namespace songsync {
+
+struct Analysis {
+    bool        ok = false;
+    std::string err;
+    std::string songName;
+    float       bpm         = 0.f;   // 0 = undetermined
+    float       confidence  = 0.f;   // peak/mean autocorrelation ratio
+    float       firstBeatSec = 0.f;  // phase of the beat grid
+    float       durationSec = 0.f;   // analyzed duration (capped at 6 min)
+    std::vector<float> env10;        // 10 Hz loudness envelope, normalized 0..1
+};
+
+// Resolve the current level's song to a decodable file path.
+inline std::string songPathFor(GJGameLevel* level, std::string& nameOut) {
+    if (!level) return "";
+    int sid = level->m_songID;
+    if (sid > 0) {
+        auto* mdm = MusicDownloadManager::sharedState();
+        nameOut = fmt::format("Newgrounds song {}", sid);
+        if (auto* info = mdm->getSongInfoObject(sid))
+            if (!info->m_songName.empty()) nameOut = info->m_songName;
+        std::string p = mdm->pathForSong(sid);
+        if (!p.empty() && std::filesystem::exists(p)) return p;
+        return "";  // not downloaded yet
+    }
+    int track = level->m_audioTrack;
+    nameOut = LevelTools::getAudioTitle(track);
+    std::string fname = LevelTools::getAudioFileName(track);
+    if (fname.empty()) return "";
+    auto full = CCFileUtils::sharedFileUtils()->fullPathForFilename(fname.c_str(), false);
+    return std::string(full);
+}
+
+inline Analysis analyzeFile(const std::string& path, const std::string& name) {
+    Analysis a;
+    a.songName = name;
+
+    auto* engine = FMODAudioEngine::sharedEngine();
+    if (!engine || !engine->m_system) { a.err = "FMOD engine unavailable"; return a; }
+
+    FMOD::Sound* snd = nullptr;
+    FMOD_RESULT fr = engine->m_system->createSound(
+        path.c_str(), FMOD_OPENONLY | FMOD_CREATESTREAM | FMOD_ACCURATETIME,
+        nullptr, &snd);
+    if (fr != FMOD_OK || !snd) {
+        a.err = fmt::format("FMOD couldn't open the song file (code {})", (int)fr);
+        return a;
+    }
+
+    FMOD_SOUND_TYPE   stype;
+    FMOD_SOUND_FORMAT sfmt;
+    int channels = 0, bits = 0;
+    snd->getFormat(&stype, &sfmt, &channels, &bits);
+    float freq = 44100.f;
+    snd->getDefaults(&freq, nullptr);
+    unsigned int pcmLen = 0;
+    snd->getLength(&pcmLen, FMOD_TIMEUNIT_PCM);
+    if (channels < 1 || channels > 8 || freq < 8000.f || pcmLen == 0) {
+        snd->release();
+        a.err = "song has an unusable format";
+        return a;
+    }
+    bool isFloat = (sfmt == FMOD_SOUND_FORMAT_PCMFLOAT);
+    if (!isFloat && sfmt != FMOD_SOUND_FORMAT_PCM16) {
+        snd->release();
+        a.err = fmt::format("unsupported PCM format ({} bits)", bits);
+        return a;
+    }
+
+    // RMS envelope at ~43 Hz (1024-sample hops), capped at 6 minutes.
+    constexpr unsigned HOP = 1024;
+    const unsigned maxFrames =
+        (unsigned)std::min<double>((double)pcmLen, 360.0 * freq);
+    std::vector<float> env;
+    env.reserve(maxFrames / HOP + 1);
+    std::vector<char> buf(HOP * channels * (isFloat ? 4 : 2));
+    unsigned done = 0;
+    while (done < maxFrames) {
+        unsigned want  = std::min<unsigned>(HOP, maxFrames - done);
+        unsigned bytes = 0;
+        fr = snd->readData(buf.data(),
+                           want * channels * (isFloat ? 4u : 2u), &bytes);
+        unsigned frames = bytes / (channels * (isFloat ? 4u : 2u));
+        if (frames == 0) break;
+        double acc = 0;
+        for (unsigned i = 0; i < frames; ++i) {
+            double s = 0;
+            for (int c = 0; c < channels; ++c) {
+                s += isFloat
+                    ? (double)reinterpret_cast<float*>(buf.data())[i * channels + c]
+                    : (double)reinterpret_cast<int16_t*>(buf.data())[i * channels + c] / 32768.0;
+            }
+            s /= channels;
+            acc += s * s;
+        }
+        env.push_back((float)std::sqrt(acc / frames));
+        done += frames;
+        if (fr == FMOD_ERR_FILE_EOF || fr != FMOD_OK) break;
+    }
+    snd->release();
+
+    if (env.size() < 64) { a.err = "song too short to analyze"; return a; }
+    const float frameRate = freq / (float)HOP;
+    a.durationSec = env.size() / frameRate;
+
+    // Onset strength: half-wave-rectified energy flux.
+    std::vector<float> flux(env.size(), 0.f);
+    for (size_t i = 1; i < env.size(); ++i)
+        flux[i] = std::max(0.f, env[i] - env[i - 1]);
+
+    // Autocorrelate the flux over the 60–200 BPM lag range, with harmonic
+    // support (half/double tempo) folded into each candidate's score.
+    const int lagMin = std::max(2, (int)(frameRate * 60.f / 200.f));
+    const int lagMax = std::min((int)env.size() / 2, (int)(frameRate * 60.f / 60.f));
+    auto corrAt = [&](int lag) -> double {
+        if (lag < 2 || lag >= (int)flux.size() - 1) return 0.0;
+        double s = 0;
+        for (size_t i = 0; i + lag < flux.size(); ++i) s += flux[i] * flux[i + lag];
+        return s / (double)(flux.size() - lag);
+    };
+    double bestScore = 0, meanScore = 0;
+    int bestLag = 0, counted = 0;
+    for (int lag = lagMin; lag <= lagMax; ++lag) {
+        double sc = corrAt(lag) + 0.5 * corrAt(lag * 2) + 0.5 * corrAt(lag / 2);
+        meanScore += sc; ++counted;
+        if (sc > bestScore) { bestScore = sc; bestLag = lag; }
+    }
+    if (bestLag > 0 && counted > 0) {
+        meanScore /= counted;
+        a.bpm = 60.f * frameRate / (float)bestLag;
+        // Fold into the 70–190 range GD songs actually occupy.
+        while (a.bpm < 70.f)  a.bpm *= 2.f;
+        while (a.bpm > 190.f) a.bpm /= 2.f;
+        a.confidence = meanScore > 0 ? (float)(bestScore / meanScore) : 0.f;
+
+        // Beat phase: pick the grid offset that catches the most onset energy
+        // over the first ~40 s.
+        int lag = (int)std::round(60.f * frameRate / a.bpm);
+        int window = std::min((int)flux.size(), (int)(frameRate * 40.f));
+        double bestPhaseScore = -1; int bestPhase = 0;
+        for (int ph = 0; ph < lag && ph < window; ++ph) {
+            double s = 0;
+            for (int i = ph; i < window; i += lag) s += flux[i];
+            if (s > bestPhaseScore) { bestPhaseScore = s; bestPhase = ph; }
+        }
+        a.firstBeatSec = bestPhase / frameRate;
+    }
+
+    // 10 Hz envelope for the text waveform: bucket-max, then normalize by
+    // the 98th percentile so one loud transient doesn't flatten the rest.
+    const float perBucket = frameRate / 10.f;
+    a.env10.reserve((size_t)(env.size() / perBucket) + 1);
+    for (float pos = 0; pos + perBucket <= (float)env.size(); pos += perBucket) {
+        float m = 0;
+        for (int i = (int)pos; i < (int)(pos + perBucket) && i < (int)env.size(); ++i)
+            m = std::max(m, env[i]);
+        a.env10.push_back(m);
+    }
+    if (!a.env10.empty()) {
+        auto sorted = a.env10;
+        std::sort(sorted.begin(), sorted.end());
+        float norm = sorted[(size_t)(sorted.size() * 0.98f)];
+        if (norm <= 0.0001f) norm = sorted.back();
+        if (norm > 0)
+            for (auto& v : a.env10) v = std::min(1.f, v / norm);
+    }
+
+    a.ok = true;
+    return a;
+}
+
+// Cached per-path analysis. GD sessions touch a handful of songs at most.
+inline Analysis& analyzeLevelSong(GJGameLevel* level) {
+    static std::unordered_map<std::string, Analysis> cache;
+    static Analysis missing;
+    std::string name;
+    std::string path = songPathFor(level, name);
+    if (path.empty()) {
+        missing = {};
+        missing.err = level && level->m_songID > 0
+            ? fmt::format("song {} isn't downloaded — play the level once or "
+                          "download it in the song browser", level->m_songID)
+            : "no song file found for this level";
+        missing.songName = name;
+        return missing;
+    }
+    auto it = cache.find(path);
+    if (it == cache.end()) {
+        log::info("songsync: analyzing '{}' ({})", name, path);
+        it = cache.emplace(path, analyzeFile(path, name)).first;
+        if (it->second.ok)
+            log::info("songsync: '{}' bpm={:.1f} conf={:.2f} dur={:.0f}s",
+                      name, it->second.bpm, it->second.confidence,
+                      it->second.durationSec);
+        else
+            log::warn("songsync: '{}' failed: {}", name, it->second.err);
+    }
+    return it->second;
+}
+
+} // namespace songsync
 
 struct LengthTarget {
     const char* label;
@@ -6849,6 +7199,7 @@ static const char* providerModelSettingKey(const std::string& p) {
     if (p == "huggingface") return "huggingface-model";
     if (p == "openrouter")  return "openrouter-model";
     if (p == "deepseek")    return "deepseek-model";
+    if (p == "groq")        return "groq-model";
     if (p == "ollama")      return "ollama-model";
     if (p == "lm-studio")   return "lm-studio-model";
     if (p == "llama-cpp")   return "llama-cpp-model";
@@ -6876,6 +7227,8 @@ protected:
     std::vector<TextRow>  m_texts;
     std::vector<IntRow>   m_ints;
     std::vector<CycleRow> m_cycles;
+    // (title, description) per (i) info button, indexed by button tag.
+    std::vector<std::pair<std::string, std::string>> m_rowInfos;
 
     // Provider-tab OAuth flow state (PKCE — HuggingFace only).
     std::unique_ptr<oauth::LocalCallback> m_pkceListener;
@@ -6884,6 +7237,11 @@ protected:
     float       m_pkceElapsed = 0.f;  // seconds since the browser was opened
     async::TaskHolder<web::WebResponse> m_authNet;
     async::TaskHolder<web::WebResponse> m_modelNet;   // dynamic model-list fetch
+    // Per-provider fetch lifecycle so the list area can distinguish "never
+    // fetched" / "in flight" / "came back empty" / "have N". Keyed by
+    // provider id. Separate from modelCache (which only holds success lists).
+    enum class FetchState { Idle, Loading, Empty, Error };
+    std::unordered_map<std::string, FetchState> m_fetchState;
     CCLabelBMFont* m_authStatus = nullptr;
     CCSprite*      m_authDot    = nullptr;  // status pill dot, tinted with each setAuthStatus
 
@@ -7028,7 +7386,7 @@ protected:
         // setting.
         flushInputs();
         m_content->removeAllChildren();
-        m_texts.clear(); m_ints.clear(); m_cycles.clear();
+        m_texts.clear(); m_ints.clear(); m_cycles.clear(); m_rowInfos.clear();
         m_authStatus = nullptr;
         m_authDot    = nullptr;
         m_rowIndex   = 0;
@@ -7070,8 +7428,10 @@ protected:
     // bottom-left).
 
     // Base row: striped cell + left label. Caller attaches the control and
-    // MUST call pushRow(row).
-    CCNode* makeRow(const char* lbl) {
+    // MUST call pushRow(row). When `desc` is given, a small (i) button is
+    // placed right after the label — tapping it opens a wide FLAlertLayer
+    // with the full explanation (same pattern MoreOptionsLayer uses).
+    CCNode* makeRow(const char* lbl, const char* desc = nullptr) {
         auto row = CCNode::create();
         row->setContentSize({ROW_W, ROW_H});
         auto cell = ui::makeCell(ROW_W, ROW_H, (m_rowIndex++ % 2) == 1);
@@ -7084,9 +7444,38 @@ protected:
         l->setAnchorPoint({0.f, 0.5f});
         l->setPosition({10.f, ROW_H / 2.f});
         row->addChild(l);
+
+        if (desc && *desc) {
+            auto spr = CCSprite::createWithSpriteFrameName("GJ_infoIcon_001.png");
+            if (spr) {
+                spr->setScale(0.4f);
+                auto infoMenu = CCMenu::create();
+                infoMenu->setContentSize({20.f, ROW_H});
+                infoMenu->ignoreAnchorPointForPosition(false);
+                infoMenu->setAnchorPoint({0.f, 0.5f});
+                infoMenu->setPosition(
+                    {10.f + l->getScaledContentSize().width + 3.f, ROW_H / 2.f});
+                auto btn = CCMenuItemSpriteExtra::create(spr, this,
+                    menu_selector(AISettingsPopup::onRowInfo));
+                btn->setTag((int)m_rowInfos.size());
+                btn->setPosition({10.f, ROW_H / 2.f});
+                infoMenu->addChild(btn);
+                m_rowInfos.push_back({lbl, desc});
+                row->addChild(infoMenu, 2);
+            }
+        }
         return row;
     }
     void pushRow(CCNode* row) { m_rows->addChild(row); }
+
+    // (i) button handler — title + description captured at row-build time.
+    void onRowInfo(CCObject* sender) {
+        int tag = static_cast<CCNode*>(sender)->getTag();
+        if (tag < 0 || tag >= (int)m_rowInfos.size()) return;
+        auto& info = m_rowInfos[tag];
+        FLAlertLayer::create(nullptr, info.first.c_str(), info.second,
+                             "OK", nullptr, 360.f)->show();
+    }
 
     // Bare (cell-less) row of arbitrary height, for notes/headers/pills.
     CCNode* makeBareRow(float h) {
@@ -7099,7 +7488,8 @@ protected:
     // arrow CCMenu (CCMenu touch dispatch assumes CCMenuItem children —
     // a label inside crashes it).
     void addCycler(const char* lbl, const char* sid,
-                   const std::vector<std::string>& opts) {
+                   const std::vector<std::string>& opts,
+                   const char* desc = nullptr) {
         std::string cur = geode::Mod::get()->getSettingValue<std::string>(sid);
         if (cur.empty() && !opts.empty()) cur = opts[0];
         if (cur.empty()) cur = "-";
@@ -7107,7 +7497,7 @@ protected:
         int tag = (int)m_cycles.size();
         m_cycles.push_back({sid, opts, nullptr});
 
-        auto row = makeRow(lbl);
+        auto row = makeRow(lbl, desc);
 
         auto valLbl = CCLabelBMFont::create(cur.c_str(), "bigFont.fnt");
         valLbl->limitLabelWidth(CYCLE_LBL_W, CYCLE_LBL_SC, CYCLE_LBL_MIN);
@@ -7142,8 +7532,9 @@ protected:
     // ── Toggle — real GD checkbox (GJ_checkOn/Off via the standard-sprites
     // toggler). The sid travels in the userObject; the toggler swaps its
     // own sprite, so onToggle just flips the setting.
-    void addToggle(const char* lbl, const char* sid) {
-        auto row = makeRow(lbl);
+    void addToggle(const char* lbl, const char* sid,
+                   const char* desc = nullptr) {
+        auto row = makeRow(lbl, desc);
 
         auto menu = CCMenu::create();
         menu->setContentSize({30.f, ROW_H});
@@ -7164,8 +7555,9 @@ protected:
     // ── Text input — keeps TextInput's stock dark bg (sits fine on the
     // brown cell; no extra well here).
     void addText(const char* lbl, const char* sid, const char* ph,
-                 int maxLen = 200, bool password = false) {
-        auto row = makeRow(lbl);
+                 int maxLen = 200, bool password = false,
+                 const char* desc = nullptr) {
+        auto row = makeRow(lbl, desc);
         float w = 150.f;
         auto in = TextInput::create(w, ph, "bigFont.fnt");
         in->setScale(0.6f);
@@ -7181,8 +7573,9 @@ protected:
     }
 
     void addInt(const char* lbl, const char* sid,
-                int64_t mn, int64_t mx, int64_t df) {
-        auto row = makeRow(lbl);
+                int64_t mn, int64_t mx, int64_t df,
+                const char* desc = nullptr) {
+        auto row = makeRow(lbl, desc);
 
         std::string hintStr = fmt::format("{}-{}", mn, mx);
         auto hint = CCLabelBMFont::create(hintStr.c_str(), "chatFont.fnt");
@@ -7285,35 +7678,141 @@ protected:
     void buildGeneral() {
         // No provider cycler here — it lives on the Provider tab (and the
         // generator's chip jumps straight there). Keeps General scroll-free.
-        addText  ("Difficulty", "difficulty", "easy/medium/hard/extreme", 30);
-        addText  ("Style",      "style",      "modern/retro/flow/memory", 30);
-        addText  ("Length",     "length",     "short/medium/long/xl/xxl", 30);
-        addInt   ("Max objects","max-objects", 10, 1000000, 500);
-        addInt   ("Spawn speed","spawn-batch-size", 1, 100, 8);
-        addInt   ("Ground Y",   "ai-ground-y", 15, 300, 105);
-        addText  ("Example IDs","example-level-ids", "up to 5 level IDs, comma-sep", 100);
+        addText  ("Difficulty", "difficulty", "easy/medium/hard/extreme", 30, false,
+            "How hard the generated gameplay should be.\n\n"
+            "Presets: <cg>easy</c>, <cg>medium</c>, <cg>hard</c>, <cg>extreme</c>.\n"
+            "Free-form text also works - e.g. <cy>'demon with tight ship parts'</c>.");
+        addText  ("Style",      "style",      "modern/retro/flow/memory", 30, false,
+            "Visual and gameplay theme.\n\n"
+            "Presets: <cg>modern</c>, <cg>retro</c>, <cg>flow</c>, <cg>memory</c>.\n"
+            "Anything else works too - e.g. <cy>'nine circles'</c>, <cy>'ambient cave'</c>.");
+        addText  ("Length",     "length",     "short/medium/long/xl/xxl", 30, false,
+            "Target level length.\n\n"
+            "<cg>short</c> ~15s   <cg>medium</c> ~30-60s   <cg>long</c> ~1-2min\n"
+            "<cg>xl</c> / <cg>xxl</c> even longer.\n\n"
+            "The AI keeps extending until the target is reached, so longer "
+            "settings use more API tokens.");
+        addInt   ("Max objects","max-objects", 10, 1000000, 500,
+            "Hard cap on objects per generation.\n\n"
+            "Higher = more detail, but slower editor spawning and bigger AI "
+            "responses. 500 is a good default; raise it for XL levels.");
+        addInt   ("Spawn speed","spawn-batch-size", 1, 100, 8,
+            "Objects placed per tick while the preview builds.\n\n"
+            "Raise for faster placement; lower it if the editor stutters "
+            "during generation.");
+        addInt   ("Ground Y",   "ai-ground-y", 15, 300, 105,
+            "Editor Y of the ground line the AI builds on.\n\n"
+            "<cg>105</c> is the default. Lower it if generated blocks float "
+            "above the ground; raise it if they sink into it.");
+        addText  ("Example IDs","example-level-ids", "up to 5 level IDs, comma-sep", 100, false,
+            "Up to 5 GD level IDs (comma-separated).\n\n"
+            "The AI downloads them and studies their object placement as "
+            "style references before building yours.");
         addNote  ("Free-form text is OK for difficulty/style/length.");
+        addNote  ("Tap an (i) icon on any row for details.");
     }
 
     // ── Advanced tab — one readable striped column; the ScrollLayer takes
     // care of the overflow (this is the only tab that scrolls).
     void buildAdvanced() {
         addHeader("Prompting");
-        addToggle("Enable AI tools",   "enable-ai-tools");
-        addToggle("Triggers & colors", "enable-advanced-features");
-        addInt   ("Refinement rounds", "refinement-rounds", 0, 10, 3);
+        addToggle("Enable AI tools",   "enable-ai-tools",
+            "Lets the AI use helper tools before building:\n"
+            "web search, reference-level download, Newgrounds song lookup, "
+            "level-length checks and a scratchpad.\n\n"
+            "<cg>Better levels</c>, slightly slower generations.");
+        addToggle("Triggers & colors", "enable-advanced-features",
+            "Allows color, move, pulse and alpha triggers plus group IDs in "
+            "generated levels.\n\n"
+            "Turn <cr>off</c> for plain block-and-spike output (simpler, "
+            "more reliable on small local models).");
+        addInt   ("Refinement rounds", "refinement-rounds", 0, 10, 3,
+            "After the first draft the AI reviews its own level and improves "
+            "it - pacing, visuals, difficulty curve - this many times.\n\n"
+            "<cg>0</c> = off.  More rounds = better quality but more tokens "
+            "and time. <cg>3</c> is a good balance.");
 
         addHeader("Rate & Feedback");
-        addToggle("Rate limiting",     "enable-rate-limiting");
-        addInt   ("Rate limit (s)",    "rate-limit-seconds", 1, 60, 3);
-        addToggle("Save AI output",    "show-ai-output");
-        addToggle("Rate generations",  "enable-rating");
-        addInt   ("Feedback examples", "max-feedback-examples", 1, 10, 3);
+        addToggle("Rate limiting",     "enable-rate-limiting",
+            "Enforces a minimum delay between generations so you can't "
+            "accidentally burn through hosted-API quota.");
+        addInt   ("Rate limit (s)",    "rate-limit-seconds", 1, 60, 3,
+            "Seconds to wait between generations while rate limiting is on.");
+        addToggle("Save AI output",    "show-ai-output",
+            "Writes the raw AI responses to the Geode log.\n\n"
+            "Useful for debugging weird generations; otherwise leave off.");
+        addToggle("Rate generations",  "enable-rating",
+            "After each generation, a small popup asks you to rate it 1-10 "
+            "and optionally say what was good or bad.\n\n"
+            "Your ratings are fed back to the AI as examples - it "
+            "<cg>learns your taste</c> over time.");
+        addInt   ("Feedback examples", "max-feedback-examples", 1, 10, 3,
+            "How many of your past rated generations are shown to the AI "
+            "each time as style guidance.");
 
         addHeader("Bypass");
-        addToggle("Character filter bypass", "bypass-char-filter");
-        addToggle("Character limit bypass",  "bypass-char-limit");
+        addToggle("Character filter bypass", "bypass-char-filter",
+            "Disables GD's text-character filter in every text box while "
+            "enabled - lets prompts contain symbols GD normally blocks.");
+        addToggle("Character limit bypass",  "bypass-char-limit",
+            "Removes GD's max-length limits in every text box while "
+            "enabled - for long, detailed prompts.");
         addNote("Bypasses apply to every text box in the game while enabled.");
+
+#ifdef EDITORAI_HAS_IMGUI
+        // ── Controls — overlay-hotkey rescue hatch ────────────────────────
+        // The overlay hotkey is normally rebound INSIDE the overlay
+        // (Settings → Controls). If the user binds something unreachable
+        // and locks themselves out of the panel, this row — living in the
+        // GD-native popup, fully independent of the overlay — gets them
+        // back in. The overlay re-reads the binding within a second, so
+        // no restart is needed.
+        addHeader("Controls");
+        {
+            std::string bind;
+            int k1 = (int)editoraiGetSavedInt("ov-toggle-key",
+                        (int)cocos2d::enumKeyCodes::KEY_E);
+            int k2 = (int)editoraiGetSavedInt("ov-toggle-key2", 0);
+            int k3 = (int)editoraiGetSavedInt("ov-toggle-key3", 0);
+            for (int k : {k1, k2, k3}) {
+                if (k <= 0) continue;
+                if (!bind.empty()) bind += " > ";
+                bind += eaiKeyName(k);
+            }
+            if (bind.empty()) bind = "E";
+
+            auto row = makeRow("Overlay hotkey",
+                "The desktop key (or 2-3 key sequence) that opens and closes "
+                "the EditorAI overlay panel.\n\n"
+                "Default: <cg>E</c>. Rebind it inside the overlay under "
+                "<cy>Settings -> Controls</c>.\n\n"
+                "Bound something unreachable and locked yourself out? "
+                "<cg>Reset</c> restores E - takes effect within a second, "
+                "no restart needed.");
+
+            auto bindLbl = CCLabelBMFont::create(bind.c_str(), "bigFont.fnt");
+            bindLbl->limitLabelWidth(80.f, 0.35f, 0.1f);
+            bindLbl->setColor(ui::TEXT_SECONDARY);
+            bindLbl->setAnchorPoint({1.f, 0.5f});
+            bindLbl->setPosition({288.f, ROW_H / 2.f});
+            row->addChild(bindLbl);
+
+            auto menu = CCMenu::create();
+            menu->setContentSize({80.f, ROW_H});
+            menu->ignoreAnchorPointForPosition(false);
+            menu->setAnchorPoint({0.5f, 0.5f});
+            menu->setPosition({330.f, ROW_H / 2.f});
+            auto lbl = CCLabelBMFont::create("Reset", "goldFont.fnt");
+            lbl->setScale(0.45f);
+            auto btn = CCMenuItemSpriteExtra::create(lbl, this,
+                menu_selector(AISettingsPopup::onResetOverlayKey));
+            btn->setPosition({40.f, ROW_H / 2.f});
+            menu->addChild(btn);
+            row->addChild(menu);
+            pushRow(row);
+        }
+        addNote("Opens/closes the overlay panel. Rebind inside the overlay: Settings -> Controls.");
+#endif
 
         addHeader("Debug");
         {
@@ -7330,9 +7829,43 @@ protected:
             btn->setPosition({40.f, ROW_H / 2.f});
             menu->addChild(btn);
             row->addChild(menu);
+            pushRow(row);  // without this the row is built but never shown
         }
         addNote("Last 10 API exchanges with latency + bodies; also validates clipboard EAS.");
     }
+
+#ifdef EDITORAI_HAS_IMGUI
+    // Compact key-name formatter for the hotkey display (a trimmed copy of
+    // the overlay's own — that one lives in an anonymous namespace).
+    static std::string eaiKeyName(int k) {
+        if ((k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9'))
+            return std::string(1, (char)k);
+        if (k >= 112 && k <= 123) return fmt::format("F{}", k - 111);
+        switch (k) {
+            case 9:   return "Tab";
+            case 13:  return "Enter";
+            case 32:  return "Space";
+            case 35:  return "End";
+            case 36:  return "Home";
+            case 45:  return "Insert";
+            case 46:  return "Delete";
+            case 192: return "`";
+        }
+        return fmt::format("key {}", k);
+    }
+
+    // Restore the overlay toggle to the default single-key E. Writes the
+    // saved values directly — overlay.cpp's cached copy refreshes at most
+    // one second later, so this works even while the overlay is wedged.
+    void onResetOverlayKey(CCObject*) {
+        editoraiSetSavedInt("ov-toggle-key",  (int)cocos2d::enumKeyCodes::KEY_E);
+        editoraiSetSavedInt("ov-toggle-key2", 0);
+        editoraiSetSavedInt("ov-toggle-key3", 0);
+        Notification::create("Overlay hotkey reset to E",
+                             NotificationIcon::Success)->show();
+        buildTab();  // refresh the shown binding
+    }
+#endif
 
     void onOpenInspector(CCObject*) { openDebugInspector(); }
 
@@ -7361,6 +7894,7 @@ protected:
                 menu->addChild(btn);
             }
             row->addChild(menu);
+            pushRow(row);  // without this the row is built but never shown
         };
         mkSlotRow("Load profile",    false);
         mkSlotRow("Save to profile", true);
@@ -7429,31 +7963,96 @@ protected:
         addHeader("Provider");
         addCycler("Provider", "ai-provider",
             {"gemini","claude","openai","openrouter","ministral","huggingface",
-             "deepseek","ollama","lm-studio","llama-cpp","custom","manual"});
+             "deepseek","groq","ollama","lm-studio","llama-cpp","custom","manual"},
+            "Which AI service builds your levels.\n\n"
+            "<cg>Hosted</c> (gemini, claude, openai, openrouter, ministral, "
+            "huggingface, deepseek, groq): need an API key, best quality.\n\n"
+            "<cy>Local</c> (ollama, lm-studio, llama-cpp): free, run on your "
+            "own PC.\n\n"
+            "<co>manual</c>: no key at all - copies a prompt for any chatbot, "
+            "you paste the reply back.");
+
+        // One-line orientation blurb for the active provider — cost, where
+        // the key comes from, what to expect. Rebuilt on every cycle since
+        // ai-provider changes rebuild the tab.
+        addNote(
+            p == "gemini"      ? "Google - generous free tier - key from AI Studio in 1 click" :
+            p == "claude"      ? "Anthropic - paid API - excellent level design" :
+            p == "openai"      ? "OpenAI - paid API" :
+            p == "openrouter"  ? "One key, hundreds of models - some are free" :
+            p == "ministral"   ? "Mistral AI - free tier available" :
+            p == "huggingface" ? "Free tier - one-click Sign In below" :
+            p == "deepseek"    ? "Very cheap paid API" :
+            p == "groq"        ? "Fastest inference anywhere - generous free tier" :
+            p == "ollama"      ? "Free, runs on your PC - needs Ollama installed & running" :
+            p == "lm-studio"   ? "Free, runs on your PC - start the LM Studio server first" :
+            p == "llama-cpp"   ? "Free, runs on your PC - run llama-server with a GGUF model" :
+            p == "custom"      ? "Any OpenAI-compatible endpoint (Groq, xAI, vLLM, ...)" :
+                                 "No key needed - copy the prompt into any AI, paste the reply back");
 
         addHeader("Model");
+        // Hosted providers: a free-text field (type ANY model id) plus a row
+        // of tappable presets. Type-or-pick — every provider now accepts a
+        // custom model id, not just the presets.
         if (p == "gemini")
-            // Keep in sync with the one-of list in mod.json.
-            addCycler("Model", "gemini-model", {"gemini-3-flash","gemini-3-pro"});
+            addModelChooser("gemini-model", "type any Gemini model id",
+                {"gemini-3-flash","gemini-3-pro","gemini-2.5-flash","gemini-2.5-pro"});
         else if (p == "claude")
-            addCycler("Model", "claude-model", {"claude-sonnet-4-6","claude-opus-4-6"});
+            addModelChooser("claude-model", "type any Claude model id",
+                {"claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5"});
         else if (p == "openai")
-            addCycler("Model", "openai-model", {"gpt-4o","gpt-4.1-mini"});
+            addModelChooser("openai-model", "type any OpenAI model id",
+                {"gpt-4o","gpt-4.1-mini","gpt-4.1","o4-mini"});
         else if (p == "ministral")
-            addCycler("Model", "ministral-model",
+            addModelChooser("ministral-model", "type any Mistral model id",
                 {"ministral-3b-latest","ministral-8b-latest","mistral-small-latest",
                  "mistral-medium-latest","mistral-large-latest"});
         else if (p == "deepseek")
-            addCycler("Model", "deepseek-model",
+            addModelChooser("deepseek-model", "type any DeepSeek model id",
                 {"deepseek-chat","deepseek-reasoner","deepseek-coder"});
+        else if (p == "groq")
+            addModelChooser("groq-model", "type any Groq model id",
+                {"llama-3.3-70b-versatile","llama-3.1-8b-instant",
+                 "openai/gpt-oss-120b","openai/gpt-oss-20b",
+                 "moonshotai/kimi-k2-instruct"});
         else if (p == "openrouter")
-            addText("Model", "openrouter-model", "vendor/model-name", 100);
+            addModelChooser("openrouter-model", "vendor/model-name",
+                {"google/gemini-2.5-flash","anthropic/claude-sonnet-4",
+                 "openai/gpt-4o","meta-llama/llama-3.3-70b-instruct"});
         else if (p == "huggingface")
-            addText("Model", "huggingface-model", "owner/repo", 100);
+            addModelChooser("huggingface-model", "owner/repo",
+                {"meta-llama/Llama-3.1-8B-Instruct","Qwen/Qwen2.5-7B-Instruct"});
         else if (p == "ollama") {
-            addToggle("Platinum", "use-platinum");
-            addText("Tag",         "ollama-model", "entity12208/editorai:v3-7b", 100);
-            addInt ("Timeout (s)", "ollama-timeout", 60, 1800, 600);
+            bool platinum = geode::Mod::get()->getSettingValue<bool>("use-platinum");
+            addToggle("Platinum", "use-platinum",
+                "Routes requests through the community EditorAI Platinum "
+                "cloud instead of your local Ollama.\n\n"
+                "No local install needed, but availability depends on the "
+                "community server being up.");
+
+            // Current selection, shown as a live text field so a custom tag
+            // still works — but the tappable list below is the main way to
+            // pick. Platinum auto-fetches its catalogue on tab build so the
+            // user never has to type a tag they can't see.
+            addText("Tag",         "ollama-model",
+                platinum ? "pick from the list below" : "entity12208/editorai:v3-7b",
+                100, false,
+                platinum
+                  ? "Which Platinum model to run. The list below is fetched "
+                    "live from the community server - tap one to select it."
+                  : "The Ollama model tag to run - exactly what `ollama list` "
+                    "shows.\n\n<cg>entity12208/editorai:v3-7b</c> is the "
+                    "recommended EditorAI fine-tune (6-8 GB VRAM).");
+            addInt ("Timeout (s)", "ollama-timeout", 60, 1800, 600,
+                "How long to wait for the local model to finish one reply.\n\n"
+                "Slow machines running 7B+ models may need 10+ minutes for "
+                "long levels - raise this rather than cancelling.");
+
+            // Auto-fetch the Platinum catalogue once per tab build (local
+            // Ollama keeps the manual Fetch button — a localhost probe on
+            // every settings open would stall the UI when Ollama isn't up).
+            if (platinum && modelCache().find("ollama") == modelCache().end())
+                autoFetchModels("ollama");
         } else if (p == "lm-studio") {
             addText("URL",   "lm-studio-url",   "http://localhost:1234", 100);
             addText("Model", "lm-studio-model", "loaded model name",     100);
@@ -7473,28 +8072,54 @@ protected:
         // ── Dynamic model picker (skipped for the manual copy-paste provider) ─
         // Fetch the provider's real model list (no hardcoded options) and show
         // each as a tappable row that writes the per-provider model setting.
+        bool platinum = (p == "ollama") &&
+            geode::Mod::get()->getSettingValue<bool>("use-platinum");
+        FetchState st = m_fetchState.count(p) ? m_fetchState[p] : FetchState::Idle;
+
         if (!isManual) {
+            // Platinum auto-fetches, so its button reads "Refresh models";
+            // everyone else fetches on demand.
             auto row = makeBareRow(30.f);
             auto menu = CCMenu::create();
             menu->setContentSize({ROW_W, 30.f});
             menu->ignoreAnchorPointForPosition(false);
             menu->setAnchorPoint({0.5f, 0.5f});
             menu->setPosition({ROW_W / 2.f, 15.f});
-            auto spr = ButtonSprite::create("Fetch model list", "bigFont.fnt",
+            const char* label = st == FetchState::Loading
+                                    ? "Loading models…"
+                                    : (platinum ? "Refresh models" : "Fetch model list");
+            auto spr = ButtonSprite::create(label, "bigFont.fnt",
                                             "GJ_button_04.png", 0.5f);
             spr->setScale(0.62f);
             auto btn = CCMenuItemSpriteExtra::create(spr, this,
                            menu_selector(AISettingsPopup::onFetchModels));
+            btn->setEnabled(st != FetchState::Loading);
             btn->setPosition({ROW_W / 2.f, 15.f});
             menu->addChild(btn);
             row->addChild(menu);
             pushRow(row);
         }
+
         if (auto it = modelCache().find(p); it != modelCache().end() && !it->second.empty()) {
             std::string curModel =
                 geode::Mod::get()->getSettingValue<std::string>(providerModelSettingKey(p));
             addNote(fmt::format("{} models - tap to select:", it->second.size()));
             for (const auto& m : it->second) addPickRow(m, m == curModel);
+        } else if (st == FetchState::Loading) {
+            addNote("Loading models…");
+        } else if (st == FetchState::Empty) {
+            // The requested feature: an explicit empty-state.
+            addNote(platinum
+                ? "<cy>No Platinum models available right now.</c>"
+                : "<cy>No models available.</c>");
+            addNote(platinum
+                ? "The community server may be down or have no workers online."
+                : "Check your key/URL, then tap Fetch again.");
+        } else if (st == FetchState::Error) {
+            addNote("<cr>Couldn't reach the model list.</c>");
+            addNote(platinum
+                ? "The Platinum server isn't responding - try again shortly."
+                : "Check your key/URL and connection, then tap Fetch again.");
         }
 
         addHeader("Authentication");
@@ -7504,7 +8129,12 @@ protected:
             bool hasOAuth = !oauth::savedToken(p).empty();
             const char* ph = hasOAuth ? "(signed in — paste to override)"
                                       : "paste API key";
-            addText("API key", keySid.c_str(), ph, 220, true);
+            addText("API key", keySid.c_str(), ph, 220, true,
+                "Your secret key for this provider.\n\n"
+                "Stored <cg>only on this device</c> (Geode save data) and sent "
+                "only to the provider itself.\n\n"
+                "<cy>Key page</c> opens the provider's key dashboard; "
+                "<cy>Save & test</c> verifies the key with a tiny request.");
         }
 
         // ── Auth status pill: recessed well + tinted dot + status text ──
@@ -7594,6 +8224,7 @@ protected:
         else if (p == "huggingface") url = "https://huggingface.co/settings/tokens";
         else if (p == "openrouter")  url = "https://openrouter.ai/keys";
         else if (p == "deepseek")    url = "https://platform.deepseek.com/api_keys";
+        else if (p == "groq")        url = "https://console.groq.com/keys";
         if (url) {
             geode::utils::web::openLinkInBrowser(url);
             setAuthStatus("Browser opened. Paste & Save & test when done.",
@@ -7633,6 +8264,7 @@ protected:
         else if (provider == "claude")    url = "https://api.anthropic.com/v1/models";
         else if (provider == "ministral") url = "https://api.mistral.ai/v1/models";
         else if (provider == "deepseek")  url = "https://api.deepseek.com/v1/models";
+        else if (provider == "groq")      url = "https://api.groq.com/openai/v1/models";
         else if (provider == "huggingface") url = "https://huggingface.co/api/whoami-v2";
         else if (provider == "openrouter")  url = "https://openrouter.ai/api/v1/auth/key";
         else if (provider == "gemini")
@@ -7670,6 +8302,7 @@ protected:
         if (provider == "claude")     return "https://api.anthropic.com/v1/models";
         if (provider == "ministral")  return "https://api.mistral.ai/v1/models";
         if (provider == "deepseek")   return "https://api.deepseek.com/v1/models";
+        if (provider == "groq")       return "https://api.groq.com/openai/v1/models";
         if (provider == "openrouter") return "https://openrouter.ai/api/v1/models";
         if (provider == "gemini")     return "https://generativelanguage.googleapis.com/v1beta/models";
         if (provider == "huggingface")
@@ -7722,29 +8355,64 @@ protected:
     void onFetchModels(CCObject*) {
         flushInputs();   // persist typed key/url/model before any rebuild
         std::string provider = geode::Mod::get()->getSettingValue<std::string>("ai-provider");
+        fetchModels(provider, /*silent=*/false);
+    }
+
+    // Fire a Platinum/local fetch automatically on tab build. Same path as
+    // the manual button but quieter — no "Set the URL first" nag, and it
+    // won't re-fire while one is already in flight.
+    void autoFetchModels(const std::string& provider) {
+        if (m_fetchState[provider] == FetchState::Loading) return;
+        fetchModels(provider, /*silent=*/true);
+    }
+
+    void fetchModels(const std::string& provider, bool silent) {
         std::string url = modelListUrl(provider);
         if (url.empty()) {
-            setAuthStatus("Set the endpoint URL first.", ui::ERROR_COL); return;
+            if (!silent) setAuthStatus("Set the endpoint URL first.", ui::ERROR_COL);
+            return;
         }
         std::string key = getProviderApiKey(provider);
-        setAuthStatus("Fetching models…", ui::BUSY_COL);
+        m_fetchState[provider] = FetchState::Loading;
+        if (!silent) setAuthStatus("Fetching models…", ui::BUSY_COL);
         auto req = web::WebRequest();
         req.timeout(std::chrono::seconds(15));
         applyProviderAuth(req, provider, key);
         m_modelNet.spawn(req.get(url),
-            [this, provider](web::WebResponse resp) {
+            [this, provider, silent](web::WebResponse resp) {
                 if (!resp.ok()) {
-                    setAuthStatus(fmt::format("✗ Models HTTP {}.", resp.code()), ui::ERROR_COL);
+                    m_fetchState[provider] = FetchState::Error;
+                    // A stale cache is now misleading — clear it so the empty
+                    // state shows instead of an old list.
+                    modelCache().erase(provider);
+                    buildTab();
+                    if (!silent)
+                        setAuthStatus(fmt::format("✗ Models HTTP {}.", resp.code()), ui::ERROR_COL);
                     return;
                 }
                 auto jr = resp.json();
-                if (!jr) { setAuthStatus("✗ Bad model-list JSON.", ui::ERROR_COL); return; }
+                if (!jr) {
+                    m_fetchState[provider] = FetchState::Error;
+                    modelCache().erase(provider);
+                    buildTab();
+                    if (!silent) setAuthStatus("✗ Bad model-list JSON.", ui::ERROR_COL);
+                    return;
+                }
                 auto list = parseModelList(std::move(jr).unwrap());
-                if (list.empty()) { setAuthStatus("No models returned.", ui::ERROR_COL); return; }
+                if (list.empty()) {
+                    m_fetchState[provider] = FetchState::Empty;
+                    modelCache().erase(provider);
+                    buildTab();   // render the "no models available" note
+                    if (!silent) setAuthStatus("No models available.", ui::WARN_COL);
+                    return;
+                }
                 size_t n = list.size();
+                m_fetchState[provider] = FetchState::Idle;
                 modelCache()[provider] = std::move(list);
                 buildTab();   // re-render the Provider tab with the selectable rows
-                setAuthStatus(fmt::format("✓ {} models — tap one to use it.", n), ui::SUCCESS_COL);
+                if (!silent)
+                    setAuthStatus(fmt::format("✓ {} models — tap one to use it.", n),
+                                  ui::SUCCESS_COL);
             });
     }
 
@@ -7753,12 +8421,31 @@ protected:
         auto* str  = static_cast<CCString*>(node->getUserObject());
         if (!str) return;
         std::string model = str->getCString();
-        flushInputs();   // save other fields first…
         std::string provider = geode::Mod::get()->getSettingValue<std::string>("ai-provider");
-        geode::Mod::get()->setSettingValue<std::string>(
-            providerModelSettingKey(provider), model);   // …then override the model
+        std::string modelKey = providerModelSettingKey(provider);
+        // Drop the live "Model" text field from the flush set BEFORE flushing —
+        // otherwise flushInputs would write its (stale, pre-pick) contents into
+        // the model key and clobber the pick. Everything else still flushes.
+        m_texts.erase(std::remove_if(m_texts.begin(), m_texts.end(),
+            [&](const TextRow& tf){ return tf.sid == modelKey; }), m_texts.end());
+        flushInputs();
+        geode::Mod::get()->setSettingValue<std::string>(modelKey, model);
         buildTab();
         setAuthStatus(fmt::format("Model set: {}", model), ui::SUCCESS_COL);
+    }
+
+    // Type-or-pick model row: a free-text field bound to `modelKey` (accepts
+    // ANY id) followed by tappable preset rows. Used by every hosted provider
+    // so custom model ids work everywhere, not just where a preset exists.
+    void addModelChooser(const char* modelKey, const char* placeholder,
+                         const std::vector<std::string>& presets) {
+        addText("Model", modelKey, placeholder, 100, false,
+            "Type any model id the provider accepts, or tap a preset below.\n\n"
+            "Not sure what's available? Use <cg>Fetch model list</c> lower "
+            "down to pull the provider's live list.");
+        std::string cur = geode::Mod::get()->getSettingValue<std::string>(modelKey);
+        addNote("Presets - tap to use:");
+        for (const auto& m : presets) addPickRow(m, m == cur);
     }
 
     // One tappable model row — full name in the userObject, a bullet on the
@@ -9070,12 +9757,15 @@ protected:
         {
             std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
             std::string model    = getProviderModel(provider);
+            // "manual" is keyless by design — group it with the local
+            // providers so its dot reads amber ("no key needed"), not red.
+            // (Also avoids looking up the undeclared "manual-api-key".)
             bool local     = (provider == "ollama" || provider == "lm-studio" ||
-                              provider == "llama-cpp");
+                              provider == "llama-cpp" || provider == "manual");
             bool hasToken  = !oauth::savedToken(provider).empty();
             // The custom provider's key id is "custom-provider-api-key" —
             // "custom-api-key" is undeclared (getProviderApiKey agrees).
-            bool hasManual = !Mod::get()->getSettingValue<std::string>(
+            bool hasManual = !local && !Mod::get()->getSettingValue<std::string>(
                               provider == "custom" ? std::string("custom-provider-api-key")
                                                    : provider + "-api-key").empty();
             bool hasAny    = hasToken || hasManual || provider == "custom";
@@ -9238,6 +9928,26 @@ protected:
         m_statusLabel->setPosition({W / 2.f, 64.f});
         m_statusLabel->setVisible(false);
         m_mainLayer->addChild(m_statusLabel);
+
+        // First-run guidance: if the active provider needs a key and none is
+        // set, say so up front (amber, not red — it's guidance, not an
+        // error) instead of letting Generate fail with a popup later.
+        {
+            std::string prov = Mod::get()->getSettingValue<std::string>("ai-provider");
+            bool keyless = (prov == "ollama" || prov == "lm-studio" ||
+                            prov == "llama-cpp" || prov == "custom" ||
+                            prov == "manual");
+            bool configured = keyless
+                || !oauth::savedToken(prov).empty()
+                || !Mod::get()->getSettingValue<std::string>(prov + "-api-key").empty();
+            if (!configured) {
+                m_statusLabel->setString(
+                    fmt::format("No {} API key yet - tap the provider bar above", prov).c_str());
+                m_statusLabel->limitLabelWidth(340.f, STATUS_SCALE, 0.1f);
+                m_statusLabel->setColor(ui::WARN_COL);
+                m_statusLabel->setVisible(true);
+            }
+        }
 
         // ── Action row (Generate / Cancel swap in one slot) ──────────────
         {
@@ -9594,6 +10304,7 @@ protected:
                 {"gemini", 0.35, 1.50}, {"claude", 3.0, 15.0}, {"openai", 2.5, 10.0},
                 {"openrouter", 1.0, 3.0}, {"ministral", 0.10, 0.30},
                 {"huggingface", 0.30, 0.60}, {"deepseek", 0.27, 1.10},
+                {"groq", 0.59, 0.79},
                 {"custom", 1.0, 3.0},
             };
             double inP = 1.0, outP = 3.0;
@@ -9697,6 +10408,9 @@ protected:
         m_generateBtn->setVisible(true);
         m_generateBtn->setEnabled(true);
         m_cancelBtn->setVisible(false);
+        // Keep what was already live-placed reviewable: settle it into the
+        // normal preview state so Accept/Deny appear.
+        settleLivePreview();
         showStatus("Cancelled.", true);
         log::info("EditorAI: generation cancelled by user");
     }
@@ -9761,7 +10475,10 @@ protected:
         int currentObjects = (m_editorLayer && m_editorLayer->m_objects)
             ? m_editorLayer->m_objects->count() : 0;
 
+        // Status dump + quick-start. Scrolling alert so the how-to section
+        // fits on every aspect ratio.
         FLAlertLayer::create(
+            nullptr,
             "Editor AI",
             gd::string(fmt::format(
                 "<cy>Provider:</c> {}\n"
@@ -9769,12 +10486,34 @@ protected:
                 "<cy>API Key:</c> {}\n"
                 "<cy>Advanced Features:</c> {}\n"
                 "<cy>Objects in library:</c> {}\n"
-                "<cy>Objects in level:</c> {}",
+                "<cy>Objects in level:</c> {}\n"
+                "\n"
+                "<cb>How it works</c>\n"
+                "1. Describe your level in the text box - theme, difficulty, "
+                "anything (<cy>'neon ship escape, hard'</c>)\n"
+                "2. Hit <cg>Generate</c> - the AI builds a blue ghost preview "
+                "in the editor\n"
+                "3. Check it, then <cg>Accept</c> or <cr>Reject</c> the preview\n"
+                "\n"
+                "<cb>Modes</c>\n"
+                "<cy>Edit existing level</c> - AI makes targeted additions "
+                "to what's already built\n"
+                "<cy>Co-op</c> - AI continues your build one chunk at a time, "
+                "matching your style\n"
+                "\n"
+                "<cb>Tips</c>\n"
+                "- The colored dot on the provider bar: <cg>green</c> = ready, "
+                "<co>amber</c> = local/no key needed, <cr>red</c> = key missing\n"
+                "- Tap the provider bar to change provider, model or key\n"
+                "- Up/down arrows next to the prompt recall previous prompts\n"
+                "- Closing this popup mid-generation keeps it running in the "
+                "background",
                 provider, model, keyStatus,
                 advFeatures ? "<cg>ON</c>" : "<cr>OFF</c>",
                 OBJECT_IDS.size(), currentObjects
             )),
-            "OK"
+            "OK", nullptr,
+            380.f, true, 280.f, 1.f
         )->show();
     }
 
@@ -10452,6 +11191,13 @@ protected:
         if (!m_isCreatingObjects || m_deferredObjects.empty()) return;
 
         if (m_currentObjectIndex >= m_deferredObjects.size()) {
+            // Mid-generation live batch fully staged: idle WITHOUT the
+            // Accept/Deny ceremony — more rounds are coming. The final
+            // apply (or settleLivePreview) runs finishSpawning later.
+            if (m_liveStarted && m_isGenerating) {
+                m_isCreatingObjects = false;
+                return;
+            }
             finishSpawning();
             return;
         }
@@ -11340,6 +12086,149 @@ protected:
         )->show();
     }
 
+    // Resolve one AI object slot (type name → numeric ID, position, validity)
+    // into a DeferredObject. Mutates the slot in place (writes "id") then
+    // MOVES it out — shared by prepareObjects and the live-placement path so
+    // the two can never drift apart.
+    // FIX preserved from the original inline loop: resolve type -> ID by
+    // writing directly into the slot, then read id/x/y back from the slot —
+    // NOT from a local copy captured before the write.
+    bool resolveSlotToDeferred(matjson::Value& slot, DeferredObject& out) {
+        auto typeResult = slot["type"].asString();
+        if (typeResult) {
+            const std::string& typeName = typeResult.unwrap();
+            // Triggers with hardcoded IDs not in object_ids.json
+            static const std::unordered_map<std::string, int> TRIGGER_IDS = {
+                {"color_trigger", 899},
+                {"move_trigger", 901},
+                {"end_trigger", 34},
+                {"show_trail_trigger", 32},
+                {"hide_trail_trigger", 33},
+            };
+            auto trigIt = TRIGGER_IDS.find(typeName);
+            if (trigIt != TRIGGER_IDS.end()) {
+                slot["id"] = trigIt->second;
+            } else {
+                auto it = OBJECT_IDS.find(typeName);
+                slot["id"] = (it != OBJECT_IDS.end()) ? it->second : 1;
+            }
+        }
+
+        auto idResult = slot["id"].asInt();
+        auto xResult  = slot["x"].asDouble();
+        auto yResult  = slot["y"].asDouble();
+        if (!idResult || !xResult || !yResult) return false;
+
+        int   objectID = idResult.unwrap();
+        float x        = static_cast<float>(xResult.unwrap());
+        float y        = static_cast<float>(yResult.unwrap());
+        if (objectID < 1 || objectID > 10000) {
+            log::warn("Invalid object ID {} — skipping", objectID);
+            return false;
+        }
+        out = {objectID, CCPoint{x, y}, std::move(slot)};
+        return true;
+    }
+
+    // ── Live placement ───────────────────────────────────────────────────
+    // Stage every accumulator entry beyond m_liveConsumed into the editor
+    // RIGHT NOW (called after each accepted tool-loop round), so the level
+    // grows on screen while the AI keeps working. Edit ops are skipped here
+    // and replayed at the final apply; the Accept/Deny ceremony only happens
+    // at the end (or on cancel, via settleLivePreview).
+    void liveStageRound() {
+        if (!m_livePlace || !m_liveEligible) return;
+        if (m_liveConsumed >= m_accumulatedObjects.size()) return;
+        if (!revalidateEditor()) return;
+
+        const size_t maxObjects =
+            (size_t)Mod::get()->getSettingValue<int64_t>("max-objects");
+
+        // First live batch: enter the preview-layer state exactly like
+        // prepareObjects' fresh path would, so Accept/Deny later behaves
+        // identically. (finishSpawning flips s_inPreviewMode at the END —
+        // m_liveStarted marks the layer as already picked until then.)
+        if (!s_inPreviewMode && !m_liveStarted) {
+            s_previewObjects.clear();
+            s_previewIntendedLayers.clear();
+            short maxLayer = 0;
+            if (m_editorLayer->m_objects) {
+                for (auto* raw : CCArrayExt<CCObject*>(m_editorLayer->m_objects)) {
+                    auto* go = typeinfo_cast<GameObject*>(raw);
+                    if (!go) continue;
+                    maxLayer = std::max({maxLayer, go->m_editorLayer, go->m_editorLayer2});
+                }
+            }
+            s_previewLayer = (short)std::min<int>(maxLayer + 1, 999);
+            s_editorLayerBeforePreview = m_editorLayer->m_currentLayer;
+            setEditorCurrentLayer(m_editorLayer, s_previewLayer);
+            log::info("Live placement: preview layer {} (editor was on {})",
+                      s_previewLayer, s_editorLayerBeforePreview);
+        }
+        m_liveStarted = true;
+
+        size_t staged = 0;
+        std::vector<DeferredObject> fresh;
+        for (; m_liveConsumed < m_accumulatedObjects.size(); ++m_liveConsumed) {
+            auto& slot = m_accumulatedObjects[m_liveConsumed];
+            if (slot.isObject() && slot.contains("op")) {
+                // Edit ops act on existing objects with full-changeset
+                // journaling — keep them for the final apply.
+                m_liveSkippedOps.push(slot);  // copy; final slice skips it
+                continue;
+            }
+            if (s_previewObjects.size() + fresh.size() >= maxObjects) break;
+            DeferredObject d;
+            // Deep-copy the slot: the accumulator stays authoritative for
+            // telemetry/history dumps and the final-apply slice.
+            matjson::Value copy = slot;
+            if (resolveSlotToDeferred(copy, d)) {
+                fresh.push_back(std::move(d));
+                ++staged;
+            }
+        }
+        if (fresh.empty()) return;
+
+        // Fix the vertical frame on the first batch and reuse it for every
+        // later batch (and the final remainder) — recomputing per batch
+        // would tear rounds apart vertically.
+        if (!m_liveShiftValid) {
+            float minY = fresh[0].position.y;
+            for (auto& d : fresh) minY = std::min(minY, d.position.y);
+            const float groundY = getGroundY();
+            m_liveShift      = minY < groundY ? groundY - minY : 0.f;
+            m_liveShiftValid = true;
+            if (m_liveShift != 0.f)
+                log::info("Live placement: Y shift locked at +{:.1f}", m_liveShift);
+        }
+        if (m_liveShift != 0.f)
+            for (auto& d : fresh) d.position.y += m_liveShift;
+
+        for (auto& d : fresh) m_deferredObjects.push_back(std::move(d));
+        m_isCreatingObjects = true;
+
+        // Off-scene popups have no scheduler tick — stage synchronously.
+        if (!this->isRunning()) {
+            while (m_currentObjectIndex < m_deferredObjects.size())
+                if (!spawnDeferredOne()) return;
+            m_isCreatingObjects = false;
+        }
+        log::info("Live placement: staged {} objects ({} total in editor)",
+                  staged, s_previewObjects.size());
+    }
+
+    // A generation that live-placed objects but ended without the final
+    // apply (cancel, error) would strand full-color ghosts with no
+    // Accept/Deny — settle them into the normal preview state instead.
+    void settleLivePreview() {
+        if (!m_liveStarted || s_inPreviewMode) return;
+        if (!revalidateEditor()) return;
+        // Flush anything still queued, then run the standard ceremony.
+        while (m_currentObjectIndex < m_deferredObjects.size())
+            if (!spawnDeferredOne()) return;
+        finishSpawning();
+    }
+
     void prepareObjects(matjson::Value& objectsArray) {
         if (!m_editorLayer || !objectsArray.isArray()) return;
 
@@ -11397,8 +12286,10 @@ protected:
         // Fresh preview: pick an unused editor layer (max used + 1) and
         // switch the editor to it. Follow-up turns while a preview is live
         // APPEND to the existing preview layer instead — that's how long
-        // conversations make many small edits before one Accept.
-        if (!s_inPreviewMode) {
+        // conversations make many small edits before one Accept. Live
+        // placement initializes the same state mid-generation (m_liveStarted)
+        // — the final apply must then append, not re-pick a layer.
+        if (!s_inPreviewMode && !m_liveStarted) {
             s_previewObjects.clear();
             s_previewIntendedLayers.clear();
             short maxLayer = 0;
@@ -11427,50 +12318,9 @@ protected:
         log::info("Preparing {} objects for progressive creation...", objectCount);
 
         for (size_t i = 0; i < objectCount; ++i) {
-            // FIX: resolve type -> ID by writing directly into objectsArray[i],
-            // then read id/x/y back from objectsArray[i] — NOT from a local copy
-            // captured before the write (that was the original bug causing
-            // "Prepared 0 valid objects" since objData never had the id field).
-            auto typeResult = objectsArray[i]["type"].asString();
-            if (typeResult) {
-                const std::string& typeName = typeResult.unwrap();
-                // Triggers with hardcoded IDs not in object_ids.json
-                static const std::unordered_map<std::string, int> TRIGGER_IDS = {
-                    {"color_trigger", 899},
-                    {"move_trigger", 901},
-                    {"end_trigger", 34},
-                    {"show_trail_trigger", 32},
-                    {"hide_trail_trigger", 33},
-                };
-                auto trigIt = TRIGGER_IDS.find(typeName);
-                if (trigIt != TRIGGER_IDS.end()) {
-                    objectsArray[i]["id"] = trigIt->second;
-                } else {
-                    auto it = OBJECT_IDS.find(typeName);
-                    objectsArray[i]["id"] = (it != OBJECT_IDS.end()) ? it->second : 1;
-                }
-            }
-
-            // Read from the authoritative array slot (not a stale local copy)
-            auto idResult = objectsArray[i]["id"].asInt();
-            auto xResult  = objectsArray[i]["x"].asDouble();
-            auto yResult  = objectsArray[i]["y"].asDouble();
-
-            if (!idResult || !xResult || !yResult) continue;
-
-            int   objectID = idResult.unwrap();
-            float x        = static_cast<float>(xResult.unwrap());
-            float y        = static_cast<float>(yResult.unwrap());
-
-            if (objectID < 1 || objectID > 10000) {
-                log::warn("Invalid object ID {} at index {} — skipping", objectID, i);
-                continue;
-            }
-
-            // Capture the full slot (with id now set) for applyObjectProperties.
-            // Move — objectsArray is a local copy that is never read again,
-            // and matjson copies are deep.
-            m_deferredObjects.push_back({objectID, CCPoint{x, y}, std::move(objectsArray[i])});
+            DeferredObject d;
+            if (resolveSlotToDeferred(objectsArray[i], d))
+                m_deferredObjects.push_back(std::move(d));
         }
 
         // If any object sits below the configured ground Y, shift the entire
@@ -11484,17 +12334,26 @@ protected:
         // the ground sprite and look underground. Triggers placed at Y=0 work
         // correctly when shifted up because triggers fire by X, not Y.
         if (!m_deferredObjects.empty()) {
-            float minY = m_deferredObjects[0].position.y;
-            for (auto& obj : m_deferredObjects)
-                minY = std::min(minY, obj.position.y);
-
-            const float groundY = getGroundY();
-            if (minY < groundY) {
-                float shift = groundY - minY;
-                log::info("Shifting all objects up by {:.1f} units (lowest was at Y={:.1f}, ground-y setting is {:.1f})",
-                    shift, minY, groundY);
+            if (m_liveShiftValid) {
+                // Live placement already fixed the coordinate frame on its
+                // first batch — the final remainder must use the SAME shift,
+                // or it lands offset from the objects already in the editor.
+                if (m_liveShift != 0.f)
+                    for (auto& obj : m_deferredObjects)
+                        obj.position.y += m_liveShift;
+            } else {
+                float minY = m_deferredObjects[0].position.y;
                 for (auto& obj : m_deferredObjects)
-                    obj.position.y += shift;
+                    minY = std::min(minY, obj.position.y);
+
+                const float groundY = getGroundY();
+                if (minY < groundY) {
+                    float shift = groundY - minY;
+                    log::info("Shifting all objects up by {:.1f} units (lowest was at Y={:.1f}, ground-y setting is {:.1f})",
+                        shift, minY, groundY);
+                    for (auto& obj : m_deferredObjects)
+                        obj.position.y += shift;
+                }
             }
         }
 
@@ -12747,6 +13606,32 @@ protected:
     // ignores enable-ai-tools=false, and hijacks mutation/copilot turns.
     bool           m_usingToolLoop        = false;
 
+    // ── Goal / task agenda (set_goal tool family) ────────────────────────
+    // While m_goalActive, processFinalResponse keeps looping the model with
+    // a "continue working" message after every answer (all other gates
+    // permitting) until goal_done is called or MAX_GOAL_ROUNDS trips.
+    struct GoalTask { std::string text; bool done = false; };
+    std::string           m_goalText;
+    std::vector<GoalTask> m_goalTasks;
+    bool                  m_goalActive = false;
+    int                   m_goalRounds = 0;
+    static constexpr int  MAX_GOAL_ROUNDS = 25;
+
+    // ── Live placement ────────────────────────────────────────────────────
+    // With the "live-placement" setting on, every accepted tool-loop round
+    // stages its objects onto the preview layer IMMEDIATELY instead of
+    // waiting for the final apply. m_liveConsumed marks how much of the
+    // accumulator is already in the editor; the final apply only stages the
+    // remainder. The Y ground-shift is captured once (first live batch) so
+    // later rounds stay in the same coordinate frame.
+    bool   m_livePlace      = false;  // setting snapshot at generation start
+    bool   m_liveEligible   = false;  // level state allows mid-run staging
+    size_t m_liveConsumed   = 0;      // accumulator entries already staged
+    bool   m_liveStarted    = false;  // live path initialized the preview layer
+    float  m_liveShift      = 0.f;    // Y shift captured on first live batch
+    bool   m_liveShiftValid = false;
+    matjson::Value m_liveSkippedOps = matjson::Value::array();  // ops deferred to final
+
     // Entry point. Called instead of callAPI's single-shot when tool use is
     // enabled and the selected provider supports it.
     void runToolLoop(const std::string& userPrompt, const std::string& rawApiKey) {
@@ -12772,6 +13657,28 @@ protected:
         m_followUpTurn = false;
         m_editEnforceRounds = 0;
         m_targetObjRounds   = 0;
+        // Goal loop: a stale goal from the last generation must never leak
+        // into this one — the model re-declares it via set_goal if it wants.
+        m_goalActive = false;
+        m_goalText.clear();
+        m_goalTasks.clear();
+        m_goalRounds = 0;
+        // Live placement: snapshot the setting and eligibility once. Fresh
+        // generations clear the level only AT APPLY, so mid-run staging is
+        // only safe when there is nothing to clear (empty/new level) or the
+        // generation extends the existing level anyway.
+        m_livePlace      = Mod::get()->getSettingValue<bool>("live-placement");
+        m_liveConsumed   = 0;
+        m_liveStarted    = false;
+        m_liveShift      = 0.f;
+        m_liveShiftValid = false;
+        m_liveSkippedOps = matjson::Value::array();
+        m_liveEligible   = false;
+        if (m_livePlace && revalidateEditor()) {
+            size_t existing = (m_editorLayer && m_editorLayer->m_objects)
+                ? m_editorLayer->m_objects->count() : 0;
+            m_liveEligible = !m_shouldClearLevel || existing == 0;
+        }
         m_lengthTarget = lengthTargetForSetting(
             Mod::get()->getSettingValue<std::string>("length"));
 
@@ -12853,6 +13760,13 @@ protected:
             "results; only you do. Call them whenever they'd help: verify drafts with\n"
             "get_level_length / check_passability between rounds, discover object\n"
             "names with search_objects, pull references with download_level.\n"
+            "MUSIC SYNC: get_bpm + get_waveform analyze the level's actual song —\n"
+            "use them first when the request mentions sync/music/drops, and place\n"
+            "hazards on the beat grid they return. get_ground_y gives the exact\n"
+            "floor Y. save_memory/get_memory persist notes across generations.\n"
+            "For big builds, set_goal + a task list turns this into a work loop:\n"
+            "the mod keeps prompting you until you call goal_done — mark tasks as\n"
+            "you finish and verify before declaring done.\n"
             "There is NO limit on tool calls — use as many as the task needs. When\n"
             "you have enough context, STOP calling tools and return your final answer.\n\n"
             "Final answer JSON: \"analysis\" string, \"objects\" array, optional \"macros\"\n"
@@ -13489,6 +14403,37 @@ protected:
             });
     }
 
+    // Numbered goal task list with completion marks — the shared rendering
+    // for task_* tool results and the user-facing session log.
+    std::string goalTaskListText() const {
+        if (m_goalTasks.empty()) return "(no tasks yet)";
+        std::string out;
+        int done = 0;
+        for (size_t i = 0; i < m_goalTasks.size(); ++i) {
+            out += fmt::format("{} [{}] {}\n", i,
+                               m_goalTasks[i].done ? "x" : " ",
+                               m_goalTasks[i].text);
+            if (m_goalTasks[i].done) ++done;
+        }
+        out += fmt::format("({}/{} complete)", done, (int)m_goalTasks.size());
+        return out;
+    }
+
+    // Surface the goal state to the user (status line + session transcript),
+    // gated on the "show-goal-tasks" setting.
+    void announceGoal(const std::string& headline) {
+        if (m_session)
+            m_session->push(GenSession::Entry::Kind::Status,
+                fmt::format("{}\nGoal: {}\n{}", headline, m_goalText,
+                            goalTaskListText()));
+        if (!Mod::get()->getSettingValue<bool>("show-goal-tasks")) return;
+        int done = 0;
+        for (auto& t : m_goalTasks) if (t.done) ++done;
+        showStatus(fmt::format("{} — {} ({}/{} tasks)", headline,
+                               m_goalText.substr(0, 60), done,
+                               (int)m_goalTasks.size()), false);
+    }
+
     // Run one tool call. Each known tool either does a synchronous mod-side
     // lookup (e.g. analyze_level) or hands off to a fireFetchX async path
     // and forwards the result to the callback.
@@ -13537,6 +14482,323 @@ protected:
                     return;
                 }
             }
+        }
+
+        // ── Music sync ─────────────────────────────────────────────────────
+        if (call.name == "get_bpm") {
+            auto* lvl = m_editorLayer ? m_editorLayer->m_level : nullptr;
+            auto& an  = songsync::analyzeLevelSong(lvl);
+            if (!an.ok) {
+                r.content = fmt::format("Couldn't analyze the song: {}. You can "
+                    "still build unsynced, or pick a song first.", an.err);
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            float songOffset = (m_editorLayer && m_editorLayer->m_levelSettings)
+                ? m_editorLayer->m_levelSettings->m_songOffset : 0.f;
+            float beatX = GD_PLAYER_SPEED_1X * 60.f / an.bpm;
+            const char* confWord = an.confidence > 2.2f ? "high"
+                                  : an.confidence > 1.5f ? "medium" : "low";
+            r.content = fmt::format(
+                "Song: {}\nBPM ≈ {:.1f} (confidence {}), first beat at t={:.2f}s, "
+                "analyzed {:.0f}s.\nsong_offset={:.2f}s (level X=0 plays song "
+                "t={:.2f}s).\nbeat_spacing_x = {:.1f} units at 1x speed — one "
+                "beat every {:.1f}u, one 4-beat bar every {:.1f}u. Place synced "
+                "hazards/orbs at X = (beat_time - song_offset) * {:.2f}. Speed "
+                "portals change the multiplier (0.5x/2x/3x/4x scale it).",
+                an.songName, an.bpm, confWord, an.firstBeatSec, an.durationSec,
+                songOffset, songOffset, beatX, beatX, beatX * 4.f,
+                GD_PLAYER_SPEED_1X);
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "get_waveform") {
+            auto* lvl = m_editorLayer ? m_editorLayer->m_level : nullptr;
+            auto& an  = songsync::analyzeLevelSong(lvl);
+            if (!an.ok) {
+                r.content = fmt::format("Couldn't analyze the song: {}.", an.err);
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            double start = 0, dur = 30;
+            if (auto v = call.args["start_sec"].asDouble())    start = v.unwrap();
+            if (auto v = call.args["duration_sec"].asDouble()) dur   = v.unwrap();
+            start = std::clamp(start, 0.0, (double)an.durationSec);
+            dur   = std::clamp(dur, 5.0, 60.0);
+            if (start + dur > an.durationSec) dur = an.durationSec - start;
+            float songOffset = (m_editorLayer && m_editorLayer->m_levelSettings)
+                ? m_editorLayer->m_levelSettings->m_songOffset : 0.f;
+
+            // Rows of 10s, one digit per 0.1s bucket.
+            std::string rows;
+            int firstBucket = (int)(start * 10.0);
+            int lastBucket  = std::min((int)an.env10.size(),
+                                       (int)((start + dur) * 10.0));
+            for (int b = firstBucket; b < lastBucket; b += 100) {
+                float t = b / 10.f;
+                float x = (t - songOffset) * GD_PLAYER_SPEED_1X;
+                rows += fmt::format("{:6.1f}s |", t);
+                for (int i = b; i < std::min(b + 100, lastBucket); ++i)
+                    rows += (char)('0' + (int)std::round(an.env10[i] * 9.f));
+                rows += fmt::format("| X={:.0f}\n", x);
+            }
+
+            // Strongest sync points inside the window: local maxima of the
+            // envelope, best 8, sorted by time.
+            struct Peak { float t, v; };
+            std::vector<Peak> peaks;
+            for (int i = std::max(firstBucket, 1); i < lastBucket - 1; ++i) {
+                if (an.env10[i] >= an.env10[i-1] && an.env10[i] > an.env10[i+1]
+                    && an.env10[i] > 0.55f)
+                    peaks.push_back({i / 10.f, an.env10[i]});
+            }
+            std::sort(peaks.begin(), peaks.end(),
+                      [](const Peak& a, const Peak& b) { return a.v > b.v; });
+            if (peaks.size() > 8) peaks.resize(8);
+            std::sort(peaks.begin(), peaks.end(),
+                      [](const Peak& a, const Peak& b) { return a.t < b.t; });
+            std::string peakLine;
+            for (auto& p : peaks)
+                peakLine += fmt::format("t={:.1f}s→X={:.0f}  ", p.t,
+                    (p.t - songOffset) * GD_PLAYER_SPEED_1X);
+
+            r.content = fmt::format(
+                "Waveform of '{}' from {:.1f}s to {:.1f}s (digit = loudness "
+                "0-9, one per 0.1s; each row 10s):\n{}"
+                "{}{}"
+                "{}",
+                an.songName, start, start + dur, rows,
+                an.bpm > 0 ? fmt::format("BPM ≈ {:.1f}, beat every {:.1f} X-units at 1x.\n",
+                                         an.bpm, GD_PLAYER_SPEED_1X * 60.f / an.bpm) : "",
+                peakLine.empty() ? "" : fmt::format("Sync points (loudest hits): {}\n", peakLine),
+                "X mapping: X = (t - song_offset) * 311.58 at 1x speed.");
+            onDone(std::move(r)); return;
+        }
+
+        // ── Editor facts ───────────────────────────────────────────────────
+        if (call.name == "get_ground_y") {
+            float gy = getGroundY();
+            r.content = fmt::format(
+                "ground_y = {:.0f}. Blocks are 30x30 with CENTERS on the grid: "
+                "the standing row is Y={:.0f}, one row up is Y={:.0f}, etc. "
+                "(Anything you place lower is auto-shifted up so the lowest "
+                "object lands on Y={:.0f}.) Player jump reach: ~2 rows up, "
+                "~2.5 blocks gap at 1x.",
+                gy, gy, gy + 30.f, gy);
+            onDone(std::move(r)); return;
+        }
+
+        // ── Scratch memory ─────────────────────────────────────────────────
+        if (call.name == "save_memory") {
+            auto keyR = call.args["key"].asString();
+            auto valR = call.args["value"].asString();
+            if (!keyR || !valR) {
+                r.content = "save_memory needs both 'key' and 'value'.";
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            std::string key = keyR.unwrap().substr(0, toolUse::MEMORY_MAX_KEY);
+            std::string val = valR.unwrap().substr(0, toolUse::MEMORY_MAX_VALUE);
+            auto& mem = toolUse::scratchMemory();
+            auto it = std::find_if(mem.begin(), mem.end(),
+                                   [&](auto& e) { return e.first == key; });
+            if (it != mem.end()) {
+                it->second = val;
+                r.content = fmt::format("Updated memory '{}' ({} entries).",
+                                        key, (int)mem.size());
+            } else if (mem.size() >= toolUse::MEMORY_MAX_ENTRIES) {
+                r.content = fmt::format(
+                    "Memory full ({} entries) — overwrite an existing key or "
+                    "consolidate. Keys: {}", (int)mem.size(), [&] {
+                        std::string k;
+                        for (auto& e : mem) { k += e.first; k += ' '; }
+                        return k;
+                    }());
+                r.isError = true;
+            } else {
+                mem.emplace_back(key, val);
+                r.content = fmt::format("Saved memory '{}' ({} entries).",
+                                        key, (int)mem.size());
+            }
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "get_memory") {
+            auto& mem = toolUse::scratchMemory();
+            auto keyR = call.args["key"].asString();
+            if (keyR) {
+                const std::string& key = keyR.unwrap();
+                auto it = std::find_if(mem.begin(), mem.end(),
+                                       [&](auto& e) { return e.first == key; });
+                r.content = it != mem.end()
+                    ? fmt::format("{} = {}", key, it->second)
+                    : fmt::format("No memory stored under '{}'.", key);
+            } else if (mem.empty()) {
+                r.content = "Scratch memory is empty. Use save_memory to store notes.";
+            } else {
+                r.content = fmt::format("{} memory entries:\n", (int)mem.size());
+                for (auto& e : mem)
+                    r.content += fmt::format("- {} = {}\n", e.first, e.second);
+            }
+            onDone(std::move(r)); return;
+        }
+
+        // ── Goal / task agenda ─────────────────────────────────────────────
+        if (call.name == "set_goal") {
+            auto goalR = call.args["goal"].asString();
+            if (!goalR || goalR.unwrap().empty()) {
+                r.content = "set_goal needs a 'goal' string.";
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            m_goalText   = goalR.unwrap().substr(0, 300);
+            m_goalActive = true;
+            m_goalRounds = 0;
+            m_goalTasks.clear();
+            if (auto tasksR = call.args["tasks"].asString()) {
+                std::stringstream ss(tasksR.unwrap());
+                std::string line;
+                while (std::getline(ss, line) && m_goalTasks.size() < 30) {
+                    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                        line.pop_back();
+                    size_t p = line.find_first_not_of(" \t-*0123456789.");
+                    if (p != std::string::npos) line = line.substr(p);
+                    if (!line.empty()) m_goalTasks.push_back({line, false});
+                }
+            }
+            announceGoal("Goal set");
+            r.content = fmt::format(
+                "Goal locked in: \"{}\"\n{}\nThe mod will now keep prompting "
+                "you to continue after every answer until you call goal_done "
+                "(safety cap: {} rounds). Work task by task; use task_mark as "
+                "you finish, verify before declaring victory.",
+                m_goalText, goalTaskListText(), MAX_GOAL_ROUNDS);
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "task_add") {
+            auto textR = call.args["text"].asString();
+            if (!textR || textR.unwrap().empty()) {
+                r.content = "task_add needs 'text'.";
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            if (m_goalTasks.size() >= 30) {
+                r.content = "Task list is at its 30-entry cap — finish or "
+                            "consolidate existing tasks first.";
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            size_t idx = m_goalTasks.size();
+            if (auto iR = call.args["index"].asInt())
+                idx = std::clamp<size_t>((size_t)std::max<int64_t>(0, iR.unwrap()),
+                                         0, m_goalTasks.size());
+            m_goalTasks.insert(m_goalTasks.begin() + idx,
+                               {textR.unwrap().substr(0, 200), false});
+            announceGoal("Task added");
+            r.content = fmt::format("Added at {}.\n{}", idx, goalTaskListText());
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "task_get") {
+            if (auto iR = call.args["index"].asInt()) {
+                size_t idx = (size_t)std::max<int64_t>(0, iR.unwrap());
+                if (idx >= m_goalTasks.size()) {
+                    r.content = fmt::format("No task {} — list has {} entries.",
+                                            idx, (int)m_goalTasks.size());
+                    r.isError = true;
+                } else {
+                    r.content = fmt::format("{} [{}] {}", idx,
+                        m_goalTasks[idx].done ? "x" : " ", m_goalTasks[idx].text);
+                }
+            } else {
+                r.content = m_goalActive
+                    ? fmt::format("Goal: {}\n{}", m_goalText, goalTaskListText())
+                    : fmt::format("No active goal. Tasks:\n{}", goalTaskListText());
+            }
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "task_mark" || call.name == "task_unmark") {
+            bool mark = call.name == "task_mark";
+            auto iR = call.args["index"].asInt();
+            if (!iR) {
+                r.content = "Needs an 'index'.";
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            size_t idx = (size_t)std::max<int64_t>(0, iR.unwrap());
+            if (idx >= m_goalTasks.size()) {
+                r.content = fmt::format("No task {} — list has {} entries.",
+                                        idx, (int)m_goalTasks.size());
+                r.isError = true;
+                onDone(std::move(r)); return;
+            }
+            m_goalTasks[idx].done = mark;
+            announceGoal(mark ? "Task completed" : "Task re-opened");
+            bool allDone = !m_goalTasks.empty();
+            for (auto& t : m_goalTasks) allDone = allDone && t.done;
+            r.content = fmt::format("{}\n{}{}", mark ? "Marked." : "Re-opened.",
+                goalTaskListText(),
+                (mark && allDone)
+                    ? "\nAll tasks complete — run verify, then goal_done."
+                    : "");
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "verify") {
+            // Live level measurements the model must check its claim against.
+            float maxX = computeMaxXFromObjects(m_accumulatedObjects);
+            auto [secs, cat] = describeLengthByX(maxX);
+            int objCount = 0;
+            for (size_t i = 0; i < m_accumulatedObjects.size(); ++i)
+                if (m_accumulatedObjects[i].isObject()
+                    && !m_accumulatedObjects[i].contains("op")) ++objCount;
+            std::string passLine = "passability: (no draft yet)";
+            if (objCount > 0) {
+                auto pass = levelcheck::check(m_accumulatedObjects);
+                passLine = fmt::format("passability: {:.0f}%{}",
+                    pass.pass_rate * 100.f,
+                    pass.deaths.empty() ? "" : fmt::format(
+                        " — {} blocked zone(s), first at X={:.0f}",
+                        (int)pass.deaths.size(), pass.deaths[0].x_start));
+            }
+            std::string subject;
+            if (auto iR = call.args["index"].asInt()) {
+                size_t idx = (size_t)std::max<int64_t>(0, iR.unwrap());
+                subject = idx < m_goalTasks.size()
+                    ? fmt::format("task {}: \"{}\"", idx, m_goalTasks[idx].text)
+                    : fmt::format("(task {} doesn't exist)", idx);
+            } else {
+                subject = fmt::format("the goal: \"{}\"", m_goalText);
+            }
+            r.content = fmt::format(
+                "VERIFY {} against the LIVE numbers:\n"
+                "- draft objects: {}\n- length: {:.1f}s ({}) , maxX={:.0f}\n- {}\n"
+                "Tasks:\n{}\n"
+                "If the numbers support completion, keep the mark and move on "
+                "(or call goal_done if everything is finished). If they don't, "
+                "task_unmark it and fix the gap NOW — do not claim done work "
+                "that isn't in the draft.",
+                subject, objCount, secs, cat, maxX, passLine, goalTaskListText());
+            onDone(std::move(r)); return;
+        }
+
+        if (call.name == "goal_done") {
+            std::string summary;
+            if (auto sR = call.args["summary"].asString())
+                summary = sR.unwrap().substr(0, 300);
+            bool wasActive = m_goalActive;
+            m_goalActive = false;
+            announceGoal("Goal finished");
+            if (m_session && !summary.empty())
+                m_session->push(GenSession::Entry::Kind::Status,
+                                fmt::format("Goal summary: {}", summary));
+            r.content = wasActive
+                ? "Goal loop ended. Emit your FINAL answer now (full required "
+                  "format) — the mod will apply it."
+                : "No goal loop was active, but noted. Emit your final answer.";
+            onDone(std::move(r)); return;
         }
 
         if (call.name == "analyze_level") {
@@ -14164,6 +15426,15 @@ protected:
         log::info("Accumulator now has {} objects (this round added {})",
                   (int)m_accumulatedObjects.size(), (int)roundAdded);
 
+        // Live placement: stage this round's objects into the editor now,
+        // while the loop keeps working. Only genuine multi-round tool-loop
+        // generations — single-shot, edits, mutations, and follow-ups keep
+        // the apply-at-end flow.
+        if (m_usingToolLoop && !m_editMode && !m_mutationMode && !m_coopMode
+            && !m_followUpTurn) {
+            liveStageRound();
+        }
+
         auto analysisResult = levelData["analysis"].asString();
         if (analysisResult) log::info("AI Analysis: {}", analysisResult.unwrap());
 
@@ -14600,6 +15871,45 @@ protected:
             }
         }
 
+        // ── Goal loop (set_goal tool) ────────────────────────────────────
+        // The model declared a goal for itself: keep the loop alive after
+        // every answer until it calls goal_done, all other gates permitting
+        // (length/objects/passability fired above and returned early). The
+        // round cap is a hard safety net, and the force-finalize backstop
+        // always wins.
+        if (inToolLoop && m_goalActive && !m_forceFinalize) {
+            if (m_goalRounds < MAX_GOAL_ROUNDS) {
+                ++m_goalRounds;
+                std::string open;
+                for (size_t i = 0; i < m_goalTasks.size(); ++i)
+                    if (!m_goalTasks[i].done)
+                        open += fmt::format("  {}: {}\n", i, m_goalTasks[i].text);
+                toolUse::Message cont;
+                cont.role = toolUse::MessageRole::User;
+                cont.text = fmt::format(
+                    "GOAL LOOP {}/{}: your goal \"{}\" is still active.\n{}"
+                    "Continue working toward it now — add objects, refine, use "
+                    "tools, task_mark what you finish. When (and only when) "
+                    "verify confirms everything is done, call goal_done and "
+                    "then emit your final answer. Reply in the same output "
+                    "format as before; additional objects only.",
+                    m_goalRounds, MAX_GOAL_ROUNDS, m_goalText,
+                    open.empty() ? "" : fmt::format("Open tasks:\n{}", open));
+                cont.imageB64 = visionSnapshotIfSupported();
+                m_toolHistory.push_back(std::move(cont));
+                announceGoal(fmt::format("Goal round {}", m_goalRounds));
+                this->doToolRound();
+                return;
+            }
+            log::warn("Goal loop hit its {}-round cap — applying what we have",
+                      MAX_GOAL_ROUNDS);
+            Notification::create(
+                fmt::format("Goal loop reached {} rounds — applying the level as-is.",
+                            MAX_GOAL_ROUNDS),
+                NotificationIcon::Warning)->show();
+            m_goalActive = false;
+        }
+
         m_followUpTurn = false;  // staged: next generation's gates fire normally
         // (The assistant reply was already recorded once, unconditionally,
         // near the top of processFinalResponse — no second push here.)
@@ -14638,6 +15948,24 @@ protected:
         auto applyObjects = std::make_shared<matjson::Value>(std::move(m_accumulatedObjects));
         m_accumulatedObjects = matjson::Value::array();  // defensive re-init
 
+        // Live placement staged a prefix of the accumulator already — the
+        // final apply only stages the remainder, plus any edit ops the live
+        // path deferred (they act on existing objects and must run through
+        // prepareObjects' journaled pipeline exactly once).
+        if (m_liveConsumed > 0 && applyObjects->isArray()) {
+            auto tail = matjson::Value::array();
+            for (size_t i = 0; i < m_liveSkippedOps.size(); ++i)
+                tail.push(std::move(m_liveSkippedOps[i]));
+            for (size_t i = m_liveConsumed; i < applyObjects->size(); ++i)
+                tail.push(std::move((*applyObjects)[i]));
+            log::info("Live placement: {} objects already staged; final apply "
+                      "covers {} remaining entr{}",
+                      (int)m_liveConsumed, (int)tail.size(),
+                      tail.size() == 1 ? "y" : "ies");
+            *applyObjects    = std::move(tail);
+            m_liveSkippedOps = matjson::Value::array();
+        }
+
         // Capture only the (small) metadata object — levelData still holds
         // the original full objects array, which the lambda never needs.
         auto metadata = std::make_shared<matjson::Value>(
@@ -14658,8 +15986,17 @@ protected:
                     NotificationIcon::Success)->show();
                 return;
             }
-            if (m_shouldClearLevel) clearLevel();
+            // Live placement implies the level was empty (m_liveEligible) —
+            // clearing now would delete the objects staged mid-generation.
+            if (m_shouldClearLevel && !m_liveStarted) clearLevel();
             if (metadata->isObject()) applyLevelMetadata(*metadata);
+            // Everything already staged live and nothing left over: skip
+            // prepareObjects (it would report "no valid objects") and run
+            // the Accept/Deny ceremony over what's on the preview layer.
+            if (m_liveStarted && applyObjects->isArray() && applyObjects->size() == 0) {
+                finishSpawning();
+                return;
+            }
             prepareObjects(*applyObjects);
             // Off-scene engines (backgrounded popup, copilot) have no spawn
             // scheduler — place everything in one pass.
@@ -15151,6 +16488,20 @@ protected:
         m_decorationPassDone = false;
         m_targetObjRounds    = 0;
         m_editEnforceRounds  = 0;
+        // Goal + live-placement state is tool-loop-only; a single-shot or
+        // edit generation running with last run's leftovers would misfire
+        // (stale m_liveConsumed slices its apply, stale goal loops it).
+        m_goalActive     = false;
+        m_goalText.clear();
+        m_goalTasks.clear();
+        m_goalRounds     = 0;
+        m_livePlace      = false;
+        m_liveEligible   = false;
+        m_liveConsumed   = 0;
+        m_liveStarted    = false;
+        m_liveShift      = 0.f;
+        m_liveShiftValid = false;
+        m_liveSkippedOps = matjson::Value::array();
         m_lengthTarget = lengthTargetForSetting(
             Mod::get()->getSettingValue<std::string>("length"));
 
@@ -15196,6 +16547,7 @@ protected:
                     provider == "claude"      ? "Claude"         :
                     provider == "openai"      ? "OpenAI"         :
                     provider == "ministral"   ? "Ministral"      :
+                    provider == "groq"        ? "Groq"           :
                     provider == "huggingface" ? "HuggingFace"    : provider
                 )),
                 "OK")->show();
@@ -15575,7 +16927,7 @@ protected:
                 // OpenAI /v1/chat/completions response envelope.
                 } else if (provider == "openai" || provider == "ministral" || provider == "huggingface"
                         || provider == "openrouter" || provider == "lm-studio" || provider == "llama-cpp"
-                        || provider == "deepseek"  || provider == "custom") {
+                        || provider == "deepseek"  || provider == "groq" || provider == "custom") {
                     auto choices = json["choices"];
                     if (!choices.isArray() || choices.size() == 0) {
                         onError("No Response", fmt::format("[{}] The AI returned no content.", autoErrorCode(60, 4))); return;
@@ -15597,6 +16949,10 @@ protected:
         resetGenerationUI();
         m_followUpTurn    = false;   // turn-scoped flags die with the turn
         m_critiquePending = false;
+        // Objects live-placed before the failure need their Accept/Deny —
+        // stranding full-color ghosts with no buttons would look like the
+        // mod dumped junk into the level.
+        settleLivePreview();
         showStatus("Failed!", true);
         log::error("Generation failed: {}", message);
         if (m_session) {
@@ -16861,6 +18217,420 @@ class $modify(BypassCCTextInputNode, CCTextInputNode) {
     }
 };
 
+// ─── First-launch Welcome + telemetry opt-in popups ─────────────────────────
+// Welcome shows once, ever — gated on the saved bool "seen-welcome" — then
+// chains straight into a one-time telemetry ask (gated on "asked-telemetry").
+// Both fire from MenuLayer::init (the first non-loading scene the user
+// reaches) via a tiny delay so they land cleanly on the finished menu.
+
+// One-time telemetry opt-in. Mirrors the mod.json description exactly so the
+// user consents to the real behavior: EVERY generation uploads while it's on.
+static void showTelemetryAskPopup() {
+    Mod::get()->setSavedValue<bool>("asked-telemetry", true);
+    geode::createQuickPopup(
+        "Help Train Better Models",
+        "<cy>Want to make the free community models smarter?</c>\n\n"
+        "With telemetry ON, every generation you run is shared with the "
+        "community collector:\n"
+        "<cg>+</c> your prompt and settings\n"
+        "<cg>+</c> the generated level\n"
+        "<cg>+</c> ratings (yours and the AI's self-review)\n\n"
+        "Levels rated above 5 become training data for the next free "
+        "EditorAI models.\n\n"
+        "<cb>Never shared:</c> your identity, API keys, or anything else.\n"
+        "You can change this anytime in Settings "
+        "(<cy>Auto-Share Generations</c>).",
+        "No Thanks", "Enable",
+        400.f,
+        [](auto*, bool enable) {
+            if (enable) {
+                Mod::get()->setSettingValue<bool>("allow-telemetry", true);
+                Notification::create("Telemetry enabled - thanks for helping!",
+                                     NotificationIcon::Success)->show();
+            }
+        }
+    );
+}
+
+static void showWelcomePopup() {
+    geode::createQuickPopup(
+        "Welcome to Editor AI",
+        // bigFont color tags: <cy> yellow, <cg> green, <cb> blue, <co> orange.
+        "<cy>Generate Geometry Dash levels with AI.</c>\n\n"
+        "<cb>Getting started</c>\n"
+        "1. Open the level editor and press <cg>E</c> (or tap the AI button)\n"
+        "2. Pick a provider - <cg>Ollama</c> and <cg>Platinum</c> are free with "
+        "no account; hosted ones (Gemini, Groq, Claude, ...) need an API key\n"
+        "3. Describe a level and hit <cg>Generate</c> - review the blue preview, "
+        "then Accept or Reject\n\n"
+        "<cb>Need help?</c>\n"
+        "Join the Discord for setup help, tips, and to report bugs.",
+        "Close", "Join Discord",
+        420.f,  // a touch wider so the steps don't wrap awkwardly
+        [](auto*, bool joinDiscord) {
+            if (joinDiscord)
+                geode::utils::web::openLinkInBrowser("https://discord.gg/5hwCqMUYNj");
+            // Chain into the telemetry ask regardless of which button was
+            // pressed — opening Discord still closes this popup.
+            showTelemetryAskPopup();
+        }
+    );
+    Mod::get()->setSavedValue<bool>("seen-welcome", true);
+}
+
+// ─── In-mod updater ──────────────────────────────────────────────────────────
+// EditorAI ships off the Geode index (GitHub releases + Discord), so users
+// have no built-in update channel. This checks the repo's releases, offers a
+// confirm-to-install popup (never silent — downloading executable code needs
+// explicit consent every time), and swaps the .geode package in place with a
+// backup dance. GitHub releases always carry ONE merged all-platform .geode.
+namespace updater {
+
+// Lenient version parse. Handles the tag shapes this repo actually uses:
+//   v2.1.9   2.1.9   2.2.0-pre1   2.2.0.pre1   v2.2-pre   2.1.10beta2
+// Tokens split on . - _ +; the first three numeric tokens are maj/min/pat;
+// the first token containing letters marks a prerelease (letters = tag,
+// trailing digits = its number). A release outranks any prerelease of the
+// same triple.
+struct Parsed {
+    int maj = 0, min = 0, pat = 0;
+    bool pre = false;
+    long preNum = 0;
+    std::string preTag;
+    bool ok = false;
+};
+
+inline Parsed parseVersion(std::string s) {
+    Parsed p;
+    if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s.erase(0, 1);
+    std::vector<std::string> toks;
+    std::string cur;
+    for (char c : s) {
+        if (c == '.' || c == '-' || c == '_' || c == '+') {
+            if (!cur.empty()) { toks.push_back(cur); cur.clear(); }
+        } else cur += c;
+    }
+    if (!cur.empty()) toks.push_back(cur);
+
+    int numSlot = 0;
+    for (auto& t : toks) {
+        size_t digits = 0;
+        while (digits < t.size() && isdigit((unsigned char)t[digits])) ++digits;
+        if (digits == t.size() && digits > 0) {          // pure number
+            if (numSlot < 3) {
+                int v = (int)std::clamp<long>(std::atol(t.c_str()), 0, 1000000);
+                (numSlot == 0 ? p.maj : numSlot == 1 ? p.min : p.pat) = v;
+                ++numSlot;
+                p.ok = true;
+            } else if (p.pre && p.preNum == 0) {
+                // "-pre.1" style: number token right after the tag token
+                p.preNum = std::atol(t.c_str());
+            }
+        } else if (!t.empty()) {                          // has letters
+            // "9pre1": leading digits still fill a numeric slot
+            if (digits > 0 && numSlot < 3) {
+                int v = (int)std::clamp<long>(std::atol(t.substr(0, digits).c_str()), 0, 1000000);
+                (numSlot == 0 ? p.maj : numSlot == 1 ? p.min : p.pat) = v;
+                ++numSlot;
+                p.ok = true;
+            }
+            if (!p.pre) {
+                p.pre = true;
+                size_t li = digits;
+                while (li < t.size() && !isdigit((unsigned char)t[li])) {
+                    p.preTag += (char)tolower((unsigned char)t[li]);
+                    ++li;
+                }
+                if (li < t.size()) p.preNum = std::atol(t.c_str() + li);
+            }
+        }
+    }
+    return p;
+}
+
+// <0 a older, 0 equal, >0 a newer.
+inline int cmp(const Parsed& a, const Parsed& b) {
+    if (a.maj != b.maj) return a.maj - b.maj;
+    if (a.min != b.min) return a.min - b.min;
+    if (a.pat != b.pat) return a.pat - b.pat;
+    if (a.pre != b.pre) return a.pre ? -1 : 1;   // release beats prerelease
+    if (a.pre) {
+        if (a.preTag != b.preTag) return a.preTag < b.preTag ? -1 : 1;
+        if (a.preNum != b.preNum) return a.preNum < b.preNum ? -1 : 1;
+    }
+    return 0;
+}
+
+struct Info {
+    std::string tag, dlUrl, assetName, pageUrl, changelog;
+    long assetSize = 0;
+};
+
+inline Info g_info;
+inline bool g_inFlight = false;
+inline bool g_offeredThisSession = false;
+inline async::TaskHolder<web::WebResponse> g_checkTask;
+inline async::TaskHolder<web::WebResponse> g_dlTask;
+
+inline constexpr const char* RELEASES_API =
+    "https://api.github.com/repos/entity12208/editorai/releases?per_page=10";
+
+// FLAlert content is small — strip markdown noise and cap the changelog.
+inline std::string tidyChangelog(const std::string& body) {
+    std::string out;
+    std::stringstream ss(body);
+    std::string line;
+    while (std::getline(ss, line) && out.size() < 380) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        size_t p = line.find_first_not_of("# ");
+        if (p == std::string::npos) continue;
+        line = line.substr(p);
+        // ** bold markers render as literal stars in FLAlert — drop them
+        for (size_t q; (q = line.find("**")) != std::string::npos; )
+            line.erase(q, 2);
+        if (!line.empty()) { out += line; out += '\n'; }
+    }
+    if (out.size() > 380) { out.resize(377); out += "..."; }
+    return out;
+}
+
+inline void installBytes(const ByteVector& bytes) {
+    if (bytes.size() < 1000 || bytes[0] != 'P' || bytes[1] != 'K') {
+        createQuickPopup("Update Failed",
+            "The downloaded file doesn't look like a .geode package. "
+            "Get it manually from the releases page?",
+            "Close", "Open Page", [](auto, bool open) {
+                if (open) web::openLinkInBrowser(g_info.pageUrl);
+            });
+        return;
+    }
+    if (g_info.assetSize > 0 && (long)bytes.size() != g_info.assetSize) {
+        log::warn("Updater: size mismatch ({} vs asset {}) — aborting",
+                  bytes.size(), g_info.assetSize);
+        Notification::create("Update download was incomplete — try again later.",
+                             NotificationIcon::Error)->show();
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    auto mods   = dirs::getModsDir();
+    auto target = mods / (Mod::get()->getID() + ".geode");
+    auto tmp    = mods / (Mod::get()->getID() + ".geode.dl");
+    auto bak    = mods / (Mod::get()->getID() + ".geode.bak");
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (f) f.write(reinterpret_cast<const char*>(bytes.data()),
+                       (std::streamsize)bytes.size());
+        if (!f) {
+            std::error_code ec; fs::remove(tmp, ec);
+            Notification::create("Couldn't write the update file (disk/permissions).",
+                                 NotificationIcon::Error)->show();
+            return;
+        }
+    }
+
+    // Swap with a backup so a failure at any step leaves a working install:
+    // old → .bak, new → live, then drop the .bak.
+    std::error_code ec;
+    fs::remove(bak, ec);
+    ec.clear();
+    fs::rename(target, bak, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        Notification::create("Couldn't replace the installed .geode (file locked?). "
+                             "Install manually from GitHub.",
+                             NotificationIcon::Error)->show();
+        return;
+    }
+    ec.clear();
+    fs::rename(tmp, target, ec);
+    if (ec) {
+        std::error_code ec2;
+        fs::rename(bak, target, ec2);   // roll back
+        fs::remove(tmp, ec2);
+        Notification::create("Update swap failed — previous version restored.",
+                             NotificationIcon::Error)->show();
+        return;
+    }
+    fs::remove(bak, ec);
+
+    log::info("Updater: installed {} ({} bytes)", g_info.tag, bytes.size());
+    createQuickPopup("Update Installed",
+        fmt::format("<cg>EditorAI {}</c> is installed. It loads on the next "
+                    "launch — restart now?", g_info.tag),
+        "Later", "Restart", [](auto, bool restart) {
+            if (restart) utils::game::restart(true);
+        });
+}
+
+inline void startDownload() {
+    if (g_inFlight) return;
+    g_inFlight = true;
+    Notification::create(fmt::format("Downloading EditorAI {}...", g_info.tag),
+                         NotificationIcon::Loading)->show();
+    auto req = web::WebRequest();
+    req.timeout(std::chrono::seconds(300));
+    req.userAgent(fmt::format("EditorAI-geode-mod/{}",
+                              Mod::get()->getVersion().toVString()));
+    g_dlTask.spawn(req.get(g_info.dlUrl), [](web::WebResponse resp) {
+        g_inFlight = false;
+        if (!resp.ok()) {
+            log::warn("Updater: download HTTP {}", resp.code());
+            createQuickPopup("Download Failed",
+                fmt::format("GitHub returned HTTP {}. Get the update manually?",
+                            resp.code()),
+                "Close", "Open Page", [](auto, bool open) {
+                    if (open) web::openLinkInBrowser(g_info.pageUrl);
+                });
+            return;
+        }
+        installBytes(resp.data());
+    });
+}
+
+inline void offerUpdate() {
+    if (g_offeredThisSession) return;
+    g_offeredThisSession = true;
+    std::string cur = Mod::get()->getVersion().toVString();
+    std::string body = fmt::format(
+        "<cy>EditorAI {}</c> is available (you have {}).\n\n{}\nDownload and "
+        "install it now? One click, then restart.",
+        g_info.tag, cur,
+        g_info.changelog.empty() ? "" : g_info.changelog + "\n");
+    createQuickPopup("Update Available", body, "Later", "Update", 420.f,
+        [](auto, bool update) {
+            if (update) startDownload();
+        });
+}
+
+// Fires at most once per 6 h (saved timestamp) and once per session. The
+// network check is silent; only a strictly-newer release produces UI.
+inline void maybeCheck() {
+    if (!Mod::get()->getSettingValue<bool>("check-updates")) return;
+    if (g_inFlight || g_offeredThisSession) return;
+    int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    int64_t last = Mod::get()->getSavedValue<int64_t>("update-last-check", 0);
+    if (now - last < 6 * 3600) return;
+    Mod::get()->setSavedValue<int64_t>("update-last-check", now);
+
+    g_inFlight = true;
+    auto req = web::WebRequest();
+    req.timeout(std::chrono::seconds(20));
+    // GitHub's API rejects UA-less requests.
+    req.userAgent(fmt::format("EditorAI-geode-mod/{}",
+                              Mod::get()->getVersion().toVString()));
+    req.header("Accept", "application/vnd.github+json");
+    g_checkTask.spawn(req.get(RELEASES_API), [](web::WebResponse resp) {
+        g_inFlight = false;
+        if (!resp.ok()) {   // offline, rate-limited, GitHub blocked — silent
+            log::info("Updater: check skipped (HTTP {})", resp.code());
+            return;
+        }
+        auto jr = resp.json();
+        if (!jr) return;
+        auto json = std::move(jr).unwrap();
+        if (!json.isArray()) return;
+
+        Parsed cur = parseVersion(Mod::get()->getVersion().toVString());
+        Parsed bestVer;
+        Info   best;
+        bool   found = false;
+        for (size_t i = 0; i < json.size(); ++i) {
+            const auto& rel = json[i];
+            if (!rel.isObject()) continue;
+            if (auto d = rel["draft"].asBool(); d && d.unwrap()) continue;
+            auto tagR = rel["tag_name"].asString();
+            if (!tagR) continue;
+            Parsed ver = parseVersion(tagR.unwrap());
+            if (!ver.ok) continue;
+            // The merged all-platform .geode is the only asset we install.
+            std::string dlUrl, assetName;
+            long assetSize = 0;
+            if (rel.contains("assets") && rel["assets"].isArray()) {
+                const auto& assets = rel["assets"];
+                for (size_t a = 0; a < assets.size(); ++a) {
+                    auto nameR = assets[a]["name"].asString();
+                    if (!nameR) continue;
+                    const std::string& n = nameR.unwrap();
+                    if (n.size() > 6 && n.rfind(".geode") == n.size() - 6) {
+                        if (auto u = assets[a]["browser_download_url"].asString())
+                            dlUrl = u.unwrap();
+                        if (auto s = assets[a]["size"].asInt())
+                            assetSize = (long)s.unwrap();
+                        assetName = n;
+                        break;
+                    }
+                }
+            }
+            if (dlUrl.empty()) continue;
+            if (!found || cmp(ver, bestVer) > 0) {
+                found   = true;
+                bestVer = ver;
+                best.tag       = tagR.unwrap();
+                best.dlUrl     = std::move(dlUrl);
+                best.assetName = std::move(assetName);
+                best.assetSize = assetSize;
+                if (auto b = rel["body"].asString())
+                    best.changelog = tidyChangelog(b.unwrap());
+                if (auto h = rel["html_url"].asString())
+                    best.pageUrl = h.unwrap();
+            }
+        }
+        if (!found || cmp(bestVer, cur) <= 0) {
+            log::info("Updater: up to date ({})",
+                      Mod::get()->getVersion().toVString());
+            return;
+        }
+        log::info("Updater: {} available (installed {})", best.tag,
+                  Mod::get()->getVersion().toVString());
+        g_info = std::move(best);
+        offerUpdate();
+    });
+}
+
+} // namespace updater
+
+class $modify(EAIWelcomeMenu, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init()) return false;
+        // Once per install. A static also guards against a second MenuLayer
+        // (e.g. returning to menu) re-triggering within the same session.
+        static bool s_shownThisSession = false;
+        bool firedIntro = false;
+        if (!s_shownThisSession &&
+            !Mod::get()->getSavedValue<bool>("seen-welcome", false)) {
+            s_shownThisSession = true;
+            firedIntro = true;
+            // Defer briefly so the popup mounts on the settled menu scene.
+            // The welcome chains into the telemetry ask on dismiss.
+            this->runAction(CCSequence::create(
+                CCDelayTime::create(0.4f),
+                CCCallFunc::create(this, callfunc_selector(EAIWelcomeMenu::onShowWelcome)),
+                nullptr));
+        } else if (!s_shownThisSession &&
+                   !Mod::get()->getSavedValue<bool>("asked-telemetry", false) &&
+                   !Mod::get()->getSettingValue<bool>("allow-telemetry")) {
+            // Upgrade path: users who saw the welcome on an older version
+            // (before the telemetry ask existed) still get asked — once.
+            s_shownThisSession = true;
+            firedIntro = true;
+            this->runAction(CCSequence::create(
+                CCDelayTime::create(0.4f),
+                CCCallFunc::create(this, callfunc_selector(EAIWelcomeMenu::onShowTelemetry)),
+                nullptr));
+        }
+        // Update check: skipped on the visit that shows welcome/telemetry
+        // (no popup stacking on first launch) — the next menu visit checks.
+        if (!firedIntro) updater::maybeCheck();
+        return true;
+    }
+    void onShowWelcome()   { showWelcomePopup(); }
+    void onShowTelemetry() { showTelemetryAskPopup(); }
+};
+
 $on_mod(Loaded) {
     // Warm the feedback cache off the main thread — feedback.json can carry
     // multi-hundred-KB level dumps, and the magic-static guard inside
@@ -16944,6 +18714,57 @@ void editoraiSendFollowUp(const std::shared_ptr<GenSession>& session,
 void editoraiCancelSession(const std::shared_ptr<GenSession>& session) {
     if (!session || !session->enginePtr) return;
     static_cast<AIGeneratorPopup*>(session->enginePtr)->requestCancel();
+}
+
+// ── Overlay bridge: Ollama/Platinum model list ──────────────────────────────
+// A standalone fetcher (independent of the GD-native settings popup) so the
+// ImGui overlay can show a real selector for Platinum models instead of a
+// text box. State machine mirrors the popup's: 0 idle/none, 1 loading,
+// 2 empty, 3 have list, 4 error.
+namespace {
+    std::vector<std::string> g_ollamaModels;
+    int  g_ollamaModelState = 0;      // matches the sessions.hpp contract
+    bool g_ollamaFetchInFlight = false;
+    async::TaskHolder<web::WebResponse> g_ollamaModelTask;
+}
+
+void editoraiRefreshOllamaModels() {
+    if (g_ollamaFetchInFlight) return;
+    g_ollamaFetchInFlight = true;
+    g_ollamaModelState = 1;  // loading
+    std::string url = getOllamaUrl() + "/api/tags";
+    auto req = web::WebRequest();
+    req.timeout(std::chrono::seconds(15));
+    g_ollamaModelTask.spawn(req.get(url),
+        [](web::WebResponse resp) {
+            g_ollamaFetchInFlight = false;
+            if (!resp.ok()) { g_ollamaModels.clear(); g_ollamaModelState = 4; return; }
+            auto jr = resp.json();
+            if (!jr) { g_ollamaModels.clear(); g_ollamaModelState = 4; return; }
+            auto json = std::move(jr).unwrap();
+            std::vector<std::string> out;
+            std::unordered_set<std::string> seen;
+            // Ollama /api/tags → { "models": [ { "name": "..." }, ... ] }
+            if (json.contains("models") && json["models"].isArray()) {
+                auto& arr = json["models"];
+                for (size_t i = 0; i < arr.size(); ++i) {
+                    const matjson::Value& e = arr[i];
+                    if (!e.isObject()) continue;
+                    if (auto r = e["name"].asString()) {
+                        std::string id = r.unwrap();
+                        if (!id.empty() && seen.insert(id).second) out.push_back(std::move(id));
+                    }
+                }
+            }
+            std::sort(out.begin(), out.end());
+            g_ollamaModels = std::move(out);
+            g_ollamaModelState = g_ollamaModels.empty() ? 2 : 3;
+        });
+}
+
+int editoraiGetOllamaModels(std::vector<std::string>& out) {
+    out = g_ollamaModels;
+    return g_ollamaModelState;
 }
 
 std::vector<LocalLevelInfo> editoraiListLocalLevels() {
