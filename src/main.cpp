@@ -10922,10 +10922,11 @@ protected:
                     journalEditOp(go, false);
                     if (hasRot)
                         go->setRotation(levelcheck::getFloat(op, "rotation", 0.f));
-                    if (hasScale)
+                    if (hasScale) {
                         float s = levelcheck::getFloat(op, "scale", 1.f);
                         go->updateCustomScaleX(s);
                         go->updateCustomScaleY(s);
+                    }
                     if (flipX) go->setFlipX(!go->isFlipX());
                     if (flipY) go->setFlipY(!go->isFlipY());
                     if (colorCh > 0 && go->m_baseColor)
