@@ -10922,10 +10922,13 @@ protected:
                     journalEditOp(go, false);
                     if (hasRot)
                         go->setRotation(levelcheck::getFloat(op, "rotation", 0.f));
-                    if (hasScale)
-                        go->setScale(levelcheck::getFloat(op, "scale", 1.f));
-                    if (flipX) go->setScaleX(-go->getScaleX());
-                    if (flipY) go->setScaleY(-go->getScaleY());
+                    if (hasScale) {
+                        float s = levelcheck::getFloat(op, "scale", 1.f);
+                        go->updateCustomScaleX(s);
+                        go->updateCustomScaleY(s);
+                    }
+                    if (flipX) go->setFlipX(!go->isFlipX());
+                    if (flipY) go->setFlipY(!go->isFlipY());
                     if (colorCh > 0 && go->m_baseColor)
                         go->m_baseColor->m_colorID = colorCh;
                     if (detailCh > 0 && go->m_detailColor)
@@ -11237,15 +11240,18 @@ protected:
             auto scaleResult = objConst["scale"].asDouble();
             if (scaleResult) {
                 float s = static_cast<float>(scaleResult.unwrap());
-                if (s >= 0.1f && s <= 10.0f) gameObj->setScale(s);
+                if (s >= 0.1f && s <= 10.0f) {
+                    gameObj->updateCustomScaleX(s);
+                    gameObj->updateCustomScaleY(s);
+                }
             }
             auto flipXResult = objConst["flip_x"].asBool();
             if (flipXResult && flipXResult.unwrap())
-                gameObj->setScaleX(-gameObj->getScaleX());
+                gameObj->setFlipX(true);
 
             auto flipYResult = objConst["flip_y"].asBool();
             if (flipYResult && flipYResult.unwrap())
-                gameObj->setScaleY(-gameObj->getScaleY());
+                gameObj->setFlipY(true);
 
             // ── Z layering & editor layers ────────────────────────────────────
             // The EAS parser and macro passthroughs have carried these fields
