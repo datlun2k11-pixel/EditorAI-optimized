@@ -2735,42 +2735,68 @@ static std::pair<std::string, std::string> parseAPIError(const std::string& erro
 
 // ─── Per-provider API key / model helpers ─────────────────────────────────────
 
+static std::string sanitizeStoredKey(std::string raw) {
+    // Re-use the same invisible-char/Bearer stripping as live input
+    // We can't call AIGeneratorPopup::sanitizeApiKey (defined later), so duplicate lightly
+    if (raw.size() >= 3 && (unsigned char)raw[0]==0xEF && (unsigned char)raw[1]==0xBB && (unsigned char)raw[2]==0xBF)
+        raw.erase(0,3);
+    const std::string ws = " \t\r\n\"'`";
+    size_t s = raw.find_first_not_of(ws);
+    if (s==std::string::npos) return "";
+    size_t e = raw.find_last_not_of(ws);
+    raw = raw.substr(s, e-s+1);
+    if (raw.rfind("Bearer ",0)==0) raw = raw.substr(7);
+    else if (raw.rfind("bearer ",0)==0) raw = raw.substr(7);
+    s = raw.find_first_not_of(ws);
+    if (s==std::string::npos) return "";
+    e = raw.find_last_not_of(ws);
+    return raw.substr(s, e-s+1);
+}
 static std::string getProviderApiKey(const std::string& provider) {
-    // Prefer a Sign-In OAuth token when one is saved. Only HuggingFace ships
-    // a true button-only OAuth flow that works from a desktop mod with a
-    // loopback listener. OpenRouter requires https://*:443/3000 callbacks
-    // (per their docs), so its PKCE flow is incompatible — paste-key path
-    // only. Gemini intentionally stays paste-only too.
     if (provider == "huggingface") {
         std::string t = oauth::savedToken(provider);
-        if (!t.empty()) return t;
+        if (!t.empty()) return sanitizeStoredKey(t);
     }
-    if (provider == "gemini")       return Mod::get()->getSettingValue<std::string>("gemini-api-key");
-    if (provider == "claude")       return Mod::get()->getSettingValue<std::string>("claude-api-key");
-    if (provider == "openai")       return Mod::get()->getSettingValue<std::string>("openai-api-key");
-    if (provider == "ministral")    return Mod::get()->getSettingValue<std::string>("ministral-api-key");
-    if (provider == "huggingface")  return Mod::get()->getSettingValue<std::string>("huggingface-api-key");
-    if (provider == "openrouter")   return Mod::get()->getSettingValue<std::string>("openrouter-api-key");
-    if (provider == "deepseek")     return Mod::get()->getSettingValue<std::string>("deepseek-api-key");
-    if (provider == "groq")         return Mod::get()->getSettingValue<std::string>("groq-api-key");
-    if (provider == "custom")       return Mod::get()->getSettingValue<std::string>("custom-provider-api-key");
-    return ""; // ollama / local — no key needed
+    std::string raw;
+    if (provider == "gemini")       raw = Mod::get()->getSettingValue<std::string>("gemini-api-key");
+    else if (provider == "claude")       raw = Mod::get()->getSettingValue<std::string>("claude-api-key");
+    else if (provider == "openai")       raw = Mod::get()->getSettingValue<std::string>("openai-api-key");
+    else if (provider == "ministral")    raw = Mod::get()->getSettingValue<std::string>("ministral-api-key");
+    else if (provider == "huggingface")  raw = Mod::get()->getSettingValue<std::string>("huggingface-api-key");
+    else if (provider == "openrouter")   raw = Mod::get()->getSettingValue<std::string>("openrouter-api-key");
+    else if (provider == "deepseek")     raw = Mod::get()->getSettingValue<std::string>("deepseek-api-key");
+    else if (provider == "groq")         raw = Mod::get()->getSettingValue<std::string>("groq-api-key");
+    else if (provider == "custom")       raw = Mod::get()->getSettingValue<std::string>("custom-provider-api-key");
+    else return "";
+    return sanitizeStoredKey(raw);
 }
 
+static std::string trimModelId(std::string s) {
+    const std::string ws = " \t\r\n\"'`";
+    size_t a = s.find_first_not_of(ws);
+    if (a==std::string::npos) return "";
+    size_t b = s.find_last_not_of(ws);
+    s = s.substr(a,b-a+1);
+    // users sometimes paste "models/gemini-..." for openai compat; keep but trim
+    return s;
+}
 static std::string getProviderModel(const std::string& provider) {
-    if (provider == "gemini")       return Mod::get()->getSettingValue<std::string>("gemini-model");
-    if (provider == "claude")       return Mod::get()->getSettingValue<std::string>("claude-model");
-    if (provider == "openai")       return Mod::get()->getSettingValue<std::string>("openai-model");
-    if (provider == "ministral")    return Mod::get()->getSettingValue<std::string>("ministral-model");
-    if (provider == "huggingface")  return Mod::get()->getSettingValue<std::string>("huggingface-model");
-    if (provider == "ollama")       return Mod::get()->getSettingValue<std::string>("ollama-model");
-    if (provider == "lm-studio")    return Mod::get()->getSettingValue<std::string>("lm-studio-model");
-    if (provider == "llama-cpp")    return Mod::get()->getSettingValue<std::string>("llama-cpp-model");
-    if (provider == "openrouter")   return Mod::get()->getSettingValue<std::string>("openrouter-model");
-    if (provider == "deepseek")     return Mod::get()->getSettingValue<std::string>("deepseek-model");
-    if (provider == "groq")         return Mod::get()->getSettingValue<std::string>("groq-model");
-    if (provider == "custom")       return Mod::get()->getSettingValue<std::string>("custom-provider-model");
-    return "unknown";
+    std::string raw;
+    if (provider == "gemini")       raw = Mod::get()->getSettingValue<std::string>("gemini-model");
+    else if (provider == "claude")       raw = Mod::get()->getSettingValue<std::string>("claude-model");
+    else if (provider == "openai")       raw = Mod::get()->getSettingValue<std::string>("openai-model");
+    else if (provider == "ministral")    raw = Mod::get()->getSettingValue<std::string>("ministral-model");
+    else if (provider == "huggingface")  raw = Mod::get()->getSettingValue<std::string>("huggingface-model");
+    else if (provider == "ollama")       raw = Mod::get()->getSettingValue<std::string>("ollama-model");
+    else if (provider == "lm-studio")    raw = Mod::get()->getSettingValue<std::string>("lm-studio-model");
+    else if (provider == "llama-cpp")    raw = Mod::get()->getSettingValue<std::string>("llama-cpp-model");
+    else if (provider == "openrouter")   raw = Mod::get()->getSettingValue<std::string>("openrouter-model");
+    else if (provider == "deepseek")     raw = Mod::get()->getSettingValue<std::string>("deepseek-model");
+    else if (provider == "groq")         raw = Mod::get()->getSettingValue<std::string>("groq-model");
+    else if (provider == "custom")       raw = Mod::get()->getSettingValue<std::string>("custom-provider-model");
+    else return "unknown";
+    std::string t = trimModelId(raw);
+    return t.empty() ? "unknown" : t;
 }
 
 // ─── Custom provider (BYOPAK — Bring Your Own Provider And Key) ─────────────
@@ -12940,16 +12966,42 @@ protected:
 
     // ── API call ──────────────────────────────────────────────────────────────
 
-    // Strips leading/trailing ASCII whitespace (spaces, tabs, newlines, carriage
-    // returns). API keys are frequently copy-pasted with invisible trailing
-    // characters that cause 401/403 responses even when the key is valid.
-    static std::string trimKey(std::string s) {
-        const std::string ws = " \t\r\n";
+    // Strips leading/trailing whitespace + invisible chars that users paste
+    // accidentally (BOM, zero-width spaces, quotes, "Bearer " prefix). This is
+    // the #1 cause of 401 despite "correct" key.
+    static std::string sanitizeApiKey(std::string s) {
+        // 1) Trim ASCII whitespace + common invisible unicode (BOM, ZWSP, NBSP)
+        // BOM = EF BB BF, ZWSP = E2 80 8B, NBSP = C2 A0 in UTF-8
+        auto stripInvisible = [](std::string& str) {
+            // remove UTF-8 BOM at start
+            if (str.size() >= 3 && (unsigned char)str[0]==0xEF && (unsigned char)str[1]==0xBB && (unsigned char)str[2]==0xBF)
+                str.erase(0,3);
+            std::string out; out.reserve(str.size());
+            for (size_t i=0;i<str.size();) {
+                if (i+2 < str.size() && (unsigned char)str[i]==0xE2 && (unsigned char)str[i+1]==0x80 && (unsigned char)str[i+2]==0x8B) { i+=3; continue; } // ZWSP
+                if (i+1 < str.size() && (unsigned char)str[i]==0xC2 && (unsigned char)str[i+1]==0xA0) { i+=2; continue; } // NBSP -> skip
+                out.push_back(str[i]); ++i;
+            }
+            str.swap(out);
+        };
+        stripInvisible(s);
+        const std::string ws = " \t\r\n\"'`";
         size_t start = s.find_first_not_of(ws);
         if (start == std::string::npos) return "";
         size_t end = s.find_last_not_of(ws);
-        return s.substr(start, end - start + 1);
+        s = s.substr(start, end - start + 1);
+        stripInvisible(s);
+        // 2) If user pasted "Bearer sk-..." or "sk-..." with prefix, strip it
+        if (s.rfind("Bearer ", 0)==0) s = s.substr(7);
+        else if (s.rfind("bearer ", 0)==0) s = s.substr(7);
+        // 3) re-trim after prefix removal
+        start = s.find_first_not_of(ws);
+        if (start == std::string::npos) return "";
+        end = s.find_last_not_of(ws);
+        s = s.substr(start, end - start + 1);
+        return s;
     }
+    static std::string trimKey(std::string s) { return sanitizeApiKey(std::move(s)); }
 
     // ── Tool 1: download a reference level from GD's servers ───────────────
     // Builds a compact summary the AI can use as design inspiration. Skips
@@ -13641,9 +13693,22 @@ protected:
     // Entry point. Called instead of callAPI's single-shot when tool use is
     // enabled and the selected provider supports it.
     void runToolLoop(const std::string& userPrompt, const std::string& rawApiKey) {
-        m_toolApiKey   = trimKey(rawApiKey);
+        m_toolApiKey   = sanitizeApiKey(rawApiKey);
+        if (m_toolApiKey.empty()) m_toolApiKey = getProviderApiKey(Mod::get()->getSettingValue<std::string>("ai-provider"));
         m_toolProvider = Mod::get()->getSettingValue<std::string>("ai-provider");
         m_toolModel    = getProviderModel(m_toolProvider);
+        if (m_toolModel.empty() || m_toolModel=="unknown") {
+            onError("Invalid Model", fmtUserError("No model configured for provider '"+m_toolProvider+"'.",
+                "Open Settings → Provider tab and pick a model.", makeErrorCode(m_toolProvider,40,0)));
+            return;
+        }
+        if (m_toolApiKey.empty() && m_toolProvider!="ollama" && m_toolProvider!="lm-studio" && m_toolProvider!="llama-cpp" && m_toolProvider!="manual") {
+            onError("API Key Required", fmtUserError("No API key saved for provider '"+m_toolProvider+"' (tool loop would get HTTP 401).",
+                "Open Settings → paste a fresh key, then save.", makeErrorCode(m_toolProvider,20,1)));
+            return;
+        }
+        { std::string mk = m_toolApiKey.size()>8 ? m_toolApiKey.substr(0,4)+"..."+m_toolApiKey.substr(m_toolApiKey.size()-4) : "***";
+          log::info("Tool loop preflight: provider={} model='{}' keyLen={} mask='{}'", m_toolProvider, m_toolModel, m_toolApiKey.size(), mk); }
         // Tool use is unbounded — no round budget. The model runs until it
         // emits a final answer; the per-tool caps + duplicate guard +
         // backstop in doToolRound prevent runaway loops.
@@ -16381,6 +16446,25 @@ protected:
                 // Same endpoints the tool-use loop hits.
                 url = toolUse::urlFor(provider, model);
             }
+        }
+
+        // ── Pre-flight validation (prevents opaque 400/401) ───────────────
+        if (model.empty() || model=="unknown") {
+            onError("Invalid Model", fmtUserError("No model configured for provider '"+provider+"'.",
+                "Open Settings → Provider tab and pick a model (use Fetch model list).", makeErrorCode(provider,40,0)));
+            return;
+        }
+        if (provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp" && provider!="manual" && apiKey.empty()) {
+            onError("API Key Required", fmtUserError("No API key saved for provider '"+provider+"' (HTTP 401 would follow).",
+                "Open Settings → paste a fresh key from the provider dashboard, then save.", makeErrorCode(provider,20,1)));
+            return;
+        }
+        // Masked diagnostics: length + prefix, never full key
+        {
+            std::string masked = apiKey.size()>8 ? apiKey.substr(0,4)+"..."+apiKey.substr(apiKey.size()-4) : "***";
+            log::info("API preflight: provider={} model='{}' keyLen={} keyMask='{}' url='{}'", provider, model, apiKey.size(), masked, url);
+            if (apiKey.size()<8 && provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp")
+                log::warn("API key looks suspiciously short ({} chars) — pasted correctly?", apiKey.size());
         }
 
         std::string jsonBody = requestBody.dump();

@@ -206,7 +206,7 @@
   },
   "gemini-model": {
    "type": "string",
-   "default": "gemini-3-flash",
+   "default": "gemini-2.5-flash",
    "name": "Gemini Model",
    "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Gemini model id."
   },
@@ -222,7 +222,7 @@
   },
   "claude-model": {
    "type": "string",
-   "default": "claude-sonnet-4-6",
+   "default": "claude-sonnet-4-20250514",
    "name": "Claude Model",
    "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Claude model id."
   },
