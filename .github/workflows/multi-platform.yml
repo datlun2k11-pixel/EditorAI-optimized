@@ -3,8 +3,7 @@ name: Build Geode Mod
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: [main, master]
   pull_request:
 
 permissions:
@@ -18,8 +17,10 @@ jobs:
         config:
         - name: Windows
           os: windows-latest
+          target: Windows
         - name: macOS
           os: macos-latest
+          target: macOS
         - name: iOS
           os: macos-latest
           target: iOS
@@ -32,6 +33,7 @@ jobs:
 
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +54,10 @@ jobs:
     if: always() && needs.build.result != 'skipped'
 
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - uses: geode-sdk/build-geode-mod/combine@main
         id: build
 
