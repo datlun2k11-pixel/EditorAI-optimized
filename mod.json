@@ -1,5 +1,5 @@
 {
- "geode": "5.9.0",
+ "geode": "5.10.1",
  "gd": {
   "win": "2.2081",
   "android": "2.2081",
@@ -8,7 +8,7 @@
  },
  "id": "entity12208.edit-ai",
  "name": "Editor AI",
- "version": "v2.1.9",
+ "version": "v2.1.10",
  "developer": "entity12208",
  "description": "Generate Geometry Dash levels using AI!",
  "dependencies": {
