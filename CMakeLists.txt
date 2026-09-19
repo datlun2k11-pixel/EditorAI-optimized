@@ -30,9 +30,20 @@ add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 # Workaround for SDK 5.10.1 iOS bindings bug: CCKeyboardDispatcher modify has empty address
 # Codegen generates `GEODE_APPLY_MODIFY_FOR_CONSTRUCTOR(, Default, ...)` which expands to
-# `static auto address = ;` -> error: expected expression on iOS. Patch at configure and build time.
+# `static auto address = ;` -> error: expected expression on iOS.
+# Fix Modify.hpp to handle empty AddressInline_ as 0, plus patch generated file.
 if (IOS OR "${CMAKE_SYSTEM_NAME}" STREQUAL "iOS")
-    # Configure-time patch (after codegen has run once)
+    # Configure-time: patch Modify.hpp directly (present before codegen)
+    set(_modify_hpp "$ENV{GEODE_SDK}/loader/include/Geode/modify/Modify.hpp")
+    if (EXISTS "${_modify_hpp}")
+        file(READ "${_modify_hpp}" _mod_content)
+        if (_mod_content MATCHES "static auto address = AddressInline_;")
+            string(REPLACE "static auto address = AddressInline_;" "static auto address = (AddressInline_ + 0);" _mod_content "${_mod_content}")
+            file(WRITE "${_modify_hpp}" "${_mod_content}")
+            message(STATUS "Patched Modify.hpp for iOS empty address bug (configure-time)")
+        endif()
+    endif()
+    # Also try patching already-generated CCKeyboardDispatcher.hpp if present
     set(_ios_patch_file "${CMAKE_CURRENT_BINARY_DIR}/bindings/bindings/Geode/modify/CCKeyboardDispatcher.hpp")
     if (EXISTS "${_ios_patch_file}")
         file(READ "${_ios_patch_file}" _ios_content)
@@ -41,14 +52,20 @@ if (IOS OR "${CMAKE_SYSTEM_NAME}" STREQUAL "iOS")
         file(WRITE "${_ios_patch_file}" "${_ios_content}")
         message(STATUS "Patched CCKeyboardDispatcher.hpp for iOS (configure-time)")
     endif()
-    # Build-time patch via custom target (runs every build before main lib)
+    # Build-time patch via custom target (runs every build, after Codegen)
     add_custom_target(patch-ios-bindings ALL
         COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-ios.cmake"
         COMMENT "Patching iOS bindings CCKeyboardDispatcher if needed"
         VERBATIM
     )
-    # Ensure patch runs before compiling the mod
     add_dependencies(${PROJECT_NAME} patch-ios-bindings)
+    # Ensure Codegen runs before patch (patch must be after Codegen generates the file)
+    if (TARGET GeodeCodegen)
+        add_dependencies(patch-ios-bindings GeodeCodegen)
+    endif()
+    if (TARGET codegen)
+        add_dependencies(patch-ios-bindings codegen)
+    endif()
 endif()
 
 # ImGui overlay — the mod's primary UI (E key on desktop, floating bubble
