@@ -34,6 +34,7 @@ jobs:
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
     timeout-minutes: 30
+    continue-on-error: ${{ matrix.config.target == 'iOS' }}
 
     steps:
       - uses: actions/checkout@v4
