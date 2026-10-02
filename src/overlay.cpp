@@ -8,11 +8,14 @@
 
 #include "sessions.hpp"
 #include <Geode/Geode.hpp>
+#ifdef GEODE_IS_DESKTOP
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
+#endif
 #include <imgui-cocos.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <unordered_set>
 #include <cstring>
 #include <unordered_map>
 
@@ -96,6 +99,21 @@ void applyThemeFrame() {
     c[ImGuiCol_SliderGrab]     = COL_ACCENT;
     c[ImGuiCol_SliderGrabActive] = lift(COL_ACCENT, 0.15f);
 }
+
+// Every EditorAI ImGui text box opts into this callback. ImGui normally owns
+// Ctrl+A and Shift-selection itself, but the game/backend can consume the
+// physical keyboard event before the focused widget observes the modifier.
+// The keyboard hook below mirrors modifiers into ImGui explicitly; this
+// callback makes Select All deterministic for whichever field is active.
+int textSelectionCallback(ImGuiInputTextCallbackData* data) {
+    if (data && ImGui::GetIO().KeyCtrl &&
+        ImGui::IsKeyPressed(ImGuiKey_A, false))
+        data->SelectAll();
+    return 0;
+}
+
+constexpr ImGuiInputTextFlags TEXT_SELECTION_FLAGS =
+    ImGuiInputTextFlags_CallbackAlways;
 
 // ── State ────────────────────────────────────────────────────────────────────
 struct OverlayState {
@@ -261,6 +279,115 @@ std::unordered_map<std::string, TextBuf>& textBufs() {
     return b;
 }
 
+// Named BYOPAK profiles. Geode saved values live in this mod's local save
+// directory; nothing here is synced or sent anywhere. A profile includes the
+// key because endpoints commonly use different credentials, and loading a
+// URL with the previous endpoint's key is both confusing and unsafe.
+struct EndpointProfile {
+    std::string name, url, model, auth, key;
+};
+
+std::vector<EndpointProfile> loadEndpointProfiles() {
+    std::vector<EndpointProfile> out;
+    auto raw = editoraiGetSavedStr("custom-endpoint-profiles", "");
+    if (raw.empty()) return out;
+    auto parsed = matjson::parse(raw);
+    if (!parsed) return out;
+    const auto root = parsed.unwrap();
+    if (!root.isArray()) return out;
+    for (size_t i = 0; i < root.size() && out.size() < 20; ++i) {
+        const auto e = root[i];
+        if (!e.isObject()) continue;
+        EndpointProfile p;
+        p.name  = e["name"].asString().unwrapOr("");
+        p.url   = e["url"].asString().unwrapOr("");
+        p.model = e["model"].asString().unwrapOr("");
+        p.auth  = e["auth"].asString().unwrapOr("");
+        p.key   = e["key"].asString().unwrapOr("");
+        if (!p.name.empty() && !p.url.empty()) out.push_back(std::move(p));
+    }
+    return out;
+}
+
+void saveEndpointProfiles(const std::vector<EndpointProfile>& profiles) {
+    auto arr = matjson::Value::array();
+    for (auto& p : profiles) {
+        auto e = matjson::Value::object();
+        e["name"] = p.name; e["url"] = p.url; e["model"] = p.model;
+        e["auth"] = p.auth; e["key"] = p.key;
+        arr.push(std::move(e));
+    }
+    editoraiSetSavedStr("custom-endpoint-profiles", arr.dump());
+}
+
+void endpointProfilesWidget() {
+    static std::string selected;
+    static std::array<char, 64> newName{};
+    auto profiles = loadEndpointProfiles();
+    if (!selected.empty() && std::none_of(profiles.begin(), profiles.end(),
+            [&](const EndpointProfile& p) { return p.name == selected; }))
+        selected.clear();
+
+    ImGui::TextColored(COL_DIM, "saved locally");
+    ImGui::SetNextItemWidth(210.f);
+    if (ImGui::BeginCombo("endpoint profile##custom-profiles",
+                          selected.empty() ? "(none)" : selected.c_str())) {
+        for (auto& p : profiles) {
+            bool isSelected = selected == p.name;
+            if (ImGui::Selectable(p.name.c_str(), isSelected)) selected = p.name;
+            if (isSelected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(selected.empty());
+    if (ImGui::SmallButton("Load")) {
+        for (auto& p : profiles) if (p.name == selected) {
+            editoraiSetStr("custom-provider-name", p.name);
+            editoraiSetStr("custom-provider-url", p.url);
+            editoraiSetStr("custom-provider-model", p.model);
+            editoraiSetStr("custom-provider-auth", p.auth);
+            editoraiSetStr("custom-provider-api-key", p.key);
+            for (auto& [id, tb] : textBufs()) tb.editing = false;
+            break;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Delete")) {
+        profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
+            [&](const EndpointProfile& p) { return p.name == selected; }), profiles.end());
+        saveEndpointProfiles(profiles);
+        selected.clear();
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SetNextItemWidth(150.f);
+    ImGui::InputTextWithHint("##endpoint-profile-name", "profile name",
+        newName.data(), newName.size(), TEXT_SELECTION_FLAGS, textSelectionCallback);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Save current")) {
+        std::string name = newName.data();
+        if (name.empty()) name = editoraiGetStr("custom-provider-name");
+        std::string url = editoraiGetStr("custom-provider-url");
+        if (!name.empty() && !url.empty()) {
+            EndpointProfile current{name, url,
+                editoraiGetStr("custom-provider-model"),
+                editoraiGetStr("custom-provider-auth"),
+                editoraiGetStr("custom-provider-api-key")};
+            auto it = std::find_if(profiles.begin(), profiles.end(),
+                [&](const EndpointProfile& p) { return p.name == name; });
+            if (it == profiles.end()) {
+                if (profiles.size() < 20) profiles.push_back(std::move(current));
+            } else *it = std::move(current);
+            saveEndpointProfiles(profiles);
+            selected = name;
+            newName.fill(0);
+        }
+    }
+    tipIfHovered("Saves name, URL, model, auth template and key only in this "
+                 "mod's local Geode save data. Up to 20 profiles.");
+}
+
 // autoBypass: pasting an API key or model ID often contains characters GD's
 // own text inputs would reject — turn both bypass settings on automatically
 // so nothing downstream mangles them.
@@ -273,10 +400,11 @@ void settingText(const char* label, const std::string& id,
         std::string cur = editoraiGetStr(id.c_str());
         snprintf(tb.buf.data(), tb.buf.size(), "%s", cur.c_str());
     }
-    ImGui::SetNextItemWidth(280.f);
+    ImGui::SetNextItemWidth(std::min(280.f, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint(fmt::format("{}##{}", label, id).c_str(), hint,
-        tb.buf.data(), tb.buf.size(),
-        secret ? ImGuiInputTextFlags_Password : 0);
+        tb.buf.data(), tb.buf.size(), TEXT_SELECTION_FLAGS |
+        (secret ? ImGuiInputTextFlags_Password : ImGuiInputTextFlags_None),
+        textSelectionCallback);
     tb.editing = ImGui::IsItemActive();
     tipIfHovered(tip);
     if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -293,7 +421,7 @@ void settingCombo(const char* label, const char* id,
                   const char* tip = nullptr) {
     std::string cur = editoraiGetStr(id);
     const char* preview = cur.empty() ? "(none)" : cur.c_str();
-    ImGui::SetNextItemWidth(210.f);
+    ImGui::SetNextItemWidth(std::min(210.f, ImGui::GetContentRegionAvail().x));
     if (ImGui::BeginCombo(fmt::format("{}##{}", label, id).c_str(), preview)) {
         for (auto* opt : options) {
             bool sel = cur == opt;
@@ -306,7 +434,120 @@ void settingCombo(const char* label, const char* id,
     tipIfHovered(tip);
 }
 
-// ── Saved-level autocomplete ─────────────────────────────────────────────────
+// ── Quality presets ───────────────────────────────────────────────────────────
+// One-click profiles that set the refinement / vision / self-check / two-pass
+// options together so a new user never has to understand each knob. Picking a
+// profile writes the underlying settings immediately; the individual toggles
+// below stay fully adjustable afterward.
+void applyQualityProfile(const std::string& name) {
+    if (name == "fast") {
+        editoraiSetInt("refinement-rounds", 1);
+        editoraiSetBool("refine-until-done", false);
+        editoraiSetBool("two-pass-generation", false);
+        editoraiSetBool("enable-vision", false);
+        editoraiSetBool("enable-self-critique", false);
+    } else if (name == "premium") {
+        editoraiSetInt("refinement-rounds", 5);
+        editoraiSetBool("refine-until-done", true);
+        editoraiSetBool("two-pass-generation", true);
+        editoraiSetBool("enable-vision", true);
+        editoraiSetBool("enable-self-critique", true);
+    } else {  // balanced — a user-selected quicker compromise
+        editoraiSetInt("refinement-rounds", 3);
+        editoraiSetBool("refine-until-done", true);
+        editoraiSetBool("two-pass-generation", true);
+        editoraiSetBool("enable-vision", true);
+        editoraiSetBool("enable-self-critique", true);
+    }
+    editoraiSetStr("quality-profile", name);
+}
+
+bool qualityProfileMatches(const std::string& name) {
+    int rounds = (int)editoraiGetInt("refinement-rounds");
+    bool untilDone = editoraiGetBool("refine-until-done");
+    bool twoPass = editoraiGetBool("two-pass-generation");
+    bool vision = editoraiGetBool("enable-vision");
+    bool critique = editoraiGetBool("enable-self-critique");
+    if (name == "fast")
+        return rounds == 1 && !untilDone && !twoPass && !vision && !critique;
+    if (name == "premium")
+        return rounds == 5 && untilDone && twoPass && vision && critique;
+    return rounds == 3 && untilDone && twoPass && vision && critique;
+}
+
+// Combo + tip for the quality preset row.
+void qualityProfileWidget() {
+    static const std::vector<const char*> PROFILES = {"premium", "balanced", "fast"};
+    std::string cur = editoraiGetStr("quality-profile");
+    if (cur != "fast" && cur != "premium") cur = "balanced";
+    if (!qualityProfileMatches(cur)) cur = "custom";
+    const char* preview =
+        cur == "fast"    ? "fast (cheaper)" :
+        cur == "premium" ? "premium (best, default)" :
+        cur == "custom"  ? "custom" : "balanced";
+    ImGui::SetNextItemWidth(std::min(210.f, ImGui::GetContentRegionAvail().x));
+    if (ImGui::BeginCombo("quality preset##qprofile", preview)) {
+        for (auto* p : PROFILES) {
+            bool sel = cur == p;
+            const char* lbl =
+                std::strcmp(p, "fast") == 0 ? "fast (cheaper)" :
+                std::strcmp(p, "premium") == 0 ? "premium (best, default)" :
+                "balanced";
+            if (ImGui::Selectable(lbl, sel)) applyQualityProfile(p);
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    tipIfHovered("Premium does the most work. Choose a lighter preset only "
+                 "when speed or cost matters more.");
+}
+
+// Getting-started hint: the ONE action still needed for the current provider,
+// so a new user never has to read the whole settings page. Returns
+// (message, ready) — ready=false renders it in the warning color.
+std::pair<std::string, bool> setupHintFor(const std::string& p) {
+    auto hasKey = [&](const char* keyId) {
+        return !editoraiGetStr(keyId).empty();
+    };
+    if (p == "manual")
+        return {"Manual: copy prompt, paste reply.", true};
+    if (p == "ollama") {
+        if (editoraiGetBool("use-platinum"))
+            return {"Platinum selected. Pick a model and test it.", true};
+        std::string det = editoraiDetectedBackends();
+        if (det.find("ollama") != std::string::npos)
+            return {"Ollama found. Pick a model and test it.", true};
+        return {"No local Ollama found. Install it, run `ollama pull <model>`, "
+                "or switch on Platinum above.", false};
+    }
+    if (p == "lm-studio" || p == "llama-cpp") {
+        std::string det = editoraiDetectedBackends();
+        if (det.find(p) != std::string::npos)
+            return {p == "lm-studio" ? "LM Studio detected - set the model and "
+                                       "press Test connection."
+                                     : "llama.cpp detected - set the model and "
+                                       "press Test connection.", true};
+        return {p == "lm-studio" ? "LM Studio not detected - start its server "
+                                   "(default port 1234), then Test connection."
+                                 : "llama.cpp not detected - start its server "
+                                   "(default port 8080), then Test connection.", false};
+    }
+    if (p == "custom") {
+        bool haveUrl = !editoraiGetStr("custom-provider-url").empty();
+        bool haveModel = !editoraiGetStr("custom-provider-model").empty();
+        if (haveUrl && haveModel)
+            return {"Endpoint ready. Test it.", true};
+        return {"Enter an endpoint and model. Key optional.", false};
+    }
+    // Hosted providers — key check mirrors the *-api-key setting names.
+    std::string keyId = p + "-api-key";
+    if (hasKey(keyId.c_str()))
+        return {"Key set. Test it.", true};
+    return {"Paste your " + p + " API key below (or use 'Sign in with browser' "
+            "where available).", false};
+}
+
+
 // Call IMMEDIATELY after an InputText holding a level ID: shows the user's
 // saved (online) levels in a dropdown under the box. Typing an ID or a name
 // narrows the list live; clicking an entry writes its ID into the buffer.
@@ -379,90 +620,330 @@ bool savedLevelSuggest(char* buf, size_t bufSize) {
     return picked;
 }
 
-// Example-level-IDs editor: one box per ID with +/- row controls and the
-// saved-level picker, stored back into the comma-joined setting (cap 5).
-std::vector<std::array<char, 24>> g_exampleIdRows;
-bool g_exampleIdsLoaded = false;
+// ── Markdown rendering ───────────────────────────────────────────────────────
+// ImGui has no markdown renderer, so this is a small purpose-built one for
+// exactly the subset LLMs emit: ATX headings, bullet/numbered lists, fenced
+// code blocks, blockquotes, horizontal rules, and inline `code`/**bold**/
+// *italic*. It is written to be safe on PARTIAL input (a stream can cut off
+// mid-token) — every unterminated construct simply renders as plain text.
+//
+// Wrapping is done by hand instead of via TextWrapped because a single logical
+// line mixes styles (bold spans etc.), and ImGui's wrapping applies per call.
+namespace md {
 
+// One styled run of text produced by the inline parser.
+struct Span {
+    std::string text;
+    bool bold   = false;
+    bool italic = false;
+    bool code   = false;
+};
+
+// Split a line into styled spans. Unterminated markers are emitted literally,
+// which is what makes this safe mid-stream.
+std::vector<Span> inlineSpans(std::string_view line) {
+    std::vector<Span> out;
+    Span cur;
+    bool bold = false, italic = false, code = false;
+    auto flush = [&] {
+        if (!cur.text.empty()) { out.push_back(cur); cur.text.clear(); }
+    };
+    auto restyle = [&] { cur.bold = bold; cur.italic = italic; cur.code = code; };
+    restyle();
+    size_t i = 0;
+    while (i < line.size()) {
+        // Inline code wins over emphasis (markdown rule) — inside a code span
+        // asterisks are literal.
+        if (line[i] == '`') {
+            // Only open a code span if there is a closing backtick on this line.
+            if (!code && line.find('`', i + 1) == std::string_view::npos) {
+                cur.text += '`'; ++i; continue;
+            }
+            flush(); code = !code; restyle(); ++i; continue;
+        }
+        if (!code && line.compare(i, 2, "**") == 0) {
+            if (!bold && line.find("**", i + 2) == std::string_view::npos) {
+                cur.text += "**"; i += 2; continue;
+            }
+            flush(); bold = !bold; restyle(); i += 2; continue;
+        }
+        if (!code && (line[i] == '*' || line[i] == '_')) {
+            char m = line[i];
+            // Not emphasis when it's part of a word (snake_case identifiers).
+            bool wordInner = i > 0 && (std::isalnum((unsigned char)line[i - 1]) ||
+                                       line[i - 1] == '_');
+            if (m == '_' && wordInner) { cur.text += m; ++i; continue; }
+            if (!italic && line.find(m, i + 1) == std::string_view::npos) {
+                cur.text += m; ++i; continue;
+            }
+            flush(); italic = !italic; restyle(); ++i; continue;
+        }
+        cur.text += line[i];
+        ++i;
+    }
+    flush();
+    return out;
+}
+
+// Draw one span run with manual word wrapping inside `wrapW`.
+// `x0` is the left edge; the caller has already indented.
+void drawSpans(const std::vector<Span>& spans, float wrapW,
+               const ImVec4& baseCol)
+{
+    const ImVec4 codeCol {0.85f, 0.92f, 1.00f, 1.f};
+    float startX = ImGui::GetCursorPosX();
+    float lineLeft = wrapW;
+    bool  atLineStart = true;
+
+    auto newline = [&] {
+        // NOTE: no ImGui::NewLine() here. After any Text* call ImGui has
+        // already advanced the cursor to the next line (SameLine is what keeps
+        // items together), so calling NewLine would insert a BLANK line and
+        // double-space every wrapped paragraph. All we need is to restore the
+        // left edge — Text resets CursorPos.x to the indent, which is not
+        // necessarily our hanging-indent start.
+        ImGui::SetCursorPosX(startX);
+        lineLeft = wrapW;
+        atLineStart = true;
+    };
+
+    for (auto& sp : spans) {
+        // Split into words so wrapping can happen between them.
+        size_t p = 0;
+        while (p < sp.text.size()) {
+            size_t sp1 = sp.text.find(' ', p);
+            std::string word = sp.text.substr(
+                p, sp1 == std::string::npos ? std::string::npos : sp1 - p);
+            bool trailingSpace = sp1 != std::string::npos;
+            p = (sp1 == std::string::npos) ? sp.text.size() : sp1 + 1;
+            if (word.empty()) {
+                if (trailingSpace && !atLineStart) {
+                    float w = ImGui::CalcTextSize(" ").x;
+                    if (lineLeft - w <= 0.f) { newline(); }
+                    else {
+                        ImGui::SameLine(0.f, 0.f);
+                        ImGui::TextUnformatted(" ");
+                        lineLeft -= w;
+                    }
+                }
+                continue;
+            }
+            std::string draw = word + (trailingSpace ? " " : "");
+            float w = ImGui::CalcTextSize(draw.c_str()).x;
+            if (!atLineStart && w > lineLeft) newline();
+            if (!atLineStart) ImGui::SameLine(0.f, 0.f);
+            // Long unbreakable token (a URL or a base64 blob): hard-slice it
+            // so it can never push the layout past the panel edge.
+            if (w > wrapW && wrapW > 8.f) {
+                std::string chunk;
+                for (char ch : draw) {
+                    chunk += ch;
+                    if (ImGui::CalcTextSize(chunk.c_str()).x >= wrapW - 4.f) {
+                        if (sp.code) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, codeCol);
+                            ImGui::TextUnformatted(chunk.c_str());
+                            ImGui::PopStyleColor();
+                        } else {
+                            ImGui::TextColored(baseCol, "%s", chunk.c_str());
+                        }
+                        ImGui::SetCursorPosX(startX);
+                        chunk.clear();
+                    }
+                }
+                if (!chunk.empty()) {
+                    if (sp.code) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, codeCol);
+                        ImGui::TextUnformatted(chunk.c_str());
+                        ImGui::PopStyleColor();
+                    } else {
+                        ImGui::TextColored(baseCol, "%s", chunk.c_str());
+                    }
+                    lineLeft = wrapW - ImGui::CalcTextSize(chunk.c_str()).x;
+                    atLineStart = false;
+                } else {
+                    lineLeft = wrapW;
+                    atLineStart = true;
+                }
+                continue;
+            }
+            // Bold has no separate font here (one atlas), so it renders as a
+            // brighter tint; italic dims slightly. Cheap, but readable.
+            ImVec4 col = baseCol;
+            if (sp.code) col = codeCol;
+            else if (sp.bold) col = ImVec4(std::min(baseCol.x * 1.25f, 1.f),
+                                           std::min(baseCol.y * 1.25f, 1.f),
+                                           std::min(baseCol.z * 1.25f, 1.f), 1.f);
+            else if (sp.italic) col = ImVec4(baseCol.x * 0.85f, baseCol.y * 0.85f,
+                                             baseCol.z * 0.92f, 1.f);
+            if (sp.code) {
+                // Subtle plate behind inline code so it reads as code.
+                ImVec2 pos = ImGui::GetCursorScreenPos();
+                ImVec2 sz  = ImGui::CalcTextSize(draw.c_str());
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    ImVec2(pos.x - 1.f, pos.y),
+                    ImVec2(pos.x + sz.x + 1.f, pos.y + sz.y),
+                    ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 0.09f)), 2.f);
+            }
+            ImGui::TextColored(col, "%s", draw.c_str());
+            lineLeft -= w;
+            atLineStart = false;
+            if (lineLeft <= 0.f) newline();
+        }
+    }
+    // Nothing to close out: the final Text call already ended the line.
+}
+
+// Render a whole markdown document (or a partial one, mid-stream).
+void render(std::string_view text, const ImVec4& baseCol, float wrapW) {
+    if (wrapW < 40.f) wrapW = 40.f;
+    bool inFence = false;
+    std::string fenceLang;
+    std::string codeAcc;
+    float baseX = ImGui::GetCursorPosX();
+    int fenceIdx = 0;   // distinct child IDs when a message has several blocks
+
+    auto flushFence = [&] {
+        if (codeAcc.empty() && fenceLang.empty()) return;
+        // Code block: monospace-ish plate. One child so it scrolls its own
+        // horizontal overflow instead of stretching the transcript.
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.f, 1.f, 1.f, 0.05f));
+        int lines = 1;
+        for (char c : codeAcc) if (c == '\n') ++lines;
+        float h = std::min((float)lines, 18.f) * ImGui::GetTextLineHeight()
+                + ImGui::GetStyle().WindowPadding.y * 2.f;
+        // EndChild is called unconditionally — required since ImGui 1.90 even
+        // when BeginChild returns false (culled/collapsed).
+        ImGui::BeginChild(ImGui::GetID(&codeAcc) + (ImGuiID)(++fenceIdx),
+                          ImVec2(wrapW, h), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        if (!fenceLang.empty())
+            ImGui::TextColored(COL_DIM, "%s", fenceLang.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.94f, 0.82f, 1.f));
+        ImGui::TextUnformatted(codeAcc.c_str());
+        ImGui::PopStyleColor();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        codeAcc.clear();
+        fenceLang.clear();
+    };
+
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t eol = text.find('\n', pos);
+        std::string_view line = text.substr(
+            pos, eol == std::string_view::npos ? std::string_view::npos : eol - pos);
+        bool last = (eol == std::string_view::npos);
+        pos = last ? text.size() + 1 : eol + 1;
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+
+        // Fence toggling.
+        std::string_view trimmed = line;
+        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+            trimmed.remove_prefix(1);
+        if (trimmed.rfind("```", 0) == 0 || trimmed.rfind("~~~", 0) == 0) {
+            if (inFence) { flushFence(); inFence = false; }
+            else {
+                inFence = true;
+                fenceLang = std::string(trimmed.substr(3));
+            }
+            continue;
+        }
+        if (inFence) {
+            codeAcc.append(line);
+            codeAcc += '\n';
+            if (last) flushFence();   // unterminated fence mid-stream
+            continue;
+        }
+
+        if (trimmed.empty()) { ImGui::Spacing(); continue; }
+
+        // Horizontal rule.
+        if (trimmed.size() >= 3 &&
+            (trimmed.find_first_not_of('-') == std::string_view::npos ||
+             trimmed.find_first_not_of('*') == std::string_view::npos ||
+             trimmed.find_first_not_of('_') == std::string_view::npos)) {
+            ImGui::Separator();
+            continue;
+        }
+
+        // Headings: bigger visual weight via the accent color + spacing.
+        int hashes = 0;
+        while (hashes < (int)trimmed.size() && trimmed[hashes] == '#') ++hashes;
+        if (hashes > 0 && hashes <= 6 && hashes < (int)trimmed.size() &&
+            trimmed[hashes] == ' ') {
+            std::string_view body = trimmed.substr(hashes + 1);
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(baseX);
+            auto spans = inlineSpans(body);
+            for (auto& s : spans) s.bold = true;
+            drawSpans(spans, wrapW, COL_ACCENT);
+            if (hashes <= 2) {
+                // Underline for h1/h2 so structure reads at a glance.
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(p.x, p.y - 2.f), ImVec2(p.x + wrapW, p.y - 2.f),
+                    ImGui::GetColorU32(ImVec4(COL_ACCENT.x, COL_ACCENT.y,
+                                              COL_ACCENT.z, 0.35f)));
+                ImGui::Spacing();
+            }
+            continue;
+        }
+
+        // Blockquote.
+        if (trimmed.front() == '>') {
+            std::string_view body = trimmed.substr(1);
+            while (!body.empty() && body.front() == ' ') body.remove_prefix(1);
+            ImVec2 top = ImGui::GetCursorScreenPos();
+            ImGui::Indent(10.f);
+            ImGui::SetCursorPosX(baseX + 10.f);
+            drawSpans(inlineSpans(body), wrapW - 10.f, COL_DIM);
+            ImGui::Unindent(10.f);
+            float bot = ImGui::GetCursorScreenPos().y;
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(top.x, top.y), ImVec2(top.x + 2.f, bot),
+                ImGui::GetColorU32(COL_DIM), 1.f);
+            continue;
+        }
+
+        // Bulleted / numbered list item.
+        bool bullet = (trimmed.size() >= 2 &&
+                       (trimmed[0] == '-' || trimmed[0] == '*' || trimmed[0] == '+') &&
+                       trimmed[1] == ' ');
+        size_t numLen = 0;
+        while (numLen < trimmed.size() && std::isdigit((unsigned char)trimmed[numLen]))
+            ++numLen;
+        bool numbered = numLen > 0 && numLen + 1 < trimmed.size() &&
+                        (trimmed[numLen] == '.' || trimmed[numLen] == ')') &&
+                        trimmed[numLen + 1] == ' ';
+        if (bullet || numbered) {
+            std::string marker = bullet
+                ? std::string("\u2022 ")
+                : std::string(trimmed.substr(0, numLen + 1)) + " ";
+            std::string_view body = trimmed.substr(bullet ? 2 : numLen + 2);
+            ImGui::SetCursorPosX(baseX);
+            ImGui::TextColored(COL_DIM, "%s", marker.c_str());
+            ImGui::SameLine(0.f, 0.f);
+            float markerW = ImGui::CalcTextSize(marker.c_str()).x;
+            drawSpans(inlineSpans(body), std::max(wrapW - markerW, 40.f), baseCol);
+            continue;
+        }
+
+        ImGui::SetCursorPosX(baseX);
+        drawSpans(inlineSpans(trimmed), wrapW, baseCol);
+    }
+    if (inFence) flushFence();
+}
+
+} // namespace md
+
+// (No example-level-IDs editor anymore: pinning reference level IDs by hand is
+// gone. The AI finds references itself with the search_levels tool — ask for a
+// style in words, e.g. "like Nine Circles", and it searches GD by title.)
 bool isAllDigits(const char* s) {
     if (!*s) return false;
     for (; *s; ++s)
         if (*s < '0' || *s > '9') return false;
     return true;
-}
-
-void exampleIdsWidget() {
-    auto save = [] {
-        std::string joined;
-        for (auto& r : g_exampleIdRows) {
-            if (!isAllDigits(r.data())) continue;  // names stay UI-only
-            if (!joined.empty()) joined += ",";
-            joined += r.data();
-        }
-        editoraiSetStr("example-level-ids", joined);
-    };
-    if (!g_exampleIdsLoaded) {
-        g_exampleIdRows.clear();
-        std::string raw = editoraiGetStr("example-level-ids");
-        size_t start = 0;
-        while (start < raw.size() && g_exampleIdRows.size() < 5) {
-            size_t comma = raw.find(',', start);
-            size_t len = (comma == std::string::npos ? raw.size() : comma) - start;
-            std::string part = raw.substr(start, len);
-            part.erase(0, part.find_first_not_of(" \t"));
-            if (auto cut = part.find_last_not_of(" \t"); cut != std::string::npos)
-                part.resize(cut + 1);
-            if (!part.empty()) {
-                std::array<char, 24> row{};
-                snprintf(row.data(), row.size(), "%s", part.c_str());
-                g_exampleIdRows.push_back(row);
-            }
-            if (comma == std::string::npos) break;
-            start = comma + 1;
-        }
-        if (g_exampleIdRows.empty()) g_exampleIdRows.push_back({});
-        g_exampleIdsLoaded = true;
-    }
-
-    ImGui::TextColored(COL_DIM, "example levels (the AI studies their style)");
-    tipIfHovered("Up to 5 online level IDs the AI downloads and learns from. "
-                 "Type an ID or a name to filter your saved levels, or pick "
-                 "one from the dropdown.");
-    int removeIdx = -1;
-    for (int i = 0; i < (int)g_exampleIdRows.size(); ++i) {
-        ImGui::PushID(7000 + i);
-        ImGui::SetNextItemWidth(170.f);
-        ImGui::InputTextWithHint("##exid", "ID, or name to search",
-            g_exampleIdRows[i].data(), g_exampleIdRows[i].size());
-        bool editedNow = ImGui::IsItemDeactivatedAfterEdit();
-        bool rowActive = ImGui::IsItemActive();  // before suggest's Begin/End
-        if (savedLevelSuggest(g_exampleIdRows[i].data(),
-                              g_exampleIdRows[i].size()) || editedNow)
-            save();
-        if (g_exampleIdRows[i][0] && !isAllDigits(g_exampleIdRows[i].data()) &&
-            !rowActive) {
-            ImGui::SameLine();
-            ImGui::TextColored(COL_WARN, "(pick from list - names don't save)");
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(g_exampleIdRows.size() <= 1 && !g_exampleIdRows[0][0]);
-        if (ImGui::SmallButton("-")) removeIdx = i;
-        ImGui::EndDisabled();
-        tipIfHovered("Remove this example level.");
-        if (i + 1 == (int)g_exampleIdRows.size()) {
-            ImGui::SameLine();
-            ImGui::BeginDisabled(g_exampleIdRows.size() >= 5);
-            if (ImGui::SmallButton("+")) g_exampleIdRows.push_back({});
-            ImGui::EndDisabled();
-            tipIfHovered("Add another example level (max 5).");
-        }
-        ImGui::PopID();
-    }
-    if (removeIdx >= 0) {
-        g_exampleIdRows.erase(g_exampleIdRows.begin() + removeIdx);
-        if (g_exampleIdRows.empty()) g_exampleIdRows.push_back({});
-        save();
-    }
 }
 
 // Model picker: a combo of presets PLUS a "custom..." entry. Picking a preset
@@ -598,12 +1079,36 @@ void providerModelWidget(const std::string& p) {
     else if (p == "llama-cpp")
         settingText("model", "llama-cpp-model", "default", false, tip, true);
     else if (p == "manual")
-        ImGui::TextColored(COL_DIM, "No model - you paste into any AI yourself.");
+        ImGui::TextColored(COL_DIM, "Copy prompt, paste reply.");
     else
         settingText("model", "custom-provider-model", "model name", false, tip, true);
 }
 
 // ── Tab: Sessions ─────────────────────────────────────────────────────────────
+// Width available for wrapped message bodies inside the transcript child.
+float transcriptWrapW(float indent) {
+    return std::max(ImGui::GetContentRegionAvail().x - indent - 6.f, 60.f);
+}
+
+// A "thinking" disclosure: the AI's reasoning, collapsed by default, rendered
+// dim and in the same markdown as everything else. Used for both finished
+// entries and the live stream.
+//   forceOpen: nullptr = remember the user's click (finished entries).
+//              non-null = drive the state every frame (the live block opens
+//              while the model is only reasoning, then folds away once the
+//              actual answer starts arriving).
+void renderThinkingBlock(const char* label, const std::string& text,
+                         const bool* forceOpen = nullptr)
+{
+    if (forceOpen) ImGui::SetNextItemOpen(*forceOpen);
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    bool open = ImGui::TreeNodeEx(label);
+    ImGui::PopStyleColor();
+    if (!open) return;
+    md::render(text, COL_DIM, transcriptWrapW(ImGui::GetTreeNodeToLabelSpacing()));
+    ImGui::TreePop();
+}
+
 void renderEntry(const GenSession::Entry& e, int idx) {
     using K = GenSession::Entry::Kind;
     ImGui::PushID(idx);
@@ -616,7 +1121,12 @@ void renderEntry(const GenSession::Entry& e, int idx) {
             ImVec2 barTop = ImGui::GetCursorScreenPos();
             ImGui::Indent(10.f);
             ImGui::TextColored(roleCol, e.kind == K::User ? "You" : "AI");
-            ImGui::TextWrapped("%s", e.text.c_str());
+            // The AI writes markdown; the user's own text is shown verbatim.
+            if (e.kind == K::Assistant)
+                md::render(e.text, ImVec4(0.90f, 0.90f, 0.92f, 1.f),
+                           transcriptWrapW(10.f));
+            else
+                ImGui::TextWrapped("%s", e.text.c_str());
             ImGui::Unindent(10.f);
             float barBot = ImGui::GetCursorScreenPos().y -
                            ImGui::GetStyle().ItemSpacing.y;
@@ -630,12 +1140,7 @@ void renderEntry(const GenSession::Entry& e, int idx) {
             break;
         }
         case K::Thinking:
-            if (ImGui::TreeNode("thinking...")) {
-                ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-                ImGui::TextWrapped("%s", e.text.c_str());
-                ImGui::PopStyleColor();
-                ImGui::TreePop();
-            }
+            renderThinkingBlock("thinking", e.text);
             break;
         case K::ToolCall:
             ImGui::TextColored(COL_TOOL, "> %s", e.text.substr(0, 90).c_str());
@@ -651,13 +1156,82 @@ void renderEntry(const GenSession::Entry& e, int idx) {
             }
             break;
         case K::Status:
+        {
+            std::string brief = e.text;
+            if (brief.size() > 140) {
+                size_t cut = brief.find_first_of(".\n", 80);
+                if (cut == std::string::npos || cut > 140) cut = 137;
+                brief.resize(cut);
+                brief += "...";
+            }
             ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-            ImGui::TextWrapped("- %s", e.text.c_str());
+            ImGui::TextWrapped("- %s", brief.c_str());
             ImGui::PopStyleColor();
+            if (brief != e.text && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", e.text.c_str());
             break;
+        }
         case K::Error:
             ImGui::TextColored(COL_ERR, "%s", e.text.c_str());
             break;
+    }
+    ImGui::PopID();
+}
+
+// The live bubble: the in-flight assistant turn, re-rendered every frame from
+// the streamed buffers. Same visual language as a finished AI message, plus a
+// blinking caret so it's obvious the text is still arriving.
+void renderStreamingBubble(const GenSession& s) {
+    if (!s.streamActive && s.streamText.empty() && s.streamThinking.empty())
+        return;
+    ImGui::PushID("stream");
+    ImGui::Spacing();
+    ImVec2 barTop = ImGui::GetCursorScreenPos();
+    ImGui::Indent(10.f);
+    ImGui::TextColored(COL_AI, "AI");
+    if (s.streamActive) {
+        ImGui::SameLine();
+        // Three-dot pulse: cheap, no textures, reads as "working".
+        int phase = (int)(ImGui::GetTime() * 3.0) % 4;
+        ImGui::TextColored(COL_DIM, "%s",
+            phase == 0 ? "" : phase == 1 ? "." : phase == 2 ? ".." : "...");
+        // Elapsed / bytes line, so a slow or queued provider never looks frozen.
+        if (!s.liveStatus.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(COL_DIM, "(%s)", s.liveStatus.c_str());
+        }
+    }
+    // Reasoning first: thinking models spend their first stretch entirely in
+    // the reasoning channel, so this is the only thing to show at that point.
+    if (!s.streamThinking.empty())
+    {
+        // Open while the model is still only reasoning; fold once the answer
+        // starts, so the user always sees the newest content without scrolling.
+        bool open = s.streamText.empty();
+        renderThinkingBlock("thinking...", s.streamThinking, &open);
+    }
+    if (!s.streamText.empty())
+        md::render(s.streamText, ImVec4(0.90f, 0.90f, 0.92f, 1.f),
+                   transcriptWrapW(10.f));
+    else if (s.streamActive && s.streamThinking.empty()) {
+        // Nothing decodable yet. Say WHY rather than just "waiting": a queued
+        // Platinum request, or a provider that buffers instead of streaming,
+        // legitimately sends keepalives (bytes, no text) for minutes. The
+        // liveStatus line above carries the elapsed time and byte count, so
+        // this only has to explain that silence is expected, not a hang.
+        ImGui::TextColored(COL_DIM, "Connected; waiting for text.");
+    }
+    // Blinking caret while the stream is open. On its own line: SameLine after
+    // md::render would fight the renderer's own line handling.
+    if (s.streamActive && fmodf((float)ImGui::GetTime(), 1.0f) < 0.5f)
+        ImGui::TextColored(COL_ACCENT, "|");
+    ImGui::Unindent(10.f);
+    float barBot = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y;
+    if (barBot > barTop.y) {
+        ImVec4 barCol = COL_AI; barCol.w = 0.65f;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImVec2(barTop.x + 1.f, barTop.y), ImVec2(barTop.x + 4.f, barBot),
+            ImGui::GetColorU32(barCol), 2.f);
     }
     ImGui::PopID();
 }
@@ -762,6 +1336,11 @@ void tabChat(float dt) {
             ImGui::SameLine();
             ImGui::TextColored(COL_DIM, "(restored)");
         }
+        if (!s->flowPhase.empty() && s->flowPhase != "idle") {
+            ImGui::Indent(14.f);
+            ImGui::TextColored(COL_DIM, "%s", s->flowPhase.c_str());
+            ImGui::Unindent(14.f);
+        }
         ImGui::Unindent(14.f);
         ImGui::PopID();
     }
@@ -805,7 +1384,11 @@ void tabChat(float dt) {
             ? ImGui::GetFrameHeightWithSpacing() : 0.f);
     ImGui::BeginChild("transcript", ImVec2(0, -footerH), ImGuiChildFlags_Borders);
     if (sel) {
-        bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.f;
+        // While streaming, the content grows every frame, so the "am I at the
+        // bottom?" test needs slack — otherwise the view detaches on its own.
+        // A real scroll-up (beyond the slack) still stops the auto-follow.
+        float slack = sel->streamActive ? 48.f : 4.f;
+        bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - slack;
         // Render the newest 150 entries — full 400-entry transcripts cost
         // real CPU every frame and nobody scrolls that far back.
         size_t start = sel->transcript.size() > 150
@@ -815,13 +1398,22 @@ void tabChat(float dt) {
                                (int)start);
         for (size_t i = start; i < sel->transcript.size(); ++i)
             renderEntry(sel->transcript[i], (int)i);
+        // In-flight turn, streamed live under everything else.
+        renderStreamingBubble(*sel);
+        // Non-streamed turn (streaming off, or a provider/platform that can't):
+        // there is no live text, so show the engine's liveness line instead —
+        // otherwise a multi-minute request looks like the mod hung.
+        if (!sel->streamActive && sel->state == GenSession::State::Running &&
+            !sel->liveStatus.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(COL_DIM, "AI %s", sel->liveStatus.c_str());
+        }
         if (pinBottom) ImGui::SetScrollHereY(1.0f);
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
         ImGui::TextWrapped(g_st.pendingSelectAfter >= 0
-            ? "Starting the generation - its conversation appears here the "
-              "moment the editor opens..."
-            : "Select a session to see its conversation.");
+            ? "Starting..."
+            : "Select a session.");
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
@@ -853,6 +1445,19 @@ void tabChat(float dt) {
                      "can tweak and re-run it.");
     }
 
+    // Export the full conversation to a text file (debugging / sharing).
+    if (sel) {
+        if (ImGui::SmallButton("export")) {
+            std::string err;
+            if (editoraiExportSession(sel, err))
+                ImGui::SetTooltip("%s", err.c_str());
+        }
+        tipIfHovered("Writes this session's full transcript (prompts, AI "
+                     "replies, tool calls, thinking) to session-<id>.txt in "
+                     "the mod's save folder.");
+        ImGui::SameLine();
+    }
+
     // Chat mode: how the AI treats your next message.
     static const char* MODES[] = {"Edit", "Plan", "Chat"};
     ImGui::SetNextItemWidth(64.f);
@@ -865,7 +1470,8 @@ void tabChat(float dt) {
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 76.f);
     bool enter = ImGui::InputTextWithHint("##chat", "message the AI...",
         g_st.chatInput, sizeof(g_st.chatInput),
-        ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGuiInputTextFlags_EnterReturnsTrue | TEXT_SELECTION_FLAGS,
+        textSelectionCallback);
     ImGui::SameLine();
     if (sel && sel->state == GenSession::State::Running) {
         if (ImGui::Button("Cancel", ImVec2(68, 0)))
@@ -893,6 +1499,9 @@ void tabChat(float dt) {
 }
 
 // ── New-chat composer (the right pane of the Chat tab) ──────────────────────
+// Chat-first: the message box is the primary control and everything else is a
+// compact strip under it. You type what you want and press Ctrl+Enter (or the
+// send button); the knobs are there when you want them, not in your way.
 void composerBody(float dt) {
     if (!g_st.levelsFresh) {
         g_st.levels = editoraiListLocalLevels();
@@ -900,24 +1509,49 @@ void composerBody(float dt) {
         if (g_st.genTarget >= (int)g_st.levels.size()) g_st.genTarget = -1;
     }
 
-    ImGui::TextColored(COL_ACCENT, "Target");
-    tipIfHovered("Where the generated objects go.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("refresh levels")) g_st.levelsFresh = false;
-    tipIfHovered("Re-read your created-levels list.");
+    bool manualProv = editoraiGetStr("ai-provider") == "manual";
 
+    // ── The prompt IS the interface ─────────────────────────────────────────
+    // Reserve room for the strip + button row below, and give the rest to the
+    // message box so it feels like a chat composer rather than a form field.
+    float footer = ImGui::GetFrameHeightWithSpacing() * 2.f + 34.f;
+    float inputH = std::max(ImGui::GetContentRegionAvail().y - footer, 90.f);
+    // Ctrl+Enter sends; plain Enter inserts a newline (multi-line prompts are
+    // common, so Enter must not fire the generation).
+    bool sendNow = ImGui::InputTextMultiline("##prompt",
+        g_st.genPrompt, sizeof(g_st.genPrompt), ImVec2(-1.f, inputH),
+        ImGuiInputTextFlags_EnterReturnsTrue | TEXT_SELECTION_FLAGS,
+        textSelectionCallback) &&
+        ImGui::GetIO().KeyCtrl;
+    bool typing = ImGui::IsItemActive();
+    if (g_st.genPrompt[0] == '\0' && !typing) {
+        // Hint drawn inside the empty box (InputTextMultiline has no hint API).
+        ImVec2 r = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(r.x + 6.f, r.y + 5.f), ImGui::GetColorU32(COL_DIM),
+            "Describe the level you want - theme, gamemodes, pacing, a song, "
+            "a level to imitate...");
+    }
+    tipIfHovered("Plain words work best. Mention a BPM ('140 bpm') to sync to "
+                 "beats, or name a level ('like Nine Circles') and the AI will "
+                 "look it up. Ctrl+Enter sends.");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        editoraiSetSavedStr("ov-gen-prompt", g_st.genPrompt);
+
+    // ── One-line context strip: where it goes + the knobs, inline ───────────
     std::string preview =
-        g_st.genTarget == -1 ? "Current editor" :
-        g_st.genTarget == -2 ? "+ New level"    :
+        g_st.genTarget == -1 ? "current editor" :
+        g_st.genTarget == -2 ? "new level"      :
         (g_st.genTarget < (int)g_st.levels.size()
-            ? fmt::format("{} ({} obj)", g_st.levels[g_st.genTarget].name,
-                          g_st.levels[g_st.genTarget].objectCount)
+            ? g_st.levels[g_st.genTarget].name
             : "?");
-    ImGui::SetNextItemWidth(300.f);
+    ImGui::TextColored(COL_DIM, "to");
+    ImGui::SameLine(0.f, 4.f);
+    ImGui::SetNextItemWidth(150.f);
     if (ImGui::BeginCombo("##target", preview.c_str())) {
-        if (ImGui::Selectable("Current editor", g_st.genTarget == -1))
+        if (ImGui::Selectable("current editor", g_st.genTarget == -1))
             g_st.genTarget = -1;
-        if (ImGui::Selectable("+ New level", g_st.genTarget == -2))
+        if (ImGui::Selectable("+ new level", g_st.genTarget == -2))
             g_st.genTarget = -2;
         if (!g_st.levels.empty()) ImGui::Separator();
         for (int i = 0; i < (int)g_st.levels.size(); ++i) {
@@ -928,148 +1562,150 @@ void composerBody(float dt) {
                 g_st.genTarget = i;
             ImGui::PopID();
         }
+        ImGui::Separator();
+        if (ImGui::Selectable("refresh list")) g_st.levelsFresh = false;
         ImGui::EndCombo();
     }
-    tipIfHovered("Current editor: build where you are.\n+ New level: create "
-                 "and open a fresh level.\nOr pick any of your created levels.");
-
-    if (g_st.genTarget == -2) {
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-        ImGui::TextUnformatted("A fresh level will be created and opened.");
-        ImGui::PopStyleColor();
-    } else {
-        if (ImGui::Checkbox("Replace level contents", &g_st.genReplace))
+    tipIfHovered("Where the objects go: the level you're in, a brand-new "
+                 "level, or any of your created levels.");
+    if (g_st.genTarget != -2) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox("replace", &g_st.genReplace))
             editoraiSetSavedInt("ov-gen-replace", g_st.genReplace ? 1 : 0);
-        tipIfHovered("On: the AI rebuilds the level from scratch.\n"
-                     "Off: it adds to what's already there.");
+        tipIfHovered("On: rebuild the level from scratch.\n"
+                     "Off: add to what's already there.");
+    }
+    ImGui::SameLine();
+    // Live summary of the knobs, click to expand.
+    static bool s_optionsOpen = false;
+    {
+        std::string diff = editoraiGetStr("difficulty");
+        std::string len  = editoraiGetStr("length");
+        std::string sty  = editoraiGetStr("style");
+        std::string sum  = fmt::format("{} | {} | {}",
+            diff.empty() ? "?" : diff, len.empty() ? "?" : len,
+            sty == "levelID" ? "reference" : (sty.empty() ? "?" : sty));
+        if (ImGui::SmallButton(fmt::format("{}  {}",
+                s_optionsOpen ? "v" : ">", sum).c_str()))
+            s_optionsOpen = !s_optionsOpen;
+        tipIfHovered("Difficulty, length and style. Click to change them.");
     }
 
-    ImGui::Spacing();
-    ImGui::TextColored(COL_ACCENT, "Describe the level");
-    ImGui::InputTextMultiline("##prompt", g_st.genPrompt, sizeof(g_st.genPrompt),
-        ImVec2(-1.f, 110.f));
-    tipIfHovered("Plain words: theme, gamemodes, pacing, song, anything. "
-                 "Mention a BPM to sync to beats.");
-    if (ImGui::IsItemDeactivatedAfterEdit())
-        editoraiSetSavedStr("ov-gen-prompt", g_st.genPrompt);
-    {
-        size_t plen = strlen(g_st.genPrompt);
-        if (plen > 0)
-            ImGui::TextColored(plen > 400 ? COL_WARN : COL_DIM,
-                "%zu chars%s", plen,
-                plen > 400 ? "  (long prompts cost more and rarely help)" : "");
-    }
-
-    ImGui::Spacing();
-    // Difficulty: presets or a free-typed custom word.
-    {
-        static const std::vector<const char*> PRESETS =
-            {"easy", "medium", "hard", "extreme"};
-        std::string cur = editoraiGetStr("difficulty");
-        bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
-            [&](const char* p) { return cur == p; }) != PRESETS.end();
-        ImGui::SetNextItemWidth(150.f);
-        if (ImGui::BeginCombo("difficulty##diffsel",
-                (!isPreset || g_st.diffCustom) ? "custom..." : cur.c_str())) {
-            for (auto* p : PRESETS)
-                if (ImGui::Selectable(p, cur == p)) {
-                    editoraiSetStr("difficulty", p);
-                    g_st.diffCustom = false;
-                }
-            if (ImGui::Selectable("custom...", g_st.diffCustom || !isPreset))
-                g_st.diffCustom = true;
-            ImGui::EndCombo();
+    if (s_optionsOpen) {
+        ImGui::Indent(8.f);
+        // Difficulty: presets or a free-typed custom word.
+        {
+            static const std::vector<const char*> PRESETS =
+                {"easy", "medium", "hard", "extreme"};
+            std::string cur = editoraiGetStr("difficulty");
+            bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
+                [&](const char* p) { return cur == p; }) != PRESETS.end();
+            ImGui::SetNextItemWidth(150.f);
+            if (ImGui::BeginCombo("difficulty##diffsel",
+                    (!isPreset || g_st.diffCustom) ? "custom..." : cur.c_str())) {
+                for (auto* p : PRESETS)
+                    if (ImGui::Selectable(p, cur == p)) {
+                        editoraiSetStr("difficulty", p);
+                        g_st.diffCustom = false;
+                    }
+                if (ImGui::Selectable("custom...", g_st.diffCustom || !isPreset))
+                    g_st.diffCustom = true;
+                ImGui::EndCombo();
+            }
+            tipIfHovered("How hard the level should be. 'custom...' lets you "
+                         "type anything - e.g. 'insane demon' or 'chill auto'.");
+            if (g_st.diffCustom || !isPreset) {
+                ImGui::SameLine();
+                settingText("##customdiff", "difficulty", "your difficulty",
+                            false, "Free-form difficulty the AI aims for.");
+            }
         }
-        tipIfHovered("How hard the level should be. 'custom...' lets you "
-                     "type anything - e.g. 'insane demon' or 'chill auto'.");
-        if (g_st.diffCustom || !isPreset) {
-            ImGui::SameLine();
-            settingText("##customdiff", "difficulty", "your difficulty",
-                        false, "Free-form difficulty the AI aims for.");
-        }
-    }
-    // Style: presets, a reference level, or a free-typed custom word.
-    {
-        static const std::vector<const char*> PRESETS =
-            {"modern", "retro", "flow", "memory"};
-        std::string cur = editoraiGetStr("style");
-        bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
-            [&](const char* p) { return cur == p; }) != PRESETS.end();
-        bool isLevelId = cur == "levelID";
-        ImGui::SetNextItemWidth(150.f);
-        const char* stylePreview =
-            isLevelId ? "levelID"
-                      : ((g_st.styleCustom || !isPreset) ? "custom..." : cur.c_str());
-        if (ImGui::BeginCombo("style##stylesel", stylePreview)) {
-            for (auto* p : PRESETS)
-                if (ImGui::Selectable(p, cur == p)) {
-                    editoraiSetStr("style", p);
+        // Style: presets, a reference level, or a free-typed custom word.
+        {
+            static const std::vector<const char*> PRESETS =
+                {"modern", "retro", "flow", "memory"};
+            std::string cur = editoraiGetStr("style");
+            bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
+                [&](const char* p) { return cur == p; }) != PRESETS.end();
+            bool isLevelId = cur == "levelID";
+            ImGui::SetNextItemWidth(150.f);
+            const char* stylePreview =
+                isLevelId ? "levelID"
+                          : ((g_st.styleCustom || !isPreset) ? "custom..." : cur.c_str());
+            if (ImGui::BeginCombo("style##stylesel", stylePreview)) {
+                for (auto* p : PRESETS)
+                    if (ImGui::Selectable(p, cur == p)) {
+                        editoraiSetStr("style", p);
+                        g_st.styleCustom = false;
+                    }
+                if (ImGui::Selectable("levelID", isLevelId)) {
+                    editoraiSetStr("style", "levelID");
                     g_st.styleCustom = false;
                 }
-            if (ImGui::Selectable("levelID", isLevelId)) {
-                editoraiSetStr("style", "levelID");
-                g_st.styleCustom = false;
+                if (ImGui::Selectable("custom...", g_st.styleCustom))
+                    g_st.styleCustom = true;
+                ImGui::EndCombo();
             }
-            if (ImGui::Selectable("custom...", g_st.styleCustom))
-                g_st.styleCustom = true;
-            ImGui::EndCombo();
+            tipIfHovered("Visual/gameplay style. 'levelID' copies the look of one "
+                         "of your saved levels; 'custom...' takes any words. Or "
+                         "just name a level in the prompt - the AI can search "
+                         "for it itself.");
+            if (isLevelId && !g_st.styleCustom) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(170.f);
+                ImGui::InputTextWithHint("##stylelvl", "ID or saved-level name",
+                    g_st.styleLevelId, sizeof(g_st.styleLevelId),
+                    TEXT_SELECTION_FLAGS, textSelectionCallback);
+                bool edited  = ImGui::IsItemDeactivatedAfterEdit();
+                // Capture BEFORE the suggest window's Begin/End clobbers
+                // LastItemData — else this tooltip can never fire.
+                bool hovered = ImGui::IsItemHovered();
+                if (savedLevelSuggest(g_st.styleLevelId, sizeof(g_st.styleLevelId))
+                    || edited)
+                    editoraiSetSavedStr("ov-style-id", g_st.styleLevelId);
+                if (hovered)
+                    ImGui::SetTooltip("Type to filter your saved levels, or pick "
+                                      "from the dropdown. The AI downloads it "
+                                      "and matches its style.");
+            } else if (g_st.styleCustom || (!isPreset && !isLevelId)) {
+                ImGui::SameLine();
+                settingText("##customstyle", "style", "your style", false,
+                            "Free-form style words the AI aims for.");
+            } else if (g_st.styleLevelId[0] && !isLevelId) {
+                // Style switched away — clear the reference so it can't silently
+                // resurface on a later levelID generation.
+                memset(g_st.styleLevelId, 0, sizeof(g_st.styleLevelId));
+                editoraiSetSavedStr("ov-style-id", "");
+            }
         }
-        tipIfHovered("Visual/gameplay style. 'levelID' copies the look of one "
-                     "of your saved levels; 'custom...' takes any words.");
-        if (isLevelId && !g_st.styleCustom) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(170.f);
-            ImGui::InputTextWithHint("##stylelvl", "ID or saved-level name",
-                g_st.styleLevelId, sizeof(g_st.styleLevelId));
-            bool edited  = ImGui::IsItemDeactivatedAfterEdit();
-            // Capture BEFORE the suggest window's Begin/End clobbers
-            // LastItemData — else this tooltip can never fire.
-            bool hovered = ImGui::IsItemHovered();
-            if (savedLevelSuggest(g_st.styleLevelId, sizeof(g_st.styleLevelId))
-                || edited)
-                editoraiSetSavedStr("ov-style-id", g_st.styleLevelId);
-            if (hovered)
-                ImGui::SetTooltip("Type to filter your saved levels, or pick "
-                                  "from the dropdown. The AI downloads it "
-                                  "and matches its style.");
-        } else if (g_st.styleCustom || (!isPreset && !isLevelId)) {
-            ImGui::SameLine();
-            settingText("##customstyle", "style", "your style", false,
-                        "Free-form style words the AI aims for.");
-        } else if (g_st.styleLevelId[0] && !isLevelId) {
-            // Style switched away — clear the reference so it can't silently
-            // resurface on a later levelID generation.
-            memset(g_st.styleLevelId, 0, sizeof(g_st.styleLevelId));
-            editoraiSetSavedStr("ov-style-id", "");
+        settingCombo("length", "length", {"short", "medium", "long", "xl", "xxl"},
+            "Target level length. The mod enforces it - too-short drafts get "
+            "extension rounds automatically.");
+        {
+            int v = (int)editoraiGetInt("target-object-count");
+            ImGui::SetNextItemWidth(150.f);
+            if (ImGui::InputInt("target objects##tgtobj", &v, 100, 1000))
+                editoraiSetInt("target-object-count",
+                               (int64_t)std::clamp(v, 0, 20000));
+            tipIfHovered("Minimum total objects the level must reach - the AI "
+                         "keeps building (densifying and decorating) until it "
+                         "gets there. 0 = let the AI decide.");
         }
-    }
-    settingCombo("length", "length", {"short", "medium", "long", "xl", "xxl"},
-        "Target level length. The mod enforces it - too-short drafts get "
-        "extension rounds automatically.");
-    {
-        int v = (int)editoraiGetInt("target-object-count");
-        ImGui::SetNextItemWidth(150.f);
-        if (ImGui::InputInt("target objects##tgtobj", &v, 100, 1000))
-            editoraiSetInt("target-object-count",
-                           (int64_t)std::clamp(v, 0, 20000));
-        tipIfHovered("Minimum total objects the level must reach - the AI "
-                     "keeps building (densifying and decorating) until it "
-                     "gets there. 0 = let the AI decide. Capped by the "
-                     "'max objects' setting.");
+        ImGui::Unindent(8.f);
     }
 
-    ImGui::Spacing();
+    // ── Send row ────────────────────────────────────────────────────────────
     bool can = g_st.genPrompt[0] != '\0';
     ImGui::BeginDisabled(!can);
-    // Generate follows the user's accent color, not a hardcoded blue.
+    // Send follows the user's accent color, not a hardcoded blue.
     ImGui::PushStyleColor(ImGuiCol_Button,
         ImVec4(COL_ACCENT.x * 0.55f, COL_ACCENT.y * 0.55f, COL_ACCENT.z * 0.55f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         ImVec4(COL_ACCENT.x * 0.75f, COL_ACCENT.y * 0.75f, COL_ACCENT.z * 0.75f, 1.f));
-    // Manual provider: "Generate" becomes "Copy prompt for AI" (no network).
-    bool manualProv = editoraiGetStr("ai-provider") == "manual";
-    const char* genLabel = manualProv ? "Copy prompt for AI" : "Generate";
-    if (ImGui::Button(genLabel, ImVec2(manualProv ? 180 : 140, 32))) {
+    // Manual provider: "Send" becomes "Copy prompt for AI" (no network).
+    const char* genLabel = manualProv ? "Copy prompt for AI" : "Send";
+    bool clicked = ImGui::Button(genLabel, ImVec2(manualProv ? 180 : 110, 30));
+    if ((clicked || (sendNow && can)) && can) {
         std::string err;
         bool replace = g_st.genTarget == -2 ? true : g_st.genReplace;
         std::string expectName = g_st.genTarget >= 0 &&
@@ -1119,7 +1755,7 @@ void composerBody(float dt) {
     // Manual: once a prompt is copied, offer Build-from-clipboard.
     if (manualProv && editoraiManualPending()) {
         ImGui::SameLine();
-        if (ImGui::Button("Build from clipboard", ImVec2(180, 32))) {
+        if (ImGui::Button("Build from clipboard", ImVec2(180, 30))) {
             std::string err;
             if (editoraiManualBuild(err)) {
                 g_st.pendingSelectAfter = 0;
@@ -1130,11 +1766,16 @@ void composerBody(float dt) {
         tipIfHovered("Reads your AI's reply from the clipboard and builds the level.");
     }
     ImGui::EndDisabled();
-    tipIfHovered("Start the generation. You can close this panel - or even "
-                 "the editor - while it runs.");
+    tipIfHovered("Start building. You can close this panel - or even the "
+                 "editor - while it runs. (Ctrl+Enter also sends.)");
+    ImGui::SameLine();
     if (!can) {
-        ImGui::SameLine();
         ImGui::TextColored(COL_DIM, "describe the level first");
+    } else {
+        size_t plen = strlen(g_st.genPrompt);
+        ImGui::TextColored(plen > 400 ? COL_WARN : COL_DIM,
+            "%zu chars%s", plen,
+            plen > 400 ? "  (long prompts rarely help)" : "");
     }
 
     if (!g_st.genError.empty()) {
@@ -1145,12 +1786,6 @@ void composerBody(float dt) {
             g_st.genError.clear();  // keep state self-consistent post-TTL
         }
     }
-
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-    ImGui::TextWrapped("Tips: mention a BPM ('140 bpm') to sync to beats; "
-        "with Replace off the AI builds onto whatever is already there.");
-    ImGui::PopStyleColor();
 }
 
 // ── Tab: Settings ─────────────────────────────────────────────────────────────
@@ -1160,18 +1795,63 @@ void tabSettings() {
         "huggingface", "deepseek", "groq", "ollama", "lm-studio", "llama-cpp",
         "custom", "manual"};
     static const std::vector<const char*> SUB_PROVIDERS = {
-        "", "gemini", "claude", "openai", "openrouter", "ministral",
-        "huggingface", "deepseek", "groq", "ollama", "lm-studio", "llama-cpp"};
+        "same", "platinum", "gemini", "claude", "openai", "openrouter",
+        "ministral", "huggingface", "deepseek", "groq", "ollama",
+        "lm-studio", "llama-cpp", "custom"};
 
     ImGui::BeginChild("settingsScroll", ImVec2(0, 0));
 
     if (ImGui::CollapsingHeader("Provider", ImGuiTreeNodeFlags_DefaultOpen)) {
-        settingCombo("provider", "ai-provider", PROVIDERS,
-            "Which AI service generates levels. Ollama runs locally (free); "
-            "Platinum runs on community machines (free); the rest need an "
-            "account with that provider.");
+        // Provider picker with local-backend auto-detect tags.
+        {
+            std::string detected = editoraiDetectedBackends();
+            std::string curP = editoraiGetStr("ai-provider");
+            const char* preview = curP.empty() ? "(none)" : curP.c_str();
+            ImGui::SetNextItemWidth(210.f);
+            if (ImGui::BeginCombo("provider##provider", preview)) {
+                for (auto* opt : PROVIDERS) {
+                    bool sel = curP == opt;
+                    std::string label = opt;
+                    if (detected.find(opt) != std::string::npos)
+                        label += "  (detected)";
+                    if (ImGui::Selectable(label.c_str(), sel))
+                        editoraiSetStr("ai-provider", opt);
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            tipIfHovered("Which AI service generates levels. Ollama runs "
+                         "locally (free); Platinum runs on community machines "
+                         "(free); the rest need an account with that provider. "
+                         "Local servers found on this machine are tagged "
+                         "(detected).");
+        }
         std::string p = editoraiGetStr("ai-provider");
+        {
+            // Getting-started nudge: the single action still needed for this
+            // provider, so setup is one glance instead of a settings maze.
+            auto [hint, ready] = setupHintFor(p);
+            if (!hint.empty()) {
+                ImGui::TextColored(ready ? COL_DIM : COL_WARN, "%s", hint.c_str());
+                tipIfHovered("The one thing left to do before you can generate.");
+                ImGui::Spacing();
+            }
+        }
         providerModelWidget(p);
+        {
+            // Test connection — a real authenticated probe of the current
+            // provider (the same endpoints the AI generation calls).
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Test connection")) editoraiTestProvider();
+            tipIfHovered("Sends a tiny authenticated request to this provider "
+                         "to confirm the key/URL work before you generate.");
+            std::string tstat = editoraiTestStatus();
+            if (!tstat.empty()) {
+                ImGui::SameLine();
+                bool ok = tstat.rfind("✓", 0) == 0;
+                ImGui::TextColored(ok ? COL_OK : COL_DIM, "%s", tstat.c_str());
+            }
+        }
         if (p == "ollama") {
             settingToggle("Use Platinum (community cloud)", "use-platinum",
                 "Routes through the VLT GG-hosted volunteer network instead "
@@ -1187,6 +1867,7 @@ void tabSettings() {
             settingText("server URL", "llama-cpp-url", "http://localhost:8080",
                 false, "Where your llama.cpp server listens.", true);
         } else if (p == "custom") {
+            endpointProfilesWidget();
             settingText("name", "custom-provider-name", "My Provider", false,
                 "Display name for your endpoint.");
             settingText("endpoint URL", "custom-provider-url",
@@ -1198,8 +1879,7 @@ void tabSettings() {
                 "Authorization: Bearer ${KEY}", false,
                 "How the key is attached. ${KEY} is replaced with it.");
         } else if (p == "manual") {
-            ImGui::TextColored(COL_DIM, "No key, no account. Generate copies a prompt;");
-            ImGui::TextColored(COL_DIM, "paste into any AI, copy the reply, press Build.");
+            ImGui::TextColored(COL_DIM, "Copy prompt, paste reply, then Build.");
         } else {
             settingText("API key", p + "-api-key", "paste key", true,
                 "Stored locally on this device and only sent to the "
@@ -1221,24 +1901,22 @@ void tabSettings() {
             }
         }
         ImGui::Separator();
-        ImGui::TextColored(COL_DIM, "Subagent - a second model the AI can consult");
-        settingCombo("subagent", "subagent-provider", SUB_PROVIDERS,
-            "Optional second model the main AI can ask focused questions "
-            "while building. Empty = disabled.");
-        if (!editoraiGetStr("subagent-provider").empty())
-            settingText("subagent model", "subagent-model",
-                "empty = provider default", false,
-                "Model the subagent uses.", true);
+        ImGui::TextColored(COL_DIM, "Assistant AI");
+        settingCombo("assistant", "subagent-provider", SUB_PROVIDERS,
+            "Same copies the main AI. Platinum uses the community network.");
+        std::string subProvider = editoraiGetStr("subagent-provider");
+        if (!subProvider.empty() && subProvider != "same" && subProvider != "platinum")
+            settingText("assistant model", "subagent-model",
+                "provider default", false, "Assistant model.", true);
     }
 
     if (ImGui::CollapsingHeader("Generation")) {
-        settingInt("max objects", "max-objects", 10, 1000000,
-            "Hard ceiling on objects per generation. Higher = more detail, "
-            "slower spawning.", ImGuiSliderFlags_Logarithmic);
-        exampleIdsWidget();
-        settingToggle("compact prompts (cheaper)", "compact-prompts",
-            "Sends a ~3 KB prompt instead of ~60 KB. Cheaper and faster; "
-            "the full prompt knows more object names.");
+        // No max-objects setting: the AI sizes to the request. The user can
+        // say "about 500 objects" in their prompt if they care.
+        settingToggle("stream responses", "stream-responses",
+            "Show the AI's reply as it is written, token by token, formatted "
+            "live. Turn off to wait for the whole reply instead.");
+        ImGui::TextColored(COL_DIM, "Name a reference level; the AI finds it.");
     }
 
     if (ImGui::CollapsingHeader("Placement & Editor")) {
@@ -1259,6 +1937,8 @@ void tabSettings() {
     }
 
     if (ImGui::CollapsingHeader("AI Behavior")) {
+        qualityProfileWidget();
+        ImGui::Separator();
         settingToggle("AI tools (search, level fetch, analysis)", "enable-ai-tools",
             "Lets the AI call tools mid-generation: web search, downloading "
             "reference levels, physics simulation, passability checks, song "
@@ -1267,9 +1947,14 @@ void tabSettings() {
         settingToggle("show AI goal & tasks", "show-goal-tasks",
             "When the AI sets itself a goal (set_goal tool), mirror its goal "
             "and task checklist in the status line and session log.");
-        settingInt("refinement rounds", "refinement-rounds", 0, 10,
-            "Extra self-review passes after the first draft. More rounds = "
-            "better quality, more tokens.");
+        settingToggle("refine until done", "refine-until-done",
+            "Keep polishing until the AI itself says the level is finished, "
+            "instead of a fixed number of passes. There is no pass limit; "
+            "Cancel remains available throughout.");
+        if (!editoraiGetBool("refine-until-done"))
+            settingInt("refinement rounds", "refinement-rounds", 0, 10,
+                "Extra self-review passes after the first draft. More rounds = "
+                "better quality, more tokens.");
         settingToggle("triggers & colors", "enable-advanced-features",
             "Allows the AI to place triggers (move, color, pulse, camera...) "
             "and assign color channels / groups.");
@@ -1283,6 +1968,10 @@ void tabSettings() {
             "Image-capable models (Claude, Gemini, GPT-4o, LLaVA...) get a "
             "rendered snapshot of the level on review and follow-up turns - "
             "they fix what they can SEE, not just coordinates.");
+        settingToggle("AI playtest & watch", "ai-playtest",
+            "Lets the AI call an unlimited repeatable playtest pass combining "
+            "physics, passability, difficulty analysis and a fresh visual render. "
+            "The real user playtest remains authoritative.");
         settingToggle("copilot mode (auto-fix while editing)", "copilot-mode",
             "While you edit, the AI watches for impossible sections and "
             "proposes fixes when the editor goes idle.");
@@ -1317,7 +2006,7 @@ void tabSettings() {
     }
 
     if (ImGui::CollapsingHeader("Theme")) {
-        ImGui::TextColored(COL_DIM, "Drag the sliders - changes apply live.");
+        ImGui::TextColored(COL_DIM, "Changes apply live.");
         for (auto& s : THEME_SLOTS) {
             float col[3] = {s.col->x, s.col->y, s.col->z};
             if (ImGui::ColorEdit3(fmt::format("{}##{}", s.label, s.key).c_str(),
@@ -1357,9 +2046,14 @@ void tabSettings() {
                     g_keyCapture = true;
                     g_keyCapturePending.clear();
                 }
-                tipIfHovered("Click, then press up to 3 keys in a row (e.g. "
-                             "E, or G then D). That sequence opens/closes this "
-                             "panel. Default is E.");
+                tipIfHovered("Click, then press up to 3 keys (e.g. E, or G "
+                             "then D). Multi-key bindings fire when tapped in "
+                             "a row OR held together. Default is E.");
+                settingToggle("hotkey priority", "hotkey-priority",
+                    "The panel hotkey wins over the editor's own keybinds and "
+                    "other mods - EditorAI consumes the key. Text boxes still "
+                    "type normally. Turn off to let the key also trigger "
+                    "whatever else is bound to it.");
             } else {
                 ImGui::TextColored(COL_ACCENT, "press up to 3 keys in a row...");
                 ImGui::Text("so far:  %s",
@@ -1403,6 +2097,7 @@ void drawOverlay() {
 
     // Background ticks that must run even with the panel closed.
     editoraiOAuthTick(dt);
+    editoraiProbeLocalBackends();   // once — tags local servers in the picker
     g_persistTimer += dt;
     if (g_persistTimer > 5.f) {
         g_persistTimer = 0.f;
@@ -1457,10 +2152,11 @@ void drawOverlay() {
         }
     }
 
-    // Touch devices: never draw the big panel over live gameplay — the same
-    // tap-eating rationale that hides the bubble, and the panel's rect is
-    // 17× bigger. panelOpen survives; the panel returns after the attempt.
-    if (uiMobile() && PlayLayer::get()) return;
+    // Never draw the big panel over LIVE gameplay on any platform — it eats
+    // input mid-attempt and its rect is huge. Paused levels are fine (the
+    // pause menu is exactly when you'd read/queue a generation). panelOpen
+    // survives; the panel returns when the level pauses or ends.
+    if (auto* pl = PlayLayer::get(); pl && !pl->m_isPaused) return;
 
     // Open/close animation: alpha fade driven by the ui-anim-speed setting
     // (1 = 2 s fade, 10 = instant). The setting is re-read at most once a
@@ -1487,20 +2183,36 @@ void drawOverlay() {
         // from live values when it reopens. A hotkey capture left dangling
         // would silently eat the next keypress, so it dies here too.
         for (auto& [id, tb] : textBufs()) tb.editing = false;
-        g_exampleIdsLoaded = false;
         g_keyCapture = false;
         return;
     }
     float alpha = g_animT * g_animT * (3.f - 2.f * g_animT);  // smoothstep
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
 
-    ImGui::SetNextWindowSize(ImVec2(760, 460), ImGuiCond_FirstUseEver);
+    // Desktop keeps a movable working panel. On phones, make this a genuine
+    // full-screen surface: no tiny floating controls, no accidental editor
+    // taps around the edges, and enough vertical room above the software
+    // keyboard for the composer and settings controls.
+    const auto* viewport = ImGui::GetMainViewport();
+    bool mobile = uiMobile();
+    if (mobile) {
+        ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(760, 460), ImGuiCond_FirstUseEver);
+    }
+    // Center the window every time it (re)appears. The window is only
+    // submitted while open, so Appearing fires on each open — this makes a
+    // lost/off-screen position self-heal instead of rendering into nowhere.
+    if (!mobile)
+        ImGui::SetNextWindowPos(viewport->GetCenter(),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     bool open = true;
     // While fading OUT the window is visually gone but would still hit-test
     // (Alpha only affects rendering) — drop mouse input so it can't swallow
     // clicks meant for the game.
-    ImGuiWindowFlags animFlags =
-        !g_st.panelOpen ? ImGuiWindowFlags_NoMouseInputs : 0;
+    ImGuiWindowFlags animFlags = !g_st.panelOpen ? ImGuiWindowFlags_NoMouseInputs : 0;
+    if (mobile) animFlags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
     if (!ImGui::Begin("EditorAI", &open, animFlags)) {
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1570,7 +2282,6 @@ void drawOverlay() {
             int nowFrame = ImGui::GetFrameCount();
             for (auto& [id, tb] : textBufs())
                 if (tb.lastFrame < nowFrame) tb.editing = false;
-            g_exampleIdsLoaded = false;
         }
         ImGui::EndTabBar();
     }
@@ -1581,70 +2292,167 @@ void drawOverlay() {
 } // namespace
 
 #ifdef GEODE_IS_DESKTOP
-class $modify(EAIOverlayKeys, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double time) {
-        // ── Hotkey capture (Settings → Controls) ──────────────────────────
-        // Each key pressed appends to the pending sequence (up to 3); the
-        // 3rd auto-commits, fewer are saved via the UI button. Esc cancels.
-        // Bare modifiers are ignored so a shifted choice doesn't bind Shift.
-        // Only while the panel is OPEN — a capture armed through the close
-        // fade would silently rebind+swallow the next editor keypress.
-        if (g_keyCapture && !g_st.panelOpen) { g_keyCapture = false; g_keyCapturePending.clear(); }
-        if (g_keyCapture && down && !repeat) {
-            int k = (int)key;
-            if (k == 27) { g_keyCapture = false; g_keyCapturePending.clear(); return true; }  // Esc
-            // Editor-critical keys are refused (still capturing): binding
-            // Tab/Space/Delete/Enter/Backspace/arrows would steal them from
-            // GD's editor (Tab toggles the build menu).
-            bool refused = k == 8 || k == 9 || k == 13 || k == 32 || k == 46 ||
-                           (k >= 37 && k <= 40);
-            if (refused) return true;
-            if (k == 16 || k == 17 || k == 18) return true;          // bare modifier — ignore
-            g_keyCapturePending.push_back(k);
-            if (g_keyCapturePending.size() >= 3) {                   // full sequence — commit
-                commitToggleSeq(g_keyCapturePending);
-                g_keyCapturePending.clear();
-                g_keyCapture = false;
-            }
-            return true;
+// Keys currently held (cocos keycode set). Maintained unconditionally —
+// including while text boxes are focused — so a key released inside an input
+// can never get stuck "held"; it is only READ when the text-input guards pass.
+static std::unordered_set<int> g_heldKeys;
+
+// The single hotkey brain: capture flow + sequence/chord matching + toggle.
+// Returns true when the key event must be CONSUMED (nothing else — GD editor,
+// Custom Keybinds, other mods — may see it). Called from the raw GLFW hook on
+// Windows and from the keyboard-dispatcher hook elsewhere / for keys the GLFW
+// map doesn't cover.
+static bool editoraiOverlayHandleKey(int key, bool down, bool repeat) {
+    // Feed modifier state explicitly before the modal overlay consumes the
+    // dispatcher event. gd-imgui-cocos also translates named keys, but on
+    // some platform/input paths its per-frame modifier snapshot arrives too
+    // late for Ctrl+A or Shift+Arrow in the currently focused text field.
+    if (ImGuiCocos::get().isInitialized()) {
+        auto k = static_cast<cocos2d::enumKeyCodes>(key);
+        auto& io = ImGui::GetIO();
+        if (k == cocos2d::enumKeyCodes::KEY_Control ||
+            k == cocos2d::enumKeyCodes::KEY_LeftControl ||
+            k == cocos2d::enumKeyCodes::KEY_RightContol)
+            io.AddKeyEvent(ImGuiMod_Ctrl, down);
+        if (k == cocos2d::enumKeyCodes::KEY_Shift ||
+            k == cocos2d::enumKeyCodes::KEY_LeftShift ||
+            k == cocos2d::enumKeyCodes::KEY_RightShift)
+            io.AddKeyEvent(ImGuiMod_Shift, down);
+
+        // Some gd-imgui-cocos/Proton paths deliver printable text through IME
+        // but lose the named Backspace event before ImGui sees it. Mirror the
+        // destructive/navigation keys while our modal panel is open so every
+        // InputText (composer, chat, settings, endpoint profiles) edits
+        // consistently. Repeated same-state AddKeyEvent calls are deduplicated
+        // by ImGui, so this is safe even when the backend also supplies them.
+        if (g_st.panelOpen || io.WantCaptureKeyboard) {
+            if (key == 8)  io.AddKeyEvent(ImGuiKey_Backspace, down);
+            if (key == 46) io.AddKeyEvent(ImGuiKey_Delete, down);
+            if (key == 35) io.AddKeyEvent(ImGuiKey_End, down);
+            if (key == 36) io.AddKeyEvent(ImGuiKey_Home, down);
+            if (key == 37) io.AddKeyEvent(ImGuiKey_LeftArrow, down);
+            if (key == 38) io.AddKeyEvent(ImGuiKey_UpArrow, down);
+            if (key == 39) io.AddKeyEvent(ImGuiKey_RightArrow, down);
+            if (key == 40) io.AddKeyEvent(ImGuiKey_DownArrow, down);
         }
+    }
 
-        // ── Hotkey match: a sequence of 1-3 keys pressed in a row ──────────
-        // Keep a small ring of recent (key, time) presses; the toggle fires
-        // when the ring's tail equals the configured sequence with each
-        // consecutive gap inside a short window. A 1-key binding fires
-        // immediately (exactly the old single-key behavior). Only built while
-        // the guards pass, so keys typed into a text box never accumulate.
-        if (down && !repeat) {
-            bool guardsOk = ImGuiCocos::get().isInitialized() &&
-                            !editoraiIsGDTextInputActive() &&
-                            !ImGui::GetIO().WantCaptureKeyboard;
-            if (guardsOk) {
-                static std::vector<std::pair<int, double>> recent;  // (keycode, seconds)
-                constexpr double SEQ_WINDOW = 1.2;  // max gap between keys in a row
-                double now = nowSeconds();
-                recent.push_back({(int)key, now});
-                if (recent.size() > 3) recent.erase(recent.begin());
+    // Held-key ledger for the chord matcher ("pressed together").
+    if (!repeat) {
+        if (down) g_heldKeys.insert(key);
+        else      g_heldKeys.erase(key);
+    }
 
-                const auto& seq = overlayToggleSeq();
-                if (!seq.empty() && recent.size() >= seq.size()) {
-                    size_t off = recent.size() - seq.size();
-                    bool match = true;
-                    for (size_t i = 0; i < seq.size() && match; ++i)
-                        if (recent[off + i].first != seq[i]) match = false;
-                    // For multi-key sequences every consecutive gap must be
-                    // within the window (single-key has no gap to check).
-                    for (size_t i = off + 1; i < recent.size() && match; ++i)
-                        if (recent[i].second - recent[i - 1].second > SEQ_WINDOW) match = false;
-                    if (match) {
-                        g_st.panelOpen = !g_st.panelOpen;
-                        if (!g_st.panelOpen) g_keyCapture = false;
-                        recent.clear();             // don't double-fire on the next key
-                        return true;                // swallow the completing key
-                    }
+    // ── Hotkey capture (Settings → Controls) ──────────────────────────────
+    // Each key pressed appends to the pending sequence (up to 3); the 3rd
+    // auto-commits, fewer are saved via the UI button. Esc cancels. Bare
+    // modifiers are ignored so a shifted choice doesn't bind Shift. Only
+    // while the panel is OPEN — a capture armed through the close fade would
+    // silently rebind+swallow the next editor keypress.
+    if (g_keyCapture && !g_st.panelOpen) { g_keyCapture = false; g_keyCapturePending.clear(); }
+    if (g_keyCapture && down && !repeat) {
+        if (key == 27) { g_keyCapture = false; g_keyCapturePending.clear(); return true; }  // Esc
+        // Editor-critical keys are refused (still capturing): binding
+        // Tab/Space/Delete/Enter/Backspace/arrows would steal them from
+        // GD's editor (Tab toggles the build menu).
+        bool refused = key == 8 || key == 9 || key == 13 || key == 32 || key == 46 ||
+                       (key >= 37 && key <= 40);
+        if (refused) return true;
+        if (key == 16 || key == 17 || key == 18) return true;    // bare modifier — ignore
+        g_keyCapturePending.push_back(key);
+        if (g_keyCapturePending.size() >= 3) {                   // full sequence — commit
+            commitToggleSeq(g_keyCapturePending);
+            g_keyCapturePending.clear();
+            g_keyCapture = false;
+        }
+        return true;
+    }
+
+    // ── Hotkey match: sequence OR chord ────────────────────────────────────
+    // Two ways a multi-key binding fires:
+    //   - sequence: the keys tapped in order, each gap under 1.2 s
+    //     (ring of recent presses, tail-compared)
+    //   - chord: all binding keys physically held at the same time, in ANY
+    //     press order — "both pressed at once" just works
+    // A 1-key binding fires immediately via the sequence path. Only evaluated
+    // while the guards pass, so keys typed into a text box never accumulate
+    // or toggle.
+    if (down && !repeat) {
+        bool guardsOk = ImGuiCocos::get().isInitialized() &&
+                        !editoraiIsGDTextInputActive() &&
+                        !ImGui::GetIO().WantCaptureKeyboard;
+        if (guardsOk) {
+            static std::vector<std::pair<int, double>> recent;  // (keycode, seconds)
+            constexpr double SEQ_WINDOW = 1.2;  // max gap between keys in a row
+            double now = nowSeconds();
+            recent.push_back({key, now});
+            if (recent.size() > 3) recent.erase(recent.begin());
+
+            const auto& seq = overlayToggleSeq();
+            bool fired = false;
+
+            // Chord: this press is part of the binding and every binding key
+            // is currently down.
+            if (seq.size() >= 2) {
+                bool keyInSeq = false, allHeld = true;
+                for (int k : seq) {
+                    if (k == key) keyInSeq = true;
+                    if (!g_heldKeys.count(k)) allHeld = false;
                 }
+                fired = keyInSeq && allHeld;
+            }
+
+            // Sequence: the ring's tail equals the binding in order.
+            if (!fired && !seq.empty() && recent.size() >= seq.size()) {
+                size_t off = recent.size() - seq.size();
+                bool match = true;
+                for (size_t i = 0; i < seq.size() && match; ++i)
+                    if (recent[off + i].first != seq[i]) match = false;
+                // For multi-key sequences every consecutive gap must be
+                // within the window (single-key has no gap to check).
+                for (size_t i = off + 1; i < recent.size() && match; ++i)
+                    if (recent[i].second - recent[i - 1].second > SEQ_WINDOW) match = false;
+                fired = match;
+            }
+
+            if (fired) {
+                // Refractory: GD can dispatch one physical press through here
+                // more than once in some scenes — a re-fire within the window
+                // would toggle the panel open and instantly closed again.
+                static double s_lastFire = -10.0;
+                if (now - s_lastFire > 0.25) {
+                    s_lastFire = now;
+                    g_st.panelOpen = !g_st.panelOpen;
+                    if (!g_st.panelOpen) g_keyCapture = false;
+                }
+                recent.clear();             // don't double-fire on the next key
+                // Priority ON: consume the completing key so GD's editor and
+                // other mods never act on it. OFF: toggle but let the key
+                // flow through to everything downstream.
+                return editoraiGetBool("hotkey-priority");
             }
         }
+    }
+    // The overlay receives ImGui input independently, so when it is visible
+    // the game must not also react to the same keystrokes. This makes typing,
+    // shortcuts, and navigation truly modal instead of leaking into the
+    // editor behind the window.
+    return g_st.panelOpen;
+}
+
+// The hotkey hook. Runs at essentially-first priority so a matched toggle
+// key is consumed before GD's editor keybinds and mods like Custom Keybinds
+// (all of which live downstream of this function) can act on it.
+class $modify(EAIOverlayKeys, CCKeyboardDispatcher) {
+    static void onModify(auto self) {
+        if (!self.setHookPriority(
+                "cocos2d::CCKeyboardDispatcher::dispatchKeyboardMSG", -1'000'000'000))
+            geode::log::warn("EditorAI: failed to prioritize the hotkey hook");
+    }
+
+    bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double time) {
+        if (editoraiOverlayHandleKey((int)key, down, repeat))
+            return true;
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, time);
     }
 };

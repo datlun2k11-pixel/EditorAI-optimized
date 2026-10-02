@@ -68,7 +68,13 @@ training/data/
 training/output/
 training/export/
 training/__pycache__/
+**/__pycache__/
 training/.venv/
 training/*.gguf
 *.pt
 *.safetensors
+
+# Tests
+tests/
+ 
+AGENTS.md

@@ -78,6 +78,33 @@ if (WIN32 OR APPLE OR ANDROID)
     set(IMGUI_VERSION "v1.92.4")
     # Pinned to main HEAD: the 1.0.0 tag (Dec 2023) predates Geode 5.x APIs.
     CPMAddPackage("gh:matcool/gd-imgui-cocos#b93f08ccef778a53ebba09b20c347f6a63980119")
+
+    # Geode's iOS bindings currently emit an invalid CCKeyboardDispatcher
+    # constructor/destructor hook header. gd-imgui-cocos already disables its
+    # keyboard hook on iOS, but its source still includes that header
+    # unconditionally. Patch only that include in the fetched, pinned source
+    # so iOS keeps touch/IME support without compiling a desktop-only binding.
+    if (IOS OR "${CMAKE_SYSTEM_NAME}" STREQUAL "iOS")
+        # Resolve the fetched source through the target instead of relying on
+        # CPM's package-variable spelling (the repository and CMake project
+        # use different names).
+        get_target_property(_editorai_imgui_sources imgui-cocos INTERFACE_SOURCES)
+        foreach (_editorai_imgui_source IN LISTS _editorai_imgui_sources)
+            if (_editorai_imgui_source MATCHES "/src/hooks\\.cpp$")
+                set(_editorai_imgui_hooks "${_editorai_imgui_source}")
+            endif()
+        endforeach()
+        if (EXISTS "${_editorai_imgui_hooks}")
+            file(READ "${_editorai_imgui_hooks}" _editorai_imgui_hooks_text)
+            string(REPLACE
+                "#include <Geode/modify/CCKeyboardDispatcher.hpp>"
+                "#ifndef GEODE_IS_IOS\n#include <Geode/modify/CCKeyboardDispatcher.hpp>\n#endif"
+                _editorai_imgui_hooks_text
+                "${_editorai_imgui_hooks_text}")
+            file(WRITE "${_editorai_imgui_hooks}" "${_editorai_imgui_hooks_text}")
+        endif()
+    endif()
+
     target_link_libraries(${PROJECT_NAME} imgui-cocos)
     target_compile_definitions(${PROJECT_NAME} PRIVATE EDITORAI_HAS_IMGUI=1)
 endif()

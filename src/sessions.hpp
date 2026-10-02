@@ -26,6 +26,11 @@ struct GenSession {
     std::vector<Entry>           transcript;
     std::vector<ChatMsg>         chat;
     std::string                  chatSummary;     // digest of folded-away turns
+    // Durable user-facing phase for the generation/editing state machine.
+    // Unlike liveStatus this changes only at meaningful boundaries and
+    // survives restarts, so a session never just says "running" with no clue
+    // whether it is researching, validating, repairing, or awaiting review.
+    std::string                  flowPhase = "idle";
     std::string                  targetLevelName; // persisted; re-resolves targetLevel
     std::string                  pendingEdit;     // edit follow-up waiting for its editor
     int                          pendingEditMode = 0;
@@ -49,6 +54,45 @@ struct GenSession {
     int         fbRating   = 0;      // set by editoraiRateSession
     bool        fbShared   = false;  // telemetry Share already sent
     bool        restored   = false;  // loaded from disk — engine context gone
+
+    // Compact one-line summary of the level's working state, refreshed after
+    // every generation/follow-up so the AI can answer "what did you change /
+    // how's the level going?" accurately — including across restarts (it is
+    // persisted with the session and re-injected into the AI context).
+    std::string workingState;
+
+    // ── Live streaming (token-by-token) ───────────────────────────────────
+    // While a streamed round is in flight the engine appends decoded deltas
+    // here and the overlay renders it as a live, markdown-formatted bubble at
+    // the bottom of the transcript. Deliberately NOT persisted: a partial
+    // answer is meaningless after a restart, and the finished text lands in
+    // `transcript`/`chat` anyway.
+    //   streamText     — visible assistant text so far
+    //   streamThinking — reasoning/thinking deltas so far (collapsed in UI)
+    //   streamActive   — a stream is open right now (drives the caret)
+    std::string streamText;
+    std::string streamThinking;
+    bool        streamActive = false;
+    // One-line "what is happening right now" (elapsed time, bytes received,
+    // queue position). Written every tick, so it must NOT go through push() —
+    // a per-second transcript entry would flood the log and evict real
+    // messages from the 400-entry window. Not persisted.
+    std::string liveStatus;
+
+    void streamBegin() {
+        streamText.clear();
+        streamThinking.clear();
+        streamActive = true;
+    }
+    // Called the moment the transfer ends. The buffers are cleared too: the
+    // finished text is immediately pushed into `transcript` (as an Assistant /
+    // Thinking entry) by the engine, so keeping it here would render it twice.
+    void streamEnd() {
+        streamActive = false;
+        streamText.clear();
+        streamThinking.clear();
+        liveStatus.clear();
+    }
 
     void push(Entry::Kind k, std::string text) {
         // Rolling window: long conversations keep flowing — the OLDEST
@@ -86,17 +130,26 @@ struct GenSession {
         size_t total = 0;
         for (auto& m : chat) total += m.text.size() + 16;
         while (total > 36000 && chat.size() > 8) {
-            auto& old = chat.front();
-            total -= old.text.size() + 16;
-            std::string line = old.role == 0 ? "User: " : "AI: ";
-            std::string digest = old.text;
-            bool cut = digest.size() > 220;
-            utf8Trim(digest, 220);
-            line += digest;
-            if (cut) line += " ...";
-            line += "\n";
-            chatSummary += line;
-            chat.erase(chat.begin());
+            // Fold a coherent user/assistant exchange when possible. Keeping
+            // the request beside its outcome preserves decisions much better
+            // than independently truncating whichever single message happens
+            // to be oldest.
+            size_t take = chat.size() > 1 && chat[0].role == 0 &&
+                          chat[1].role == 1 ? 2 : 1;
+            chatSummary += "Turn:\n";
+            for (size_t i = 0; i < take; ++i) {
+                auto& old = chat[i];
+                total -= old.text.size() + 16;
+                std::string digest = old.text;
+                size_t cap = old.role == 0 ? 360 : 280;
+                bool cut = digest.size() > cap;
+                utf8Trim(digest, cap);
+                chatSummary += old.role == 0 ? "  Request: " : "  Outcome: ";
+                chatSummary += digest;
+                if (cut) chatSummary += " ...";
+                chatSummary += "\n";
+            }
+            chat.erase(chat.begin(), chat.begin() + take);
         }
         if (chatSummary.size() > 8000) {
             std::string head = chatSummary.substr(0, 2000);
@@ -191,6 +244,17 @@ void        editoraiSetBool(const char* id, bool v);
 int64_t     editoraiGetInt(const char* id);
 void        editoraiSetInt(const char* id, int64_t v);
 
+// Test-connection (Settings → provider row): kicks off a real authenticated
+// probe of the current provider; poll the result with editoraiTestStatus().
+void        editoraiTestProvider();
+std::string editoraiTestStatus();
+
+// Local-backend auto-detect: probes localhost for a running Ollama / LM Studio
+// / llama.cpp (called once from the overlay). editoraiDetectedBackends returns
+// the comma-joined names that responded.
+void        editoraiProbeLocalBackends();
+std::string editoraiDetectedBackends();
+
 // Saved-value bridge (Geode saved.json — persists overlay inputs, theme
 // colors, and anything else that isn't a mod.json setting).
 std::string editoraiGetSavedStr(const char* key, const std::string& def = "");
@@ -207,6 +271,11 @@ void editoraiPersistSessionsIfDirty();   // throttled; overlay ticks this
 // Telemetry share (the overlay rating row's Share button; opt-in, 8+ only).
 bool editoraiShareSession(const std::shared_ptr<GenSession>& session,
                           std::string& err);
+
+// Export a session's transcript to a text file in the mod save dir
+// (background write; the filename is returned in err on success).
+bool editoraiExportSession(const std::shared_ptr<GenSession>& session,
+                           std::string& err);
 
 // ── Saved (online) levels — example/style reference pickers ────────────────
 struct SavedLevelInfo { std::string name; int levelId = 0; };

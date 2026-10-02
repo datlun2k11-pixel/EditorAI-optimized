@@ -1,6 +1,9 @@
 #include <algorithm>
+#include "design_knowledge.hpp"
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
+#include <map>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -42,6 +45,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+// Hard safety cap on objects per generation. There is deliberately NO user
+// setting for this anymore — the AI sizes its output to the user's request,
+// and this is only a runaway guard (never reachable in normal use).
+inline constexpr size_t EAI_OBJECT_CAP = 20000;
 
 namespace editorai::json_lenient {
 
@@ -375,26 +383,6 @@ inline constexpr std::string_view EXAMPLE_SECTIONS_JSON = R"eai_v2(
 
 )eai_v2";
 
-// ── GD Creator School design knowledge ──────────────────────────────────────
-// Ultra-compact distillation of community level-design guidance from
-// https://www.gdcreatorschool.com. The full text lives in
-// resources/gdcs_design.txt; this constant is the in-prompt digest
-// (~700 bytes / ~180 tokens, down from ~4 KB) so it fits cleanly inside
-// any model's context.
-inline constexpr std::string_view GDCS_DESIGN_TIPS = R"gdcs(
-DESIGN TIPS (GD Creator School digest):
-- Pick difficulty first; pace to match. One theme per section.
-- Layers: gameplay → decoration → triggers (decoration follows layout).
-- Vary segment lengths; alternate tense bursts with breathers.
-- Place orbs/pads 30-60u BEFORE the obstacle they bypass.
-- Ramp difficulty: ~30% intro / ~50% main / ~20% climax.
-- ≤10 color channels per section; backgrounds complement gameplay color.
-- Z LAYER: T1-T4 above player, B1-B4 below (blocks default B2, decor T1/T2 or B3/B4).
-- Triggers fire when X is crossed; place slightly BEFORE the visible effect.
-- Avoid: spammed identical objects, sub-90u jump gaps, decoration covering hazards.
-- Macros (FLOOR/CORRIDOR/PILLAR/SPIKE-TRAIN/PLATFORM-RUN) expand from one line — prefer them for repetitive shapes.
-)gdcs";
-
 } // namespace editorai
 
 // ─── OAuth plumbing ──────────────────────────────────────────────────────────
@@ -422,6 +410,7 @@ DESIGN TIPS (GD Creator School digest):
 #include <deque>
 #include <unordered_set>
 #include "sessions.hpp"
+#include "stream.hpp"
 #include <cstring>
 #include <functional>
 #include <random>
@@ -743,7 +732,8 @@ inline void clearSavedToken(const std::string& provider) {
 
 } // namespace oauth
 
-// Multi-turn tool-use support for every supported AI provider EXCEPT custom.
+// Multi-turn tool-use support for every supported AI provider, including
+// OpenAI-compatible custom endpoints.
 //
 // Architecture:
 //   1. We define a small, fixed catalog of tools the AI can call (web_search,
@@ -762,10 +752,9 @@ inline void clearSavedToken(const std::string& provider) {
 //
 // The loop is UNBOUNDED: the AI runs as many tool rounds — and as many calls
 // to any single tool — as it wants. There is no round-count setting and no
-// per-tool "you've called this N times, stop" cap. The only guards are an
-// exact-duplicate guard (a repeat of the SAME query just reuses the prior
-// result, never a stop signal) and a high anti-runaway backstop that
-// finalizes gracefully (see doToolRound).
+// per-tool "you've called this N times, stop" cap. An exact-duplicate guard
+// reuses the prior result for identical discovery queries; Cancel is the
+// user-owned escape hatch.
 //
 // Each provider has its own native tool-use format:
 //   - OpenAI / Mistral / HuggingFace / OpenRouter / DeepSeek / LM Studio /
@@ -773,8 +762,8 @@ inline void clearSavedToken(const std::string& provider) {
 //   - Anthropic Claude uses content blocks with type=tool_use / tool_result.
 //   - Gemini uses functionDeclarations + functionCall / functionResponse parts.
 //
-// "custom" provider is intentionally skipped: we don't know what tool-use
-// format the user's endpoint speaks. The single-shot path still works for it.
+// "custom" uses the OpenAI-compatible tools dialect. Endpoints which do not
+// implement tools still return their normal provider error to the user.
 
 #include <Geode/Geode.hpp>
 #include <array>
@@ -783,8 +772,9 @@ inline void clearSavedToken(const std::string& provider) {
 #include <vector>
 
 // Defined later in this file; needed by the request builders below to skip
-// the temperature param on OpenAI o-series reasoning models.
-static bool isOSeriesModel(const std::string& model);
+// the optional temperature knob on models/endpoints that reject it.
+static bool modelRejectsTemperature(const std::string& model);
+static std::string resolveCustomChatUrl(std::string url);
 
 namespace toolUse {
 
@@ -792,9 +782,11 @@ namespace toolUse {
 // in AIGeneratorPopup::doToolRound for the structural runaway guards.
 
 // Tools the AI can call. Anything outside this list is rejected during dispatch.
-inline constexpr std::array<std::string_view, 24> KNOWN_TOOL_NAMES = {
+inline constexpr std::array<std::string_view, 30> KNOWN_TOOL_NAMES = {
     "web_search",
     "download_level",
+    "search_levels",
+    "render_level",
     "search_newgrounds",
     "get_newgrounds_song",
     "analyze_level",
@@ -803,8 +795,12 @@ inline constexpr std::array<std::string_view, 24> KNOWN_TOOL_NAMES = {
     "check_passability",
     "analyze_difficulty_curve",
     "simulate_physics",
+    "playtest_level",
+    "level_report",
     "ask_subagent",
     "get_level_region",
+    "count_objects_in_region",
+    "highlight_region",
     // Music sync
     "get_bpm",
     "get_waveform",
@@ -895,6 +891,28 @@ inline matjson::Value buildToolCatalog() {
         {"level_id"}
     ));
     arr.push(openAIToolSchema(
+        "search_levels",
+        "Search Geometry Dash's online levels BY TITLE (and optionally by "
+        "creator name). Returns up to 6 matches with their numeric IDs, "
+        "creator, difficulty, length, downloads and likes. Use this whenever "
+        "the user names a level or a style (\"like Nine Circles\") — then call "
+        "download_level on the best match to study it.",
+        {{"query",   {"string",  "Level title or keywords, e.g. 'Nine Circles'."}},
+         {"creator", {"string",  "Optional: only levels by this creator name."}},
+         {"featured",{"boolean", "Optional: restrict to featured/rated levels (better quality)."}}},
+        {"query"}
+    ));
+    arr.push(openAIToolSchema(
+        "render_level",
+        "Render the level as it looks RIGHT NOW and attach the image to your "
+        "next turn, so you can SEE what you built (layout, density, palette, "
+        "empty stretches) instead of reasoning from coordinates alone. Only "
+        "useful on image-capable models. Optionally frame one X range.",
+        {{"x0", {"number", "Optional: left edge of the region to render."}},
+         {"x1", {"number", "Optional: right edge of the region to render."}}},
+        {}
+    ));
+    arr.push(openAIToolSchema(
         "search_newgrounds",
         "Search Newgrounds Audio for a song by name/keyword. Returns the song "
         "title, artist, and the Newgrounds song ID (which you can pass to "
@@ -948,17 +966,17 @@ inline matjson::Value buildToolCatalog() {
         {},
         {}
     ));
-    if (!geode::Mod::get()->getSettingValue<std::string>("subagent-provider").empty()) {
-        arr.push(openAIToolSchema(
-            "ask_subagent",
-            "Consult the user's configured second model (a different "
-            "provider) with a focused question — e.g. ask a local model for "
-            "themed object combinations, or a big model to sanity-check your "
-            "plan. One question per call; answers are advisory.",
-            {{"question", {"string", "A single focused question (max ~1500 chars)."}}},
-            {"question"}
-        ));
-    }
+    arr.push(openAIToolSchema(
+        "ask_subagent",
+        "Delegate a focused review or design problem to an assistant AI. It "
+        "copies your provider/model by default, or can use a configured second "
+        "provider. Give it the exact decision, relevant constraints, and current "
+        "evidence so its concise answer saves you work. Use it proactively for "
+        "independent checking, risky gameplay, reference synthesis, or choosing "
+        "between designs; do not ask it to repeat work you can finish instantly.",
+        {{"question", {"string", "Focused task with context and desired decision (max ~3000 chars)."}}},
+        {"question"}
+    ));
     arr.push(openAIToolSchema(
         "simulate_physics",
         "Run a cube-physics bot through your ACCEPTED DRAFT: it jumps "
@@ -966,6 +984,17 @@ inline matjson::Value buildToolCatalog() {
         "spike spacing, walls, bad landings). Much stricter than "
         "check_passability for cube sections. Works after your first draft.",
         {},
+        {}
+    ));
+    arr.push(openAIToolSchema(
+        "playtest_level",
+        "Playtest and watch the current accumulated draft. Runs the physics "
+        "bot, passability scan and difficulty analysis together, and attaches "
+        "a fresh rendered image when this model can see images and the draft "
+        "is staged. Call this repeatedly after changes; every call is a new "
+        "review pass and there is no pass limit. Be honest that the simulator "
+        "is advisory and user playtesting is still authoritative.",
+        {{"focus", {"string", "Optional issue or section to focus on during this pass."}}},
         {}
     ));
     arr.push(openAIToolSchema(
@@ -978,6 +1007,16 @@ inline matjson::Value buildToolCatalog() {
         {}
     ));
     arr.push(openAIToolSchema(
+        "level_report",
+        "One-shot full diagnostic over your ACCEPTED DRAFT: passability "
+        "(death zones), a physics-bot run (exact death spots), and the "
+        "difficulty histogram, all in a single reply. Prefer this over calling "
+        "check_passability + simulate_physics + analyze_difficulty_curve "
+        "separately — it is one round-trip instead of three.",
+        {},
+        {}
+    ));
+    arr.push(openAIToolSchema(
         "get_level_region",
         "List the CURRENT editor level's objects whose X falls inside "
         "[x_start, x_end] (type, x, y; capped at 80 objects). Much cheaper "
@@ -985,6 +1024,28 @@ inline matjson::Value buildToolCatalog() {
         "mode or when extending an existing level.",
         {{"x_start", {"integer", "Left edge of the X range."}},
          {"x_end",   {"integer", "Right edge of the X range."}}},
+        {"x_start", "x_end"}
+    ));
+    arr.push(openAIToolSchema(
+        "count_objects_in_region",
+        "Aggregate counts by object type inside [x_start, x_end] of the "
+        "CURRENT editor level (no per-object dump — token-cheap). Answer "
+        "'how many spikes / blocks / orbs are in this section?' precisely, "
+        "and spot density hotspots before editing.",
+        {{"x_start", {"integer", "Left edge of the X range."}},
+         {"x_end",   {"integer", "Right edge of the X range."}}},
+        {"x_start", "x_end"}
+    ));
+    arr.push(openAIToolSchema(
+        "highlight_region",
+        "Draw a visible amber band over [x_start, x_end] of the CURRENT "
+        "editor level so the USER can see which section you mean — use it "
+        "when you refer to a specific part ('make THIS section harder'). "
+        "Non-destructive; the next highlight replaces it. Also returns the "
+        "region's object count.",
+        {{"x_start", {"integer", "Left edge of the X range."}},
+         {"x_end",   {"integer", "Right edge of the X range."}},
+         {"reason",  {"string", "One short phrase the user sees, e.g. 'drop section'."}}},
         {"x_start", "x_end"}
     ));
     arr.push(openAIToolSchema(
@@ -1038,7 +1099,8 @@ inline matjson::Value buildToolCatalog() {
         "set_goal",
         "Set a working goal and start a goal loop: after each of your "
         "answers the mod will prompt you to CONTINUE working until you call "
-        "goal_done (or the safety cap trips). Optionally seed the task list "
+        "goal_done. There is no pass limit; the user can cancel. Optionally "
+        "seed the task list "
         "(one task per line in 'tasks'). Use task_add/task_mark to manage "
         "tasks, verify to self-check, then goal_done to finish.",
         {{"goal",  {"string", "One sentence describing the finished state."}},
@@ -1142,13 +1204,14 @@ struct ParsedResponse {
     std::string errorMessage;                  // user-visible error string
 };
 
-// Which providers we route through the tool-use loop. "custom" intentionally
-// excluded — we don't know what its tool-use API looks like.
+// Which providers we route through the tool-use loop. Custom/BYOPAK endpoints
+// use the documented OpenAI-compatible tools shape.
 inline bool supportsToolUse(const std::string& provider) {
     return provider == "openai"     || provider == "ministral"  ||
            provider == "huggingface"|| provider == "openrouter" ||
            provider == "deepseek"   || provider == "lm-studio"  ||
            provider == "llama-cpp"  || provider == "groq"       ||
+           provider == "custom"     ||
            provider == "claude"     ||
            provider == "gemini"     ||
            provider == "ollama";
@@ -1164,6 +1227,11 @@ inline bool supportsVision(const std::string& provider, const std::string& model
     };
     if (provider == "openai")
         return has("4o") || has("4.1") || has("vision");
+    // BYOPAK can front the same multimodal models. The locally tested Codex
+    // OpenAI-compatible bridge exposes GPT-5/6 this way and accepts image_url
+    // parts, so provider identity must not hide the vision tools.
+    if (provider == "custom")
+        return has("gpt-4") || has("gpt-5") || has("gpt-6") || has("vision");
     return has("gpt-4o") || has("claude") || has("gemini") || has("llava") ||
            has("pixtral") || has("-vl") || has("vision") || has("4o") ||
            has("minicpm-v") || has("moondream");
@@ -1181,7 +1249,7 @@ inline bool isOpenAICompat(const std::string& provider) {
            provider == "huggingface"|| provider == "openrouter" ||
            provider == "deepseek"   || provider == "lm-studio"  ||
            provider == "llama-cpp"  || provider == "ollama"     ||
-           provider == "groq";
+           provider == "groq"       || provider == "custom";
 }
 
 // Which token-limit field each OpenAI-compatible provider accepts, and how
@@ -1196,7 +1264,12 @@ inline TokenLimitSpec tokenLimitSpec(const std::string& provider) {
         return {"max_completion_tokens", 16384};
     if (provider == "ministral" || provider == "openrouter")
         return {"max_tokens", 16384};
-    // huggingface, deepseek, custom, ollama (ignores it), anything else
+    // DeepSeek's reasoning models bill their chain of thought against the same
+    // budget, and a level script is long — 8K left them finishing the reasoning
+    // and never writing an answer. Their models accept 16K+.
+    if (provider == "deepseek")
+        return {"max_tokens", 16384};
+    // huggingface, custom, ollama (ignores it), anything else
     return {"max_tokens", 8192};
 }
 
@@ -1245,6 +1318,10 @@ inline std::string urlFor(const std::string& provider, const std::string& model)
     if (provider == "llama-cpp") {
         std::string base = geode::Mod::get()->getSettingValue<std::string>("llama-cpp-url");
         return base + "/v1/chat/completions";
+    }
+    if (provider == "custom") {
+        return resolveCustomChatUrl(
+            geode::Mod::get()->getSettingValue<std::string>("custom-provider-url"));
     }
     if (provider == "ollama") {
         bool platinum = geode::Mod::get()->getSettingValue<bool>("use-platinum");
@@ -1382,8 +1459,11 @@ inline matjson::Value buildOpenAICompatRequest(const std::string& provider,
         // OpenAI) reject the request with HTTP 400.
         auto spec = tokenLimitSpec(provider);
         body[spec.field] = spec.limit;
-        // OpenAI o-series reasoning models reject a temperature param (400).
-        if (!(provider == "openai" && isOSeriesModel(model)))
+        // Reasoning/Codex models reject a temperature param (400). Custom
+        // endpoints are deliberately conservative too: temperature is an
+        // optional OpenAI field, and omitting it works on far more proxies
+        // than assuming every compatible server implements sampling knobs.
+        if (provider != "custom" && !modelRejectsTemperature(model))
             body["temperature"] = 0.7;
     }
     // CRITICAL for Ollama: without stream:false, /api/chat returns
@@ -1559,7 +1639,22 @@ inline ParsedResponse parseOpenAICompatResponse(const matjson::Value& json) {
     // No tool calls — text is the final answer.
     out.finalText = text;
     out.ok = !text.empty();
-    if (!out.ok) out.errorMessage = "Empty final response";
+    if (!out.ok) {
+        // A reasoning model that spent its entire token budget thinking comes
+        // back with empty content and a full reasoning channel. Saying "empty
+        // response, lower your temperature" for that is actively misleading —
+        // name the real cause, which the user can fix (shorter request, or a
+        // non-reasoning model).
+        if (!out.reasoningText.empty())
+            out.errorMessage =
+                "the model used its whole output budget on internal reasoning "
+                "and never wrote an answer (" +
+                std::to_string(out.reasoningText.size()) +
+                " chars of reasoning, 0 of content). Ask for a shorter level, "
+                "or pick a non-reasoning model";
+        else
+            out.errorMessage = "Empty final response";
+    }
     return out;
 }
 
@@ -1909,7 +2004,22 @@ inline ParsedResponse parseGeminiResponse(const matjson::Value& json) {
         auto& p = parts[i];
         if (p.contains("text")) {
             auto t = p["text"].asString();
-            if (t) text += t.unwrap();
+            // Gemini flags reasoning parts with "thought": true — those are
+            // the model thinking, not its answer. Route them to the thinking
+            // channel so the UI shows them collapsed instead of pasting the
+            // chain of thought into the level script.
+            bool isThought = false;
+            if (p.contains("thought")) {
+                if (auto b = p["thought"].asBool()) isThought = b.unwrap();
+            }
+            if (t) {
+                if (isThought) {
+                    if (!out.reasoningText.empty()) out.reasoningText += "\n";
+                    out.reasoningText += t.unwrap();
+                } else {
+                    text += t.unwrap();
+                }
+            }
         }
         if (p.contains("functionCall")) {
             auto fc = p["functionCall"];
@@ -2391,11 +2501,23 @@ static std::vector<size_t> pickExampleIndices(const std::string& difficulty,
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// Returns true if the model name is an o-series reasoning model.
-// These models reject the "temperature" parameter and return HTTP 400 if sent.
-static bool isOSeriesModel(const std::string& model) {
-    if (model.size() < 2) return false;
-    return (model[0] == 'o' && model[1] >= '1' && model[1] <= '9');
+// Returns true for model families whose APIs accept only their default
+// sampling behavior. This must be based on the model ID, not provider ID:
+// reasoning/Codex models are frequently exposed through OpenRouter or a
+// user-configured OpenAI-compatible proxy. Sending temperature to those
+// endpoints produces HTTP 400 even though the same endpoint passes a basic
+// connection test.
+static bool modelRejectsTemperature(const std::string& model) {
+    std::string low = model;
+    for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+
+    // Strip a routing namespace such as "openai/gpt-5" for the prefix test.
+    std::string_view id = low;
+    if (auto slash = id.rfind('/'); slash != std::string_view::npos)
+        id.remove_prefix(slash + 1);
+    if (id.size() >= 2 && id[0] == 'o' && id[1] >= '1' && id[1] <= '9')
+        return true;
+    return id.rfind("gpt-5", 0) == 0 || id.rfind("gpt-6", 0) == 0;
 }
 
 // Parse a 6-digit hex color string "#RRGGBB" or "RRGGBB" into r, g, b.
@@ -2598,6 +2720,43 @@ static std::string fmtUserError(const std::string& description,
     return out;
 }
 
+// HTTP codes worth one automatic retry: provider rate limits, provider-side
+// crashes, and the Cloudflare edge family (520 unknown, 522 connect timeout,
+// 524 origin read timeout) that fronts several proxied providers — including
+// the Platinum worker path, where a slow upstream trips Cloudflare's ~100s
+// edge limit even though nothing is actually broken.
+static bool isTransientHttp(int code) {
+    switch (code) {
+        case 408:  // request timeout
+        case 425:  // too early
+        case 429:  // rate limited
+        case 500: case 502: case 503:
+        case 504:  // gateway timeout
+        case 520: case 522: case 524:  // Cloudflare edge
+        case 529:  // overloaded (Anthropic)
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Some providers return HTTP 200 and put the failure in the BODY — Ollama and
+// the Platinum coordinator both do this ("Platinum timed out after 300s...",
+// "No workers available for model X"). Those are the same class of transient
+// hiccup as a 503/524 and deserve the same one automatic retry, but
+// isTransientHttp can't see them because the status code is 200.
+static bool isTransientProviderError(const std::string& msg) {
+    std::string low = msg;
+    for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+    static constexpr std::string_view NEEDLES[] = {
+        "timed out", "timeout", "no workers available", "overloaded",
+        "try again", "busy", "temporarily unavailable", "connection reset",
+    };
+    for (auto n : NEEDLES)
+        if (low.find(n) != std::string::npos) return true;
+    return false;
+}
+
 static std::pair<std::string, std::string> parseAPIError(const std::string& errorBody, int statusCode) {
     std::string title = "API Error";
     std::string code, msg;
@@ -2699,6 +2858,20 @@ static std::pair<std::string, std::string> parseAPIError(const std::string& erro
                     "This usually means an outdated model or a setting the provider no longer supports. Try a different model or re-install the mod.",
                     code, errorMsg);
             }
+
+        } else if (statusCode == 524 || statusCode == 522 || statusCode == 520 ||
+                   statusCode == 504) {
+            // Cloudflare / gateway timeouts: the provider (or the proxy in
+            // front of it) gave up waiting for the model. Not a mod bug and
+            // not fixable client-side beyond asking for less work.
+            title = fmt::format("Provider Timed Out (HTTP {})", statusCode);
+            code  = autoErrorCode(50, std::min(statusCode - 500, 99));
+            msg = fmtUserError(
+                "The provider's gateway closed the connection before the model finished. "
+                "Big generations on slow models hit this most often.",
+                "Retry (the mod already retried once), ask for a shorter level, "
+                "or switch to a faster model/provider in settings.",
+                code, errorMsg);
 
         } else if (statusCode >= 500) {
             title = fmt::format("Service Error (HTTP {})", statusCode);
@@ -2832,10 +3005,8 @@ static std::optional<std::pair<std::string, std::string>> parseCustomAuthHeader(
     return std::make_pair(name, value);
 }
 
-// Parse the "example-level-ids" setting into at most 5 numeric GD level IDs.
-// Accepts commas/spaces/semicolons as separators; ignores junk tokens.
 // Scan a prompt for "<digits> bpm" (case-insensitive); 0 when absent.
-// Manual digit scan — same exception-free pattern as parseExampleLevelIds.
+// Manual digit scan — exception-free (no std::stoi anywhere in this file).
 static int parseBpmFromPrompt(const std::string& prompt) {
     for (size_t i = 0; i + 2 < prompt.size(); ++i) {
         char a = (char)std::tolower((unsigned char)prompt[i]);
@@ -2939,31 +3110,28 @@ static bool extractRegionRange(std::string& prompt, float& outX0, float& outX1) 
     return false;
 }
 
-static std::vector<int> parseExampleLevelIds() {
-    std::string raw = Mod::get()->getSettingValue<std::string>("example-level-ids");
-    std::vector<int> ids;
-    std::string tok;
-    auto flush = [&] {
-        if (!tok.empty()) {
-            if (auto n = geode::utils::numFromString<int>(tok)) {
-                if (n.unwrap() > 0 && ids.size() < 5) ids.push_back(n.unwrap());
-            }
-            tok.clear();
-        }
-    };
-    for (char c : raw) {
-        if (c >= '0' && c <= '9') tok += c;
-        else flush();
-    }
-    flush();
-    return ids;
-}
-
 static std::string getOllamaUrl() {
     bool usePlatinum = Mod::get()->getSettingValue<bool>("use-platinum");
     return usePlatinum
         ? "http://sn-1.vltgg.net:21800"
         : "http://localhost:11434";
+}
+
+// A BYOPAK value may be either an OpenAI-compatible base URL or the complete
+// chat-completions endpoint. Generation and validation must target the same
+// normalized endpoint.
+static std::string resolveCustomChatUrl(std::string url) {
+    while (!url.empty() && std::isspace((unsigned char)url.back())) url.pop_back();
+    size_t first = 0;
+    while (first < url.size() && std::isspace((unsigned char)url[first])) ++first;
+    if (first) url.erase(0, first);
+    if (url.find("/chat/completions") == std::string::npos
+        && url.find("/v1/messages") == std::string::npos
+        && url.find("/completions") == std::string::npos) {
+        if (!url.empty() && url.back() == '/') url.pop_back();
+        url += "/v1/chat/completions";
+    }
+    return url;
 }
 
 // Apply the per-provider authentication header(s) to a WebRequest. One source
@@ -3000,6 +3168,37 @@ static void applyProviderAuth(web::WebRequest& req,
         }
     }
     // ollama / lm-studio / llama-cpp: no auth header
+}
+
+// Same auth headers as applyProviderAuth, but as raw "Name: value" strings
+// for the streaming path (which talks to libcurl directly and can't take a
+// WebRequest). One source of truth would be nicer, but WebRequest exposes no
+// way to read its headers back out, so the two share this switch by shape.
+static std::vector<std::string> providerAuthHeaderLines(
+    const std::string& provider, const std::string& apiKey)
+{
+    std::vector<std::string> out;
+    out.push_back("Content-Type: application/json");
+    if (provider == "gemini") {
+        out.push_back(fmt::format("x-goog-api-key: {}", apiKey));
+    } else if (provider == "claude") {
+        out.push_back(fmt::format("x-api-key: {}", apiKey));
+        out.push_back("anthropic-version: 2023-06-01");
+    } else if (provider == "openai"     || provider == "ministral" ||
+               provider == "huggingface"|| provider == "deepseek"  ||
+               provider == "groq")
+    {
+        out.push_back(fmt::format("Authorization: Bearer {}", apiKey));
+    } else if (provider == "openrouter") {
+        out.push_back(fmt::format("Authorization: Bearer {}", apiKey));
+        out.push_back("Referer: https://editorai.pages.dev");
+        out.push_back("X-Title: EditorAI");
+    } else if (provider == "custom") {
+        if (auto header = parseCustomAuthHeader(apiKey))
+            out.push_back(fmt::format("{}: {}", header->first, header->second));
+    }
+    // ollama / lm-studio / llama-cpp: no auth header
+    return out;
 }
 
 // Per-provider request timeout, shared by the single-shot and tool-loop
@@ -3343,18 +3542,40 @@ static std::pair<float, std::string> describeLengthByX(float maxX) {
 //   ARC-ORBS x y count=N [radius=R] [orb=yellow]
 //   MIRROR axis=X [from=x0..x1]
 //   COPY from=x0..x1 offset=DX
-//   TRIGGER color   ch=N hex=RRGGBB at=X [duration=T] [blend]
-//   TRIGGER alpha   groups=g at=X to=A duration=T
-//   TRIGGER move    groups=g at=X dx=DX dy=DY duration=T
-//   TRIGGER toggle  groups=g at=X on=BOOL
-//   TRIGGER pulse   ch=N hex=RRGGBB at=X duration=T
-//   TRIGGER rotate  groups=g at=X degrees=D duration=T
-//   TRIGGER spawn   target=N at=X [delay=T]
-//   TRIGGER stop    groups=g at=X
-//   TRIGGER end     at=X
+//   REPEAT <count> <any EAS line with $i>   (loop: e.g. `REPEAT 6 SPIKE $i*30`)
+//   TRIGGER color ch=N hex=RRGGBB at=X [duration=T opacity=A blend]
+//   TRIGGER alpha groups=g at=X to=A duration=T
+//   TRIGGER move  groups=g at=X dx=DX dy=DY [duration=T easing=N lock_to_player_x lock_to_player_y]
+//   TRIGGER toggle groups=g at=X [on]
+//   TRIGGER pulse ch=N|groups=g hex=RRGGBB at=X [fade_in=T hold=T fade_out=T exclusive]
+//   TRIGGER rotate groups=g at=X degrees=D [duration=T center=g lock_rotation]
+//   TRIGGER scale groups=g at=X to=F [duration=T]
+//   TRIGGER shake at=X [duration=T strength=F interval=F]
+//   TRIGGER spawn target=N at=X [delay=T editor_disable]
+//   TRIGGER stop  groups=g at=X
+//   TRIGGER end   at=X
+//   TRIGGER show-player|hide-player|show-trail|hide-trail at=X
+//   TRIGGER zoom at=X zoom=F [duration=T]      (2.2 camera zoom)
+//   TRIGGER static-cam at=X target=g [duration=T exit]
+//   TRIGGER offset-cam at=X x=DX y=DY [duration=T]
+//   TRIGGER timewarp at=X mod=F               (0.5=slow-mo, 2=double)
+//   TRIGGER song at=X [sound_id=N channel=C volume=F]
+//   TRIGGER sfx  at=X sound_id=N [volume=F pitch=F]
+//   TRIGGER follow at=X target=g follow=g2 [x_mod=F y_mod=F duration=T]
+//   TRIGGER follow-y at=X target=g [speed=F delay=T offset=N max_speed=F]
+//   TRIGGER touch at=X target=g [activate hold]
+//   TRIGGER count|instant-count at=X item_id=N count=C target=g [activate]
+//   TRIGGER pickup at=X item_id=N count=C
+//   TRIGGER on-death at=X target=g [activate]
+//   TRIGGER animate at=X groups=g anim=N
+//   TRIGGER gravity at=X g=F [duration=T]      (1=normal, 0.5=floaty, 2=heavy)
+//   TRIGGER teleport at=X groups=g
+//   TRIGGER reverse|bg-on|bg-off|no-enter-fx at=X
 //
 // All triggers default to X-position-triggered. Touch triggers require explicit
-// `touch=true` (this is rare and a deliberate design choice).
+// `touch=true` (this is rare and a deliberate design choice). The authoritative
+// grammar for the MODEL is the system prompt (buildSystemPrompt), not this
+// comment — keep the two in sync when adding a verb.
 
 namespace eas {
 
@@ -3567,6 +3788,97 @@ inline std::tuple<float, float, bool> parseRange(const std::string& s) {
     float b = tryFloat(s.substr(dd + 2), NAN);
     if (std::isnan(a) || std::isnan(b)) return {0, 0, false};
     return {a, b, true};
+}
+
+// ── REPEAT loop expansion ─────────────────────────────────────────────────────
+// `REPEAT <count> <any EAS statement with $i>` repeats the statement `count`
+// times, substituting a tiny numeric expression per iteration. This is the
+// codegen stepping-stone: pattern generation in one line instead of N lines
+// ("REPEAT 8 SPIKE $i*30" → spikes every 30u). Supported expression: the
+// loop variable `i` (also as `$i` inside a larger expression) plus digits,
+// + - * / ( ) and '.'. No strings, no eval — a ~40-line recursive-descent
+// parser is all that is involved.
+// Returns true when the line parsed as a REPEAT (so the caller returns).
+
+struct ExprParser {
+    const std::string& s;
+    size_t pos = 0;
+    double i;
+    ExprParser(const std::string& str, double iv) : s(str), i(iv) {}
+    bool skip() { while (pos < s.size() && s[pos] == ' ') ++pos; return pos < s.size(); }
+    double expr() {
+        double v = term();
+        while (skip() && (s[pos] == '+' || s[pos] == '-')) {
+            char op = s[pos++]; double r = term();
+            v = op == '+' ? v + r : v - r;
+        }
+        return v;
+    }
+    double term() {
+        double v = factor();
+        while (skip() && (s[pos] == '*' || s[pos] == '/')) {
+            char op = s[pos++]; double r = factor();
+            v = op == '*' ? v * r : (r == 0.0 ? v : v / r);
+        }
+        return v;
+    }
+    double factor() {
+        if (skip() && s[pos] == '-') { ++pos; return -factor(); }
+        // Nested `$i` inside a larger expression, e.g. `$(300+$i*60)`.
+        if (skip() && s[pos] == '$') {
+            ++pos;
+            if (skip() && (s[pos] == 'i' || s[pos] == 'I')) { ++pos; return i; }
+            return 0.0;
+        }
+        if (skip() && s[pos] == '(') {
+            ++pos; double v = expr();
+            if (skip() && s[pos] == ')') ++pos;
+            return v;
+        }
+        if (skip() && (s[pos] == 'i' || s[pos] == 'I')) { ++pos; return i; }
+        size_t start = pos;
+        while (pos < s.size() && (std::isdigit((unsigned char)s[pos]) || s[pos] == '.')) ++pos;
+        if (pos == start) return 0.0;
+        return tryFloat(s.substr(start, pos - start), 0.0);
+    }
+};
+
+// Expand one statement for loop iteration `idx`: replace every `$<expr>` with
+// the evaluated value (i = idx). A `$` with an unparseable expression is left
+// as-is (the line will then fail its own numeric parse and be skipped — safe).
+inline std::string expandRepeatStatement(const std::string& stmt, int idx) {
+    std::string out;
+    out.reserve(stmt.size() + 8);
+    for (size_t p = 0; p < stmt.size();) {
+        if (stmt[p] != '$') { out += stmt[p++]; continue; }
+        // Expression = contiguous run of expression characters after the '$'.
+        // Space-free: a `$expr` is a single token, so a following positional
+        // arg ("SAW $i*40 165") is never absorbed. '.' counts as a decimal
+        // point only when NOT the start of a ".." range separator.
+        size_t q = p + 1;
+        while (q < stmt.size()) {
+            unsigned char ch = (unsigned char)stmt[q];
+            bool isExprChar = std::isdigit(ch) || ch == 'i' || ch == 'I'
+                || ch == '+' || ch == '-' || ch == '*' || ch == '/'
+                || ch == '(' || ch == ')' || ch == '$';
+            if (ch == '.') {
+                if (q + 1 < stmt.size() && stmt[q + 1] == '.') break;
+                isExprChar = true;
+            }
+            if (!isExprChar) break;
+            ++q;
+        }
+        if (q == p + 1) { out += stmt[p++]; continue; }   // lone '$'
+        ExprParser ep(stmt.substr(p + 1, q - p - 1), idx);
+        double v = ep.expr();
+        // Whole number → integer form; otherwise keep two decimals.
+        if (std::abs(v - std::round(v)) < 1e-6 && v < 1e9)
+            out += fmt::format("{:.0f}", v);
+        else
+            out += fmt::format("{:.2f}", v);
+        p = q;
+    }
+    return out;
 }
 
 // Hex string → RGB triplet matjson array. Supports "RRGGBB" with optional "#".
@@ -3797,6 +4109,7 @@ inline ParseResult parse(std::string_view text) {
 
     // Stride through lines
     std::string cur;
+    std::vector<std::string> pending;   // lines queued by REPEAT expansion
     auto handle_inner = [&](const std::string& raw) {
         auto ln = tokenize(raw);
         if (ln.verb.empty()) return;
@@ -3833,6 +4146,63 @@ inline ParseResult parse(std::string_view text) {
                 applyCommonFields(op, ln);
             }
             objects.push(std::move(op));
+            return;
+        }
+
+        // ── REPEAT (loop / pattern generation) ────────────────────────────
+        // `REPEAT <count> <statement with $i>` expands `<statement>` count
+        // times, substituting $i and tiny numeric expressions per iteration.
+        // Pure line-splitting + substitution — no interpreter, deterministic.
+        if (ln.verb == "repeat") {
+            // Split raw into whitespace tokens to isolate count + statement.
+            std::vector<std::string> toks;
+            {
+                std::string curTok;
+                std::string s = trim(raw);
+                for (size_t ci = 0; ci <= s.size(); ++ci) {
+                    char c = ci < s.size() ? s[ci] : ' ';
+                    if (c == ' ' || c == '\t') {
+                        if (!curTok.empty()) { toks.push_back(curTok); curTok.clear(); }
+                    } else curTok.push_back(c);
+                }
+            }
+            int count = 0;
+            size_t stmtStart = 1;
+            if (toks.size() > 1) {
+                if (isNumericTok(toks[1])) {
+                    count = tryInt(toks[1], 0);
+                    stmtStart = 2;
+                } else if (toks[1].rfind("count=", 0) == 0) {
+                    count = tryInt(toks[1].substr(6), 0);
+                    stmtStart = 2;
+                }
+            }
+            if (count <= 0) count = (int)ln.inum("count", 0);
+            if (count <= 0 || count > 200) {
+                geode::log::warn("EAS: REPEAT needs a count 1..200 - line skipped");
+                return;
+            }
+            std::string stmt;
+            for (size_t t = stmtStart; t < toks.size(); ++t) {
+                if (!stmt.empty()) stmt += " ";
+                stmt += toks[t];
+            }
+            if (stmt.empty()) { geode::log::warn("EAS: REPEAT has no statement - skipped"); return; }
+            // No nesting — a REPEAT whose statement is itself a REPEAT would
+            // queue unboundedly. Flatten only one level.
+            {
+                std::string first;
+                size_t si = 0;
+                while (si < stmt.size() && (stmt[si] == ' ' || stmt[si] == '\t')) ++si;
+                size_t sj = si;
+                while (sj < stmt.size() && stmt[sj] != ' ' && stmt[sj] != '\t') ++sj;
+                if (lower(stmt.substr(si, sj - si)) == "repeat") {
+                    geode::log::warn("EAS: nested REPEAT is not allowed - skipped");
+                    return;
+                }
+            }
+            for (int idx = 0; idx < count; ++idx)
+                pending.push_back(expandRepeatStatement(stmt, idx));
             return;
         }
 
@@ -4540,16 +4910,27 @@ inline ParseResult parse(std::string_view text) {
     // return defaults on bad input), so a malformed line degrades to default
     // values instead of needing a catch-all here.
     auto handle = [&](const std::string& raw) { handle_inner(raw); };
+    auto drainPending = [&] {
+        while (!pending.empty()) {
+            std::string p = std::move(pending.front());
+            pending.erase(pending.begin());
+            handle(p);
+        }
+    };
     // Stream through lines
     for (size_t i = 0; i <= text.size(); ++i) {
         char c = (i < text.size()) ? text[i] : '\n';
         if (c == '\n' || c == '\r') {
-            if (!cur.empty()) handle(cur);
+            if (!cur.empty()) {
+                handle(cur);
+                drainPending();
+            }
             cur.clear();
         } else {
             cur.push_back(c);
         }
     }
+    drainPending();   // safety: a trailing REPEAT with no newline after it
 
     // Assemble
     if (defaultColors.size() > 0) metadata["default_colors"] = defaultColors;
@@ -4575,6 +4956,7 @@ inline bool looksLikeEAS(const std::string& text) {
         "pyramid","ceiling-spikes","ceiling_spikes","saw-gauntlet","saw_gauntlet",
         "mirror","copy","trigger","row","dual","teleport",
         "move","delete","edit",   // edit ops on existing objects
+        "repeat",                 // loop / pattern generation
     };
     // In-place line walk — istringstream would copy the whole (potentially
     // 60 KB+) response just to inspect the first non-comment line.
@@ -4908,21 +5290,31 @@ struct Result {
     std::string summary;         // human-readable for AI/user feedback
 };
 
-// Object types that physically block the player. We only need substring
-// matching here — anything containing these prefixes counts.
-inline bool isBlockingType(const std::string& type) {
+// Lethal-only classification: hazards the player must not touch. Spikes,
+// generic hazards, and saws — but NOT `decor_*` objects (no collision),
+// "fake" spikes, or "decorative" spikes/thorns (all non-lethal visual
+// decoration). Shared by the physics sim and the difficulty histogram so the
+// passability paths can never disagree about what is dangerous.
+inline bool isHazardType(const std::string& type) {
     if (type.empty()) return false;
-    // Solid blocks
-    if (type.rfind("block_", 0) == 0) return true;
-    // Spikes (deadly + decorative; both block via collision damage / solid)
-    if (type.rfind("spike_", 0) == 0 && type.find("fake") == std::string::npos)
-        return true;
-    // Generic hazards (pit, animated, etc.)
+    if (type.rfind("decor_", 0) == 0) return false;   // pure decoration
+    if (type.rfind("spike_", 0) == 0)
+        return type.find("fake") == std::string::npos &&
+               type.find("decorative") == std::string::npos;
     if (type.rfind("hazard_", 0) == 0) return true;
-    // Sawblades
-    if (type.find("sawblade") != std::string::npos) return true;
-    if (type.find("saw_blade") != std::string::npos) return true;
-    return false;
+    // Sawblades (lethal) — decorative saws were already excluded by the
+    // decor_ check above.
+    return type.find("sawblade") != std::string::npos ||
+           type.find("saw_blade") != std::string::npos ||
+           type.find("_saw") != std::string::npos ||
+           type.find("saw_") != std::string::npos;
+}
+
+// Object types that physically block the player (solid OR lethal). Anything
+// matching isHazardType blocks; solid blocks block; decoration doesn't.
+inline bool isBlockingType(const std::string& type) {
+    if (type.rfind("block_", 0) == 0) return true;
+    return isHazardType(type);
 }
 
 // Triggers that "remove" objects (effectively) when fired. Recognise both the
@@ -5020,15 +5412,12 @@ inline Result check(const matjson::Value& objectsArray) {
         if (!isMovingTrigger(type)) continue;
         // Direction matters: a toggle that turns a group ON adds blockers,
         // it doesn't remove them — treating it as removal hides real death
-        // zones. Same for alpha fading TO visible (opacity > 0).
+        // zones. Alpha only changes visibility, never collision.
         if (type.find("toggle") != std::string::npos) {
             auto act = o["activate_group"].asBool();
             if (act && act.unwrap()) continue;
         }
-        if (type.find("alpha") != std::string::npos) {
-            float to = getFloat(o, "opacity", 0.f);
-            if (to > 0.05f) continue;
-        }
+        if (type.find("alpha") != std::string::npos) continue;
         float trigX = getFloat(o, "x", 0.f);
         int target = parseSingleGroup(o, "target_group");
         if (target == 0) {
@@ -5054,11 +5443,10 @@ inline Result check(const matjson::Value& objectsArray) {
         if (!typeRes) continue;
         std::string type = typeRes.unwrap();
         if (!isBlockingType(type)) continue;
-        // passable / no_touch objects have no collision — fake walls and
-        // decorative hazards must not register as blockers.
+        // NoTouch disables interaction for both solids and hazards. Passable
+        // is a one-way surface, not absent geometry; retain it conservatively
+        // in this directionless occupancy scan.
         {
-            auto pr = o["passable"].asBool();
-            if (pr && pr.unwrap()) continue;
             auto nt = o["no_touch"].asBool();
             if (nt && nt.unwrap()) continue;
         }
@@ -5297,7 +5685,7 @@ inline SimResult simulateCube(const matjson::Value& objectsArray, float groundY)
     SimResult res;
     if (!objectsArray.isArray() || objectsArray.size() == 0) return res;
 
-    struct Box { float x, y, halfW, halfH; };
+    struct Box { float x, y, halfW, halfH; bool oneWay = false; };
     std::vector<Box> solids, hazards;
     // v2: gamemode segments, speed portals, and jump orbs/pads. The bot is
     // mode-aware — cube/robot run the jump simulation; flight modes run a
@@ -5347,23 +5735,17 @@ inline SimResult simulateCube(const matjson::Value& objectsArray, float groundY)
             boosters.push_back({x, y, imp, t.rfind("jump_pad_", 0) == 0});
             continue;
         }
-        bool hazard = t.rfind("spike_", 0) == 0 || t.rfind("hazard_", 0) == 0 ||
-                      t.find("_saw") != std::string::npos || t.find("saw_") != std::string::npos;
+        bool hazard = isHazardType(t);
         bool solid  = !hazard && isBlockingType(t);
         if (!hazard && !solid) continue;
-        // Flagged-off collision: no_touch hazards can't kill, passable
-        // solids can't block — skip both so the bot sees the real level.
-        if (hazard) {
-            auto nt = o["no_touch"].asBool();
-            if (nt && nt.unwrap()) continue;
-        }
-        if (solid) {
-            auto pr = o["passable"].asBool();
-            if (pr && pr.unwrap()) continue;
-        }
+        // Passable solids still provide landing surfaces. NoTouch disables
+        // interactions regardless of whether an object is solid or hazardous.
+        auto nt = o["no_touch"].asBool();
+        if (nt && nt.unwrap()) continue;
+        const bool oneWay = solid && getBool(o, "passable", false);
         // Hazard hitboxes in GD are forgiving (~40-60% of the sprite).
         float half = 15.f * scale * (hazard ? 0.55f : 1.f);
-        (hazard ? hazards : solids).push_back({x, y, half, half});
+        (hazard ? hazards : solids).push_back({x, y, half, half, oneWay});
         if (x > maxX) maxX = x;
     }
     if (maxX <= 0.f) return res;
@@ -5544,6 +5926,7 @@ inline SimResult simulateCube(const matjson::Value& objectsArray, float groundY)
             if (!wantJump) {
                 for (size_t i = sWin; i < solids.size() && solids[i].x < x + 55.f; ++i) {
                     const auto& b = solids[i];
+                    if (b.oneWay) continue;
                     if (b.x > x + HALF && b.y + b.halfH > y - HALF + 6.f &&
                         b.y - b.halfH < y + HALF) { wantJump = true; break; }
                 }
@@ -5588,9 +5971,11 @@ inline SimResult simulateCube(const matjson::Value& objectsArray, float groundY)
         // Wall slam: grounded into a solid's face.
         for (size_t i = sWin; i < solids.size() && solids[i].x - solids[i].halfW <= x + HALF; ++i) {
             const auto& b = solids[i];
+            if (b.oneWay) continue;
             if (x + HALF > b.x - b.halfW && x - HALF < b.x + b.halfW &&
                 y + HALF - 6.f > b.y - b.halfH && y - HALF + 6.f < b.y + b.halfH) {
-                res.deaths.push_back({x, y, "ran into a wall"});
+                res.deaths.push_back({x, y,
+                    fmt::format("ran into a wall (in {})", modeName(mode))});
                 goto died;
             }
         }
@@ -5599,7 +5984,8 @@ inline SimResult simulateCube(const matjson::Value& objectsArray, float groundY)
             const auto& h = hazards[i];
             if (x + HALF * 0.7f > h.x - h.halfW && x - HALF * 0.7f < h.x + h.halfW &&
                 y + HALF * 0.7f > h.y - h.halfH && y - HALF * 0.7f < h.y + h.halfH) {
-                res.deaths.push_back({x, y, "hit a hazard"});
+                res.deaths.push_back({x, y,
+                    fmt::format("hit a hazard (in {})", modeName(mode))});
                 goto died;
             }
         }
@@ -5646,9 +6032,7 @@ inline std::vector<CurveWindow> difficultyHistogram(const matjson::Value& object
         const std::string& t = typeRes.unwrap();
         float x = getFloat(o, "x", 0.f);
         if (!std::isfinite(x) || x < 0.f || x > 250000.f) continue;
-        bool hazard = t.rfind("spike_", 0) == 0 || t.rfind("hazard_", 0) == 0 ||
-                      t.find("_saw") != std::string::npos ||
-                      t.find("saw_") != std::string::npos;
+        bool hazard = isHazardType(t);
         if (hazard) hazardXs.push_back(x);
         if (isBlockingType(t) && x > maxX) maxX = x;
     }
@@ -6501,6 +6885,18 @@ static std::unordered_set<GameObject*> s_editOpDeleted;  // pending soft deletes
 // Accept / Done: make soft deletes real, drop the journal.
 static void finalizeEditOps(LevelEditorLayer* lel) {
     int removed = 0;
+    auto deleted = CCArray::create();
+    for (auto& rec : s_editOpJournal) {
+        GameObject* obj = rec.obj;
+        if (obj && rec.deleted && obj->getParent()) deleted->addObject(obj);
+    }
+    if (lel && lel->m_undoObjects && deleted->count() > 0) {
+        if (auto* undo = UndoObject::createWithArray(
+                deleted, UndoCommand::DeleteMulti)) {
+            lel->m_undoObjects->addObject(undo);
+            if (lel->m_redoObjects) lel->m_redoObjects->removeAllObjects();
+        }
+    }
     for (auto& rec : s_editOpJournal) {
         GameObject* obj = rec.obj;
         if (!obj || !rec.deleted) continue;
@@ -6582,6 +6978,39 @@ static void removePlaytestGhost() {
         s_playtestGhost->removeFromParent();
         s_playtestGhost = nullptr;
     }
+}
+
+// Region-highlight overlay (CCDrawNode translucent band). The AI's
+// highlight_region tool draws a non-destructive visual band over an X range
+// so the user sees exactly which section it is talking about. A CCDrawNode
+// overlay — no GameObjects, no editor object bookkeeping, dies with the scene.
+static Ref<cocos2d::CCDrawNode> s_regionHighlight;
+
+static void removeRegionHighlight() {
+    if (s_regionHighlight) {
+        s_regionHighlight->removeFromParent();
+        s_regionHighlight = nullptr;
+    }
+}
+
+// Draw the region-highlight band; returns false when no editor is available.
+static bool drawRegionHighlight(LevelEditorLayer* layer, float x0, float x1,
+                                const std::string& reason) {
+    removeRegionHighlight();
+    if (!layer || !layer->m_objectLayer) return false;
+    float gY = (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y");
+    constexpr float TOP = 540.f;
+    auto draw = cocos2d::CCDrawNode::create();
+    // Translucent amber fill with a brighter outline band.
+    draw->drawRect({x0, gY - 15.f}, {x1, TOP},
+        cocos2d::ccColor4F{1.f, 0.82f, 0.25f, 0.14f}, 1.2f,
+        cocos2d::ccColor4F{1.f, 0.82f, 0.25f, 0.6f});
+    draw->setZOrder(899);
+    layer->m_objectLayer->addChild(draw);
+    s_regionHighlight = draw;
+    log::info("Region highlight: X {:.0f}-{:.0f}{}", x0, x1,
+              reason.empty() ? "" : fmt::format(" ({})", reason));
+    return true;
 }
 
 // Set by the editor's Mutate button just before opening the generator popup;
@@ -7718,10 +8147,6 @@ protected:
             "<cg>xl</c> / <cg>xxl</c> even longer.\n\n"
             "The AI keeps extending until the target is reached, so longer "
             "settings use more API tokens.");
-        addInt   ("Max objects","max-objects", 10, 1000000, 500,
-            "Hard cap on objects per generation.\n\n"
-            "Higher = more detail, but slower editor spawning and bigger AI "
-            "responses. 500 is a good default; raise it for XL levels.");
         addInt   ("Spawn speed","spawn-batch-size", 1, 100, 8,
             "Objects placed per tick while the preview builds.\n\n"
             "Raise for faster placement; lower it if the editor stutters "
@@ -7730,10 +8155,6 @@ protected:
             "Editor Y of the ground line the AI builds on.\n\n"
             "<cg>105</c> is the default. Lower it if generated blocks float "
             "above the ground; raise it if they sink into it.");
-        addText  ("Example IDs","example-level-ids", "up to 5 level IDs, comma-sep", 100, false,
-            "Up to 5 GD level IDs (comma-separated).\n\n"
-            "The AI downloads them and studies their object placement as "
-            "style references before building yours.");
         addNote  ("Free-form text is OK for difficulty/style/length.");
         addNote  ("Tap an (i) icon on any row for details.");
     }
@@ -7752,11 +8173,26 @@ protected:
             "generated levels.\n\n"
             "Turn <cr>off</c> for plain block-and-spike output (simpler, "
             "more reliable on small local models).");
+        addToggle("Refine until done", "refine-until-done",
+            "Keep polishing until the <cg>AI itself</c> reports the level is "
+            "finished, instead of a fixed number of passes.\n\n"
+            "There is no pass cap; Cancel remains available. Turn off to use the "
+            "fixed \"Refinement rounds\" count below.");
         addInt   ("Refinement rounds", "refinement-rounds", 0, 10, 3,
+            "Used only when <cy>Refine until done</c> is OFF.\n\n"
             "After the first draft the AI reviews its own level and improves "
             "it - pacing, visuals, difficulty curve - this many times.\n\n"
             "<cg>0</c> = off.  More rounds = better quality but more tokens "
             "and time. <cg>3</c> is a good balance.");
+        addToggle("Stream responses", "stream-responses",
+            "Show the AI's reply <cg>as it is written</c>, token by token, "
+            "formatted live in the overlay chat.\n\n"
+            "Turn off to wait for each complete reply instead.");
+        addToggle("AI playtest & watch", "ai-playtest",
+            "Lets the AI repeatedly run simulated playtests and inspect a "
+            "fresh render between revision passes.\n\n"
+            "The user can still run Geometry Dash's real playtest before "
+            "accepting or denying the preview.");
 
         addHeader("Rate & Feedback");
         addToggle("Rate limiting",     "enable-rate-limiting",
@@ -8792,8 +9228,6 @@ static std::string buildRecipeCode(const std::string& prompt) {
     o["difficulty"] = Mod::get()->getSettingValue<std::string>("difficulty");
     o["style"]      = Mod::get()->getSettingValue<std::string>("style");
     o["length"]     = Mod::get()->getSettingValue<std::string>("length");
-    auto ids = Mod::get()->getSettingValue<std::string>("example-level-ids");
-    if (!ids.empty()) o["example_ids"] = ids;
     std::string json = o.dump();
     return std::string(RECIPE_PREFIX)
          + oauth::b64url((const uint8_t*)json.data(), json.size());
@@ -8816,8 +9250,8 @@ static bool applyRecipeCode(const std::string& code, std::string& outPrompt) {
     if (s) Mod::get()->setSettingValue<std::string>("style", s.unwrap());
     auto l = r["length"].asString();
     if (l) Mod::get()->setSettingValue<std::string>("length", l.unwrap());
-    auto ids = r["example_ids"].asString();
-    if (ids) Mod::get()->setSettingValue<std::string>("example-level-ids", ids.unwrap());
+    // (example_ids from older recipe codes is ignored — pinned reference IDs
+    // were replaced by the AI's own search_levels tool.)
     return true;
 }
 
@@ -9503,6 +9937,8 @@ static void loadPersistedSessions(std::vector<std::shared_ptr<GenSession>>& out)
         s->fbShared   = o["fbShared"].asBool().unwrapOr(false);
         s->restored   = true;
         s->chatSummary     = o["chatSummary"].asString().unwrapOr("");
+        s->flowPhase      = o["flowPhase"].asString().unwrapOr("idle");
+        s->workingState    = o["workingState"].asString().unwrapOr("");
         s->targetLevelName = o["targetLevelName"].asString().unwrapOr("");
         s->pendingEdit     = o["pendingEdit"].asString().unwrapOr("");
         s->pendingEditMode = (int)o["pendingEditMode"].asInt().unwrapOr(0);
@@ -9556,10 +9992,14 @@ static void loadPersistedSessions(std::vector<std::shared_ptr<GenSession>>& out)
         bool wasLive = st == (int)GenSession::State::Running ||
                        st == (int)GenSession::State::AwaitingEditor ||
                        st == (int)GenSession::State::Staged;
-        if (wasLive)
+        if (wasLive) {
+            s->flowPhase = !s->pendingEdit.empty()
+                ? "open target level to continue"
+                : "interrupted - ready to resume";
             s->push(GenSession::Entry::Kind::Status,   // push() keeps the cap
                 "(restored after restart - anything unstaged was lost, but "
                 "the conversation lives: just send another message)");
+        }
         if (s->id >= s_sessionsNextId) s_sessionsNextId = s->id + 1;
         out.push_back(std::move(s));
     }
@@ -9618,6 +10058,8 @@ void editoraiPersistSessionsIfDirty() {
         }
         o["chat"]            = ch;
         o["chatSummary"]     = s->chatSummary;
+        o["flowPhase"]       = s->flowPhase;
+        o["workingState"]    = s->workingState;
         o["targetLevelName"] = s->targetLevelName;
         o["pendingEdit"]     = s->pendingEdit;
         o["pendingEditMode"] = s->pendingEditMode;
@@ -10096,7 +10538,12 @@ protected:
         this->schedule(schedule_selector(AIGeneratorPopup::updateCostEstimate), 1.0f);
         this->schedule(schedule_selector(AIGeneratorPopup::pollPlatinumStatus), 5.0f);
 
-        this->schedule(schedule_selector(AIGeneratorPopup::updateObjectCreation), 0.05f);
+        // The overlay creates this popup headless. CCNode::schedule() marks
+        // off-scene targets paused, so its object-spawn selector never fires
+        // while live placement is waiting for the next AI diff. Register it
+        // directly with the scheduler so both visible and headless engines
+        // progressively materialize their queued objects.
+        scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 0.05f);
         return true;
     }
 
@@ -10339,9 +10786,15 @@ protected:
             constexpr double EST_OUT_TOKENS = 4000.0;
             double perCall = inTokens / 1e6 * inP + EST_OUT_TOKENS / 1e6 * outP;
             // Quality rounds multiply the spend — say so. One generation =
-            // initial + refinement rounds + two-pass + self-review.
+            // initial + refinement rounds + two-pass + self-review. In
+            // until-done mode the count is open-ended, so estimate with a
+            // typical run rather than the safety cap.
+            int refineRounds =
+                Mod::get()->getSettingValue<bool>("refine-until-done")
+                    ? 4
+                    : (int)Mod::get()->getSettingValue<int64_t>("refinement-rounds");
             int rounds = 1
-                + (int)Mod::get()->getSettingValue<int64_t>("refinement-rounds")
+                + refineRounds
                 + (Mod::get()->getSettingValue<bool>("two-pass-generation") ? 1 : 0)
                 + (Mod::get()->getSettingValue<bool>("enable-self-critique") ? 1 : 0);
             rounds = std::max(rounds, 1);
@@ -10414,6 +10867,7 @@ protected:
     void onCancel(CCObject*) {
         if (!m_isGenerating) return;
         m_listener = {};  // destroy the task holder, cancelling the request
+        cancelStream();   // abort an in-flight streamed round too
         // Also cancel any in-flight TOOL requests — with parallel tool
         // execution these run on their own holders, and a surviving callback
         // would push results into m_toolHistory and silently restart the
@@ -10429,6 +10883,8 @@ protected:
         m_critiquePending = false;
         if (m_session) {
             m_session->state = GenSession::State::Done;
+            m_session->flowPhase = "cancelled";
+            m_session->liveStatus.clear();
             m_session->push(GenSession::Entry::Kind::Status, "Cancelled by user");
         }
         m_generateBtn->setVisible(true);
@@ -10546,6 +11002,12 @@ protected:
     // Base scale of m_statusLabel; the error micro-pop returns to this.
     static constexpr float STATUS_SCALE = 0.3f;
 
+    void setFlowPhase(const std::string& phase) {
+        if (!m_session || phase.empty() || m_session->flowPhase == phase) return;
+        m_session->flowPhase = phase;
+        editoraiMarkSessionsDirty();
+    }
+
     void showStatus(const std::string& msg, bool error = false) {
         if (m_session && !msg.empty()) {
             // Skip exact-duplicate consecutive status lines (progress spam).
@@ -10570,14 +11032,31 @@ protected:
         }
     }
 
+    // Label-only status: updates the popup label and the session's live line,
+    // but never appends to the transcript. For anything that ticks (elapsed
+    // time), which would otherwise push one entry PER SECOND — flooding the
+    // 400-entry window and re-marking sessions dirty every second.
+    void showLiveStatus(const std::string& msg) {
+        if (m_session) m_session->liveStatus = msg;
+        if (m_statusLabel) {
+            m_statusLabel->setString(msg.c_str());
+            m_statusLabel->limitLabelWidth(340.f, STATUS_SCALE, 0.1f);
+            m_statusLabel->setColor(ui::SUCCESS_COL);
+            m_statusLabel->setVisible(true);
+        }
+    }
+
     void updateGenerationTimer(float) {
         if (!m_isGenerating) {
-            this->unschedule(schedule_selector(AIGeneratorPopup::updateGenerationTimer));
+            unscheduleAlways(schedule_selector(AIGeneratorPopup::updateGenerationTimer));
+            if (m_session) m_session->liveStatus.clear();
             return;
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_generationStartTime).count();
-        showStatus(fmt::format("AI is generating... ({}s)", elapsed));
+        // A streamed round owns the live line (it reports bytes/tokens too).
+        if (m_streamSink) return;
+        showLiveStatus(fmt::format("working... {}s", elapsed));
     }
 
     // ── Level manipulation ────────────────────────────────────────────────────
@@ -10996,15 +11475,27 @@ protected:
     std::string m_snapCacheB64;       // last snapshot, keyed by fingerprint
     size_t      m_snapCacheFp = 0;    // (the encode is main-thread disk IO —
                                       //  never pay it twice for the same view)
+    std::string m_snapMime = "image/jpeg";  // format the last capture produced
+    // render_level tool: the snapshot it produced, attached to the NEXT turn.
+    std::string m_pendingRenderB64;
 
-    std::string captureLevelSnapshotB64() {
+    // Whole-level capture (auto-framed).
+    std::string captureLevelSnapshotB64(bool forceFresh = false) {
+        return captureLevelSnapshotB64(0.f, -1.f, forceFresh);
+    }
+
+    // Region capture. Pass x1 <= x0 to auto-frame the whole generated area.
+    std::string captureLevelSnapshotB64(float regionX0, float regionX1,
+                                        bool forceFresh = false) {
+        bool region = regionX1 > regionX0;
         if (!revalidateEditor() || !m_editorLayer->m_objectLayer) return "";
         size_t editorCount = m_editorLayer->m_objects
             ? (size_t)m_editorLayer->m_objects->count() : 0;
         size_t fp = m_accumulatedObjects.size() * 1315423911u
                   ^ s_previewObjects.size()     * 2654435761u
-                  ^ editorCount                 * 97u;
-        if (fp == m_snapCacheFp && !m_snapCacheB64.empty())
+                  ^ editorCount                 * 97u
+                  ^ (size_t)(regionX0 * 31.f) ^ (size_t)(regionX1 * 131.f);
+        if (!forceFresh && fp == m_snapCacheFp && !m_snapCacheB64.empty())
             return m_snapCacheB64;
 
         // Frame from the accumulated draft; fall back to the whole level.
@@ -11028,13 +11519,24 @@ protected:
         if (maxX <= minX) return "";
         minX -= 60.f; maxX += 60.f;
         minY = std::max(minY - 90.f, 0.f); maxY += 90.f;
+        // Explicit region wins over the auto frame (clamped to real content so
+        // a bogus range can't produce an empty image).
+        if (region) {
+            float rx0 = std::max(regionX0 - 30.f, 0.f);
+            float rx1 = regionX1 + 30.f;
+            if (rx1 > rx0) { minX = rx0; maxX = rx1; }
+        }
         // Very long levels: cap the framed span so objects stay legible.
         if (maxX - minX > 9000.f) maxX = minX + 9000.f;
         float dx = maxX - minX;
         float dy = std::max(maxY - minY, 240.f);
 
         auto* objLayer = m_editorLayer->m_objectLayer;
-        auto renderAt = [&](int W) -> std::vector<std::uint8_t> {
+        // JPEG first: a level render is photographic (lots of gradients), so
+        // JPEG is 4-8x smaller than PNG at the same legibility — which means
+        // the model can be shown MORE of the level per request. PNG is the
+        // fallback when the platform's encoder refuses.
+        auto renderAt = [&](int W, bool jpeg) -> std::vector<std::uint8_t> {
             int H = (int)std::clamp(W * dy / dx, 160.f, 640.f);
             auto* rt = CCRenderTexture::create(W, H);
             if (!rt) return {};
@@ -11051,22 +11553,27 @@ protected:
             objLayer->setPosition(oldPos);
             CCImage* img = rt->newCCImage(true);
             if (!img) return {};
-            auto path = Mod::get()->getSaveDir() / "level-snapshot.png";
+            auto path = Mod::get()->getSaveDir() /
+                        (jpeg ? "level-snapshot.jpg" : "level-snapshot.png");
             std::string pathStr = utils::string::pathToString(path);
-            bool saved = img->saveToFile(pathStr.c_str(), false);
+            // JPEG has no alpha channel, so it must be written as RGB.
+            bool saved = img->saveToFile(pathStr.c_str(), jpeg);
             img->release();
             if (!saved) return {};
             auto bytes = utils::file::readBinary(path);
             if (!bytes) return {};
             auto data = bytes.unwrap();
-            log::info("Vision snapshot: {}x{}, {} KB", W, H, data.size() / 1024);
+            log::info("Vision snapshot: {}x{} {}, {} KB", W, H,
+                      jpeg ? "jpg" : "png", data.size() / 1024);
             return data;
         };
-        // 800px is plenty for the model; drop to 512 if a dense level
-        // compresses badly, and bail rather than ship a megabyte.
-        auto vec = renderAt(800);
-        if (vec.size() > 700'000) vec = renderAt(512);
+        // 1000px on JPEG costs about what 512px PNG did.
+        bool jpeg = true;
+        auto vec = renderAt(1000, true);
+        if (vec.empty()) { jpeg = false; vec = renderAt(800, false); }
+        if (vec.size() > 700'000) vec = renderAt(512, jpeg);
         if (vec.empty() || vec.size() > 900'000) return "";
+        m_snapMime = jpeg ? "image/jpeg" : "image/png";
         m_snapCacheB64 = utils::base64::encode(
             std::span<const std::uint8_t>(vec.data(), vec.size()),
             utils::base64::Base64Variant::Normal);
@@ -11076,14 +11583,28 @@ protected:
 
     // Gate + capture in one call. Empty when: vision off, model can't see,
     // or the editor view would MISLEAD (fresh-mode generation still shows
-    // the old level until apply).
+    // the old level until apply). A render_level call short-circuits the
+    // gate — the model explicitly asked to look.
     std::string visionSnapshotIfSupported() {
+        if (!m_pendingRenderB64.empty()) {
+            std::string b64 = std::move(m_pendingRenderB64);
+            m_pendingRenderB64.clear();
+            return b64;
+        }
         if (!Mod::get()->getSettingValue<bool>("enable-vision")) return "";
         if (m_shouldClearLevel && !s_inPreviewMode) return "";
         std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
         if (!toolUse::supportsVision(provider, getProviderModel(provider)))
             return "";
         return captureLevelSnapshotB64();
+    }
+
+    // Attach the current level snapshot (if any) to a message, with the
+    // matching MIME type — the capture may be JPEG or PNG depending on what
+    // the platform's encoder produced.
+    void attachVision(toolUse::Message& msg) {
+        msg.imageB64  = visionSnapshotIfSupported();
+        msg.imageMime = m_snapMime;
     }
 
     void drawPlaytestGhost() {
@@ -11182,6 +11703,7 @@ protected:
                                s_previewObjects.size(), editNote), false);
         if (m_session) {
             m_session->state = GenSession::State::Staged;
+            m_session->flowPhase = "review draft";
             m_session->push(GenSession::Entry::Kind::Status,
                 fmt::format("Staged {} objects{} on preview layer {}",
                             s_previewObjects.size(), editNote, s_previewLayer));
@@ -11354,8 +11876,8 @@ protected:
 
             // ── 2.2 editor flags (any object) ─────────────────────────────────
             // Set-only (true): all members verified against the 2.2074
-            // bindings. passable = player phases through a solid block;
-            // no_touch = hazard loses its hitbox (decorative spikes).
+            // bindings. passable = one-way landing surface;
+            // no_touch = no player interaction (solids and hazards alike).
             {
                 auto setFlag = [&objConst](const char* key, bool& member) {
                     auto r = objConst[key].asBool();
@@ -12173,8 +12695,7 @@ protected:
         if (m_liveConsumed >= m_accumulatedObjects.size()) return;
         if (!revalidateEditor()) return;
 
-        const size_t maxObjects =
-            (size_t)Mod::get()->getSettingValue<int64_t>("max-objects");
+        const size_t maxObjects = EAI_OBJECT_CAP;
 
         // First live batch: enter the preview-layer state exactly like
         // prepareObjects' fresh path would, so Accept/Deny later behaves
@@ -12345,7 +12866,7 @@ protected:
         m_deferredObjects.clear();
         m_currentObjectIndex = 0;
 
-        int    maxObjects  = (int)Mod::get()->getSettingValue<int64_t>("max-objects");
+        int    maxObjects  = (int)EAI_OBJECT_CAP;
         size_t objectCount = std::min(objectsArray.size(), static_cast<size_t>(maxObjects));
         log::info("Preparing {} objects for progressive creation...", objectCount);
 
@@ -12474,6 +12995,13 @@ protected:
                 "MODE: CREATION. Blank canvas. Build a complete playable level matching "
                 "the requested length/difficulty. Use macros liberally.\n\n";
         }
+        modePrefix +=
+            "DEFAULT EFFORT: do the strongest work you can. Unless the user "
+            "explicitly asks for a quick, cheap, minimal, layout-only, or otherwise "
+            "limited result, prefer thorough research, deliberate construction, "
+            "repeated inspection/playtesting, and meaningful refinement. Time is not "
+            "a reason to stop. Do not add busywork: every extra pass must improve the "
+            "level or validate it, and explicit user constraints always win.\n\n";
 
         // Cache the configured ground Y for the prompt.
         // {1}=ground, {2}=ground+30, {3}=ground+60, {4}=ground+90.
@@ -12718,20 +13246,21 @@ protected:
             " ARC-ORBS x y count=N [spacing=60 orb=yellow]\n"
             " COPY from=x0..x1 offset=DX            MIRROR axis=X [from=x0..x1]\n"
             " ROW <catalog_name> x0..x1 [y={1} step=30]  (run-length: a row of ANY object in one line)\n"
+            " REPEAT <count> <any EAS line with $i>  (loop: expand a pattern, e.g. `REPEAT 6 SPIKE $i*30`)\n"
             " DUAL x0..x1 [floor=Y gap=240 block=<variant>]  (entry portal + mirrored corridor + exit portal)\n"
             " TELEPORT x [y=Y y_offset=DY]          (linked teleport pair; DY = vertical jump)\n"
             " OBJ <catalog_name> x y                (escape hatch — any catalog entry)\n\n"
             "TOKEN ECONOMY: y may be omitted when it equals ground ({1}). Prefer "
-            "ROW / FLOOR / SPIKE-TRAIN / COPY / MIRROR over runs of OBJ lines.\n\n"
+            "ROW / FLOOR / SPIKE-TRAIN / COPY / MIRROR / REPEAT over runs of OBJ lines.\n\n"
             "PER-LINE FIELDS (apply to any verb): scale=F rot=N color=N detail=N "
             "groups=1,2,3 flip_x flip_y multi_activate z_layer=N z_order=N editor_layer=N\n"
             " `FLOOR 0..1500 color=10 groups=1` → every block in the floor gets color_channel=10 and group 1.\n"
-            "OBJECT FLAGS (any object): passable (player phases through a solid "
-            "block — fake walls/secret routes), notouch (hazard loses its hitbox "
-            "— decorative spikes), hide (invisible but functional), noglow, "
+            "OBJECT FLAGS (any object): passable (one-way platform: jump through "
+            "from below, land on top), notouch (no player interaction, for "
+            "decorative solids AND hazards), hide (invisible but functional), noglow, "
             "nofade, highdetail, dontenter (skip enter animation), noeffects.\n"
             " `SPIKE 600 notouch scale=1.4` → big spike that can't kill; "
-            "`BLOCK 900 105 passable` → fake wall.\n\n"
+            "`BLOCK 900 105 notouch` → non-interactive scenery.\n\n"
             "TRIGGER VERBS — fire by X position. Place at y=0. Add `multi_activate` for repeating sections:\n"
             " TRIGGER color ch=N hex=RRGGBB at=X [duration=T opacity=A blend]\n"
             " TRIGGER alpha groups=g at=X to=A [duration=T easing=N]\n"
@@ -12764,39 +13293,42 @@ protected:
             "`TRIGGER spawn target=g` chains for logic (give the chained trigger a group).\n"
             "EASING: 0 none, 1 inout, 2 in, 3 out, 4-6 elastic, 7-9 bounce, 10-12 exp, 13-15 sine, 16-18 back.\n\n"
             "COLOR SLOTS: 1000=BG 1001=G1 1002=Line 1003=3DL 1004=Object 1005=Line2 1009=G2. 1-999 = user.\n\n"
-            "RULES: section must start with FLOOR or CORRIDOR. Obstacle every "
-            "90-210u (easy 150-210, medium 90-150, hard 60-90, insane 30-60). "
-            "Mix obstacle types, don't spam SPIKE-TRAIN. End each gamemode at a portal. "
-            "Use macros for 30-60% of objects (FLOOR/CORRIDOR/PLATFORM-RUN do the bones).\n"
-            "DECORATION (what separates rated levels from object soup): set "
-            "META bg/ground + 2-3 custom COLOR channels and shift them with "
-            "TRIGGER color at section boundaries; ground strips/slabs every "
-            "150-300u; large dim background decor (z_layer=-3) every "
-            "400-600u for depth; TRIGGER pulse on the beat; never leave a "
-            "300u stretch bare. Decoration is NOT optional - budget ~30% of "
-            "your objects for it.\n"
-            "LENGTH (X span): short 1200-2400, medium 2400-9000, long 9000-18000, xl 18000+. "
-            "Aim 100-800 objects.\n"
+            "RULES: build surfaces and clearance appropriate to each mode. "
+            "FLOOR/CORRIDOR are optional construction helpers, not mandatory shapes. "
+            "Use macros where repetition is intentional; vary structures by phrase. "
+            "Set up color channels before using them. Follow the design workflow below.\n"
+            "LENGTH: follow the requested duration and supplied targets; X-span only "
+            "estimates duration in forward classic gameplay at the assumed speed. "
+            "Do not pad length with distant decoration.\n"
             "OUTPUT BUDGET: analysis ≤ 2 sentences, no prose between EAS lines, "
             "prefer macros over individual blocks, don't restate already-given facts.\n\n"
-            "EXAMPLE — 30s medium cube→ship drop:\n"
+            "SYNTAX EXAMPLE ONLY — not a verified layout or duration template:\n"
             "## Plan\n"
             "Cube intro 0-3000 easy, ship corridor 3000-7000 hard with color shift.\n"
             "## Level Script\n"
-            "META name=\"Drop\" desc=\"30s\" song_id=467339 bg=1 ground=1\n"
-            "COLOR ch=1000 hex=1a2030 blend   COLOR ch=1001 hex=2a3040\n"
+            "META name=\"Drop\" desc=\"Syntax example\" bg=1 ground=1\n"
+            "COLOR ch=1000 hex=1a2030\n"
+            "COLOR ch=1001 hex=2a3040\n"
             "SECTION 0..3000 difficulty=medium mode=cube\n"
             "FLOOR 0..3000 color=1001\n"
-            "SPIKE-TRAIN 300 count=2   ORB yellow 600 135   STAIR-UP 900 steps=3\n"
-            "SPIKE 1200   ARC-ORBS 1500 165 count=3 spacing=120\n"
-            "SPIKE-TRAIN 2000 count=4 spacing=45   PAD yellow 2500 105   PORTAL ship 2900 165\n"
+            "SPIKE-TRAIN 300 count=2\n"
+            "ORB yellow 600 135\n"
+            "STAIR-UP 900 steps=3\n"
+            "SPIKE 1200\n"
+            "ARC-ORBS 1500 165 count=3 spacing=120\n"
+            "SPIKE-TRAIN 2000 count=4 spacing=45\n"
+            "PAD yellow 2500 105\n"
+            "PORTAL ship 2900 165\n"
             "SECTION 3000..7000 difficulty=hard mode=ship\n"
             "TRIGGER color ch=1000 hex=2a1030 at=3000 duration=0.4 blend\n"
             "CORRIDOR 3000..7000 ceiling=270 floor=60 color=1001\n"
-            "SAW small 3300 180   PORTAL speed-double 3600 0\n"
-            "SAW medium 4200 165   SAW large 4800 195\n"
+            "SAW small 3300 180\n"
+            "PORTAL speed-double 3600 165\n"
+            "SAW medium 4200 165\n"
+            "SAW large 4800 195\n"
             "TRIGGER move groups=5 at=5000 dx=-300 dy=0 duration=2.0 easing=1\n"
-            "BLOCK 5400 180 groups=5   TRIGGER end at=7000\n\n"
+            "BLOCK 5400 180 groups=5\n"
+            "TRIGGER end at=7000\n\n"
             "CATALOG — essentials only (curated core). For ANY object beyond "
             "this list, call the search_objects tool (when tools are on) or use "
             "OBJ <name>; the full library is 3,986 objects:\n {0}",
@@ -12957,11 +13489,7 @@ protected:
                     "they give one.\n";
         }
 
-        // Append the GD Creator School design tips digest. This is a tiny
-        // appendix (~700 bytes) that gives small fine-tunes a stronger prior on
-        // pacing, difficulty curves, decoration, and common mistakes — things
-        // the model can't easily infer from the object catalog alone.
-        return base + std::string(editorai::GDCS_DESIGN_TIPS);
+        return base + std::string(editorai::LEVEL_DESIGN_GUIDANCE);
     }
 
     // ── API call ──────────────────────────────────────────────────────────────
@@ -13009,8 +13537,8 @@ protected:
     // ── Reference-level cache ───────────────────────────────────────────────
     // Summaries are small (≤ ~4 KB) and immutable for a given level ID, so
     // they cache hard: in-memory for the session, mirrored to
-    // level_cache.json so pinned example-level-ids stop re-downloading from
-    // boomlings.com on every single generation.
+    // level_cache.json so a level the model keeps consulting is downloaded
+    // from boomlings.com at most once.
     static std::unordered_map<std::string, std::string>& levelSummaryCache() {
         static std::unordered_map<std::string, std::string> cache = [] {
             std::unordered_map<std::string, std::string> c;
@@ -13249,10 +13777,10 @@ protected:
     // ── Tool 2: search Newgrounds for a song (or fetch by ID directly) ─────
     // Accepts either a numeric ID or a free-text query. For queries we hit
     // the public search URL and pull the first song result.
-    // Newgrounds via DuckDuckGo: when NG itself is unreachable (Cloudflare
-    // 403, cert failure under proton), search the public index for
-    // site:newgrounds.com/audio/listen links instead. Returns "id - title"
-    // pairs the model can pick from; reuses the proven lite-endpoint shape.
+    // Search-index fallback: when NG itself is unreachable (Cloudflare 403,
+    // cert failure under Proton), search a public index for
+    // site:newgrounds.com/audio/listen links instead. Brave is the primary
+    // index here; DuckDuckGo Lite remains parser-compatible if it is used.
     void fireFetchNGViaDDG(const std::string& query,
                            std::function<void(const std::string&)> onDone)
     {
@@ -13260,7 +13788,7 @@ protected:
         request.userAgent("Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0");
         request.timeout(std::chrono::seconds(15));
         std::string url = fmt::format(
-            "https://lite.duckduckgo.com/lite/?q={}",
+            "https://search.brave.com/search?q={}",
             urlFormEncode("site:newgrounds.com/audio/listen " + query));
         m_toolListenerNG.spawn(
             request.get(url),
@@ -13274,13 +13802,31 @@ protected:
                     return;
                 }
                 std::string body = resp.string().unwrapOr("");
-                // Result anchors: href=".../audio/listen/<id>" ... >TITLE<
+                // Brave puts the direct Newgrounds URL and its title in one
+                // result block. [\s\S] makes this survive line wrapping.
+                static const std::regex braveRx(
+                    R"ng(href="https://www\.newgrounds\.com/audio/listen/(\d+)"[\s\S]*?class="[^"]*search-snippet-title[^"]*"[^>]*>([^<]{2,120})<)ng",
+                    std::regex::ECMAScript | std::regex::optimize);
+                // DuckDuckGo Lite puts the encoded Newgrounds URL and the
+                // human-readable result title in the same result anchor.
                 static const std::regex rowRx(
-                    R"(audio/listen/(\d+)[^>]*>([^<]{2,80})<)",
+                    R"(uddg=https?%3A%2F%2Fwww\.newgrounds\.com%2Faudio%2Flisten%2F(\d+)[^"]*"[^>]*class=['"]result-link['"][^>]*>([^<]{2,120})<)",
+                    std::regex::ECMAScript | std::regex::optimize);
+                static const std::regex plainRx(
+                    R"(href=['"][^'"]*newgrounds\.com/audio/listen/(\d+)[^'"]*['"][^>]*>([^<]{2,120})<)",
                     std::regex::ECMAScript | std::regex::optimize);
                 std::string out;
                 int found = 0;
                 std::unordered_set<std::string> seen;
+                for (auto it = std::sregex_iterator(body.begin(), body.end(), braveRx);
+                     it != std::sregex_iterator() && found < 5; ++it) {
+                    std::string id = (*it)[1].str();
+                    std::string title = stripHtmlBasic((*it)[2].str());
+                    if (title.empty() || !seen.insert(id).second) continue;
+                    if (found) out += "\n";
+                    out += fmt::format("  song_id={} - {}", id, title);
+                    ++found;
+                }
                 for (auto it = std::sregex_iterator(body.begin(), body.end(), rowRx);
                      it != std::sregex_iterator() && found < 5; ++it) {
                     std::string id = (*it)[1].str();
@@ -13291,18 +13837,273 @@ protected:
                     ++found;
                 }
                 if (!found) {
+                    for (auto it = std::sregex_iterator(body.begin(), body.end(), plainRx);
+                         it != std::sregex_iterator() && found < 5; ++it) {
+                        std::string id = (*it)[1].str();
+                        std::string title = stripHtmlBasic((*it)[2].str());
+                        if (title.empty() || !seen.insert(id).second) continue;
+                        if (found) out += "\n";
+                        out += fmt::format("  song_id={} - {}", id, title);
+                        ++found;
+                    }
+                }
+                if (!found) {
                     onDone(fmt::format(
                         "(no Newgrounds songs found for \"{}\" via the search "
                         "index - try ONE different phrasing, or continue "
                         "without a song.)", query));
                     return;
                 }
-                log::info("NG-via-DDG: {} result(s) for '{}'", found, query);
+                log::info("NG-via-search-index: {} result(s) for '{}'", found, query);
                 onDone(fmt::format(
                     "Newgrounds songs matching \"{}\" (via search index):\n{}\n"
                     "Set level_metadata.song_id to your pick.", query, out));
             }
         );
+    }
+
+    // ── Tool: search GD's online levels by title ───────────────────────────
+    // getGJLevels21 with type=0 (search) — the same endpoint the in-game
+    // search box uses. Returns a compact list the model can pick an ID from.
+    // Cached per (query|creator|featured) for the session: the model often
+    // re-searches the same name across rounds.
+    static std::unordered_map<std::string, std::string>& levelSearchCache() {
+        static std::unordered_map<std::string, std::string> c;
+        return c;
+    }
+
+    // HTTPS fallback for environments where boomlings.com is blocked or its
+    // DNS fails (observed under Proton). GDBrowser returns already-decoded JSON
+    // and mirrors the public GD search results; the primary endpoint remains
+    // RobTop's server whenever it is reachable.
+    void fireSearchLevelsFallback(const std::string& query,
+                                  const std::string& creator,
+                                  bool featuredOnly,
+                                  const std::string& cacheKey,
+                                  std::function<void(const std::string&)> onDone)
+    {
+        std::string encoded = urlFormEncode(query);
+        // application/x-www-form-urlencoded uses '+', but this value is a URL
+        // PATH segment where GDBrowser treats '+' literally.
+        for (size_t p = 0; (p = encoded.find('+', p)) != std::string::npos; p += 3)
+            encoded.replace(p, 1, "%20");
+        auto req = web::WebRequest();
+        req.userAgent("EditorAI-geode-mod");
+        req.timeout(std::chrono::seconds(20));
+        m_toolListenerLevel.spawn(
+            req.get(fmt::format("https://gdbrowser.com/api/search/{}?count=10", encoded)),
+            [query, creator, featuredOnly, cacheKey,
+             onDone = std::move(onDone)](web::WebResponse resp) mutable {
+                if (!resp.ok()) {
+                    onDone(fmt::format("(level search failed on both GD and the "
+                        "HTTPS fallback: HTTP {})", resp.code()));
+                    return;
+                }
+                auto jr = resp.json();
+                if (!jr || !jr.unwrap().isArray()) {
+                    onDone("(level-search fallback returned invalid JSON)");
+                    return;
+                }
+                const auto arr = jr.unwrap();
+                std::string creatorLow = creator;
+                for (auto& c : creatorLow) c = (char)std::tolower((unsigned char)c);
+                std::string out = fmt::format("GD level search \"{}\" (HTTPS fallback):\n", query);
+                int shown = 0;
+                for (size_t i = 0; i < arr.size() && shown < 6; ++i) {
+                    const auto e = arr[i];
+                    if (!e.isObject()) continue;
+                    std::string name = e["name"].asString().unwrapOr("");
+                    std::string id = e["id"].asString().unwrapOr("");
+                    std::string author = e["author"].asString().unwrapOr("?");
+                    std::string difficulty = e["difficulty"].asString().unwrapOr("Unrated");
+                    if (id.empty() || name.empty()) continue;
+                    std::string authorLow = author;
+                    for (auto& c : authorLow) c = (char)std::tolower((unsigned char)c);
+                    if (!creatorLow.empty() && authorLow.find(creatorLow) == std::string::npos)
+                        continue;
+                    int stars = (int)e["stars"].asInt().unwrapOr(0);
+                    if (featuredOnly && stars <= 0) continue;
+                    int downloads = (int)e["downloads"].asInt().unwrapOr(0);
+                    int likes = (int)e["likes"].asInt().unwrapOr(0);
+                    std::string length = e["length"].asString().unwrapOr("?");
+                    out += fmt::format("  id={} \"{}\" by {} | {} | {} | {} downloads, {} likes\n",
+                                       id, name, author, difficulty, length, downloads, likes);
+                    ++shown;
+                }
+                if (!shown) out += "  (no matches)\n";
+                else out += "Call download_level with one of these ids to study it.\n";
+                if (levelSearchCache().size() < 40) levelSearchCache()[cacheKey] = out;
+                log::info("search_levels fallback: {} match(es)", shown);
+                onDone(std::move(out));
+            });
+    }
+
+    void fireSearchLevels(const std::string& query, const std::string& creator,
+                          bool featuredOnly,
+                          std::function<void(const std::string&)> onDone)
+    {
+        std::string q = trimKey(query);
+        if (q.empty()) { onDone("(empty query)"); return; }
+
+        std::string cacheKey = fmt::format("{}|{}|{}", q, creator, featuredOnly);
+        if (auto it = levelSearchCache().find(cacheKey);
+            it != levelSearchCache().end()) {
+            onDone(it->second);
+            return;
+        }
+
+        showStatus(fmt::format("Searching GD levels: \"{}\"...", q));
+        log::info("search_levels: '{}' (creator='{}', featured={})",
+                  q, creator, featuredOnly);
+
+        auto request = web::WebRequest();
+        request.userAgent("");
+        request.header("Content-Type", "application/x-www-form-urlencoded");
+        // type=0 → search by string. star=1 restricts to rated levels, which
+        // is the closest thing to "good quality" the endpoint offers.
+        std::string body = fmt::format(
+            "str={}&type=0&page=0&secret=Wmfd2893gb0&gameVersion=22"
+            "&binaryVersion=42&total=0{}",
+            urlFormEncode(q), featuredOnly ? "&star=1" : "");
+        request.bodyString(body);
+        request.timeout(std::chrono::seconds(20));
+
+        m_toolListenerLevel.spawn(
+            request.post("https://www.boomlings.com/database/getGJLevels21.php"),
+            [this, q, creator, featuredOnly, cacheKey, onDone = std::move(onDone)]
+            (web::WebResponse resp) mutable {
+                if (!resp.ok()) {
+                    log::warn("search_levels HTTP {}", resp.code());
+                    this->fireSearchLevelsFallback(q, creator, featuredOnly,
+                                                   cacheKey, std::move(onDone));
+                    return;
+                }
+                std::string raw = resp.string().unwrapOr("");
+                if (raw.empty() || raw == "-1") {
+                    this->fireSearchLevelsFallback(q, creator, featuredOnly,
+                                                   cacheKey, std::move(onDone));
+                    return;
+                }
+                onDone(this->formatLevelSearch(raw, q, creator, cacheKey));
+            }
+        );
+    }
+
+    // getGJLevels21 response: "<levels>#<creators>#<songs>#<page info>".
+    // Levels are '|'-separated colon-KV records; creators are
+    // "id:name:accountID" triples in the second block.
+    std::string formatLevelSearch(const std::string& raw, const std::string& query,
+                                  const std::string& creatorFilter,
+                                  const std::string& cacheKey)
+    {
+        // Split the top-level sections.
+        std::vector<std::string> sections;
+        size_t pos = 0;
+        while (pos <= raw.size()) {
+            size_t h = raw.find('#', pos);
+            sections.push_back(raw.substr(pos, h == std::string::npos
+                                              ? std::string::npos : h - pos));
+            if (h == std::string::npos) break;
+            pos = h + 1;
+        }
+        if (sections.empty()) return "(unparseable level search response)";
+
+        // Creator names by userID (block 1).
+        std::unordered_map<std::string, std::string> creatorNames;
+        if (sections.size() > 1) {
+            size_t p = 0;
+            const std::string& blk = sections[1];
+            while (p < blk.size()) {
+                size_t bar = blk.find('|', p);
+                std::string rec = blk.substr(p, bar == std::string::npos
+                                                 ? std::string::npos : bar - p);
+                // id:name:accountID
+                size_t c1 = rec.find(':');
+                if (c1 != std::string::npos) {
+                    size_t c2 = rec.find(':', c1 + 1);
+                    creatorNames[rec.substr(0, c1)] =
+                        rec.substr(c1 + 1, c2 == std::string::npos
+                                            ? std::string::npos : c2 - c1 - 1);
+                }
+                if (bar == std::string::npos) break;
+                p = bar + 1;
+            }
+        }
+
+        auto lowerOf = [](std::string s) {
+            for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+            return s;
+        };
+        std::string creatorWant = lowerOf(creatorFilter);
+
+        static const char* LEN_NAMES[] = {"Tiny", "Short", "Medium", "Long", "XL", "Plat"};
+        auto diffName = [](int stars, int demonType, bool isDemon, bool isAuto) {
+            if (isAuto) return std::string("Auto");
+            if (isDemon) {
+                switch (demonType) {
+                    case 3:  return std::string("Easy Demon");
+                    case 4:  return std::string("Medium Demon");
+                    case 5:  return std::string("Insane Demon");
+                    case 6:  return std::string("Extreme Demon");
+                    default: return std::string("Hard Demon");
+                }
+            }
+            switch (stars) {
+                case 1:  return std::string("Auto");
+                case 2:  return std::string("Easy");
+                case 3:  return std::string("Normal");
+                case 4: case 5: return std::string("Hard");
+                case 6: case 7: return std::string("Harder");
+                case 8: case 9: return std::string("Insane");
+                case 10: return std::string("Demon");
+                default: return std::string("Unrated");
+            }
+        };
+
+        std::string out = fmt::format("GD level search \"{}\":\n", query);
+        int shown = 0;
+        size_t p = 0;
+        const std::string& lv = sections[0];
+        while (p < lv.size() && shown < 6) {
+            size_t bar = lv.find('|', p);
+            std::string_view rec(lv.data() + p,
+                (bar == std::string::npos ? lv.size() : bar) - p);
+            p = (bar == std::string::npos) ? lv.size() : bar + 1;
+            auto kv = parseColonKV(rec);
+            auto get = [&](const char* k) -> std::string {
+                auto it = kv.find(k);
+                return it == kv.end() ? std::string() : it->second;
+            };
+            auto getInt = [&](const char* k) -> int {
+                auto s = get(k);
+                if (s.empty()) return 0;
+                auto n = geode::utils::numFromString<int>(s);
+                return n ? n.unwrap() : 0;
+            };
+            std::string id   = get("1");
+            std::string name = get("2");
+            if (id.empty() || name.empty()) continue;
+            std::string author = creatorNames.count(get("6"))
+                ? creatorNames[get("6")] : std::string("?");
+            if (!creatorWant.empty() &&
+                lowerOf(author).find(creatorWant) == std::string::npos)
+                continue;
+            int lenIdx = std::clamp(getInt("15"), 0, 5);
+            out += fmt::format(
+                "  id={} \"{}\" by {} | {} | {} | {} downloads, {} likes\n",
+                id, name, author,
+                diffName(getInt("18"), getInt("43"),
+                         getInt("17") != 0, getInt("25") != 0),
+                LEN_NAMES[lenIdx], getInt("10"), getInt("14"));
+            ++shown;
+        }
+        if (shown == 0)
+            out += "  (no matches)\n";
+        else
+            out += "Call download_level with one of these ids to study it.\n";
+        if (levelSearchCache().size() < 40) levelSearchCache()[cacheKey] = out;
+        log::info("search_levels: {} match(es)", shown);
+        return out;
     }
 
     void fireFetchNGSong(const std::string& input,
@@ -13364,12 +14165,9 @@ protected:
                         R"(/audio/listen/(\d+))", std::regex::optimize | std::regex::ECMAScript);
                     std::smatch m;
                     if (!std::regex_search(body, m, idRx)) {
-                        Notification::create(
-                            fmt::format("No NG results for \"{}\"", trimmed),
-                            NotificationIcon::Warning)->show();
-                        onDone(fmt::format(
-                            "(no Newgrounds results for \"{}\" — try a different "
-                            "query once, or continue without a song.)", trimmed));
+                        log::warn("NG search returned HTML but no song links - "
+                                  "falling back to DDG site-search");
+                        this->fireFetchNGViaDDG(trimmed, std::move(onDone));
                         return;
                     }
                     auto songIdRes = geode::utils::numFromString<int>(m[1].str());
@@ -13626,30 +14424,33 @@ protected:
     std::vector<toolUse::Message> m_toolHistory;
     int                           m_toolIterations  = 0;
     // Tool use is UNBOUNDED by design — the AI runs as many rounds, and as
-    // many calls to any one tool, as it wants. Runaway loops are prevented
-    // structurally, NOT by a per-tool count:
-    //   - an exact-duplicate-call guard (same name+args) → reuse the prior result
-    //   - a very high anti-runaway backstop that finalizes GRACEFULLY (never errors)
-    bool                          m_forceFinalize     = false;  // backstop tripped: next round must finalize
-    int                           m_forceFinalizeTries = 0;     // bounds the forced-finalize retries
+    // many calls to any one tool, as it wants. Identical discovery calls reuse
+    // their earlier result; state-reading/playtest calls always run afresh.
     std::unordered_map<std::string, int> m_toolCallSigCounts;   // (name|args) → count, duplicate guard
     std::string                   m_toolProvider;
     std::string                   m_toolModel;
     std::string                   m_toolApiKey;
+    // Immutable system-prompt portion for this engine. Every turn rebuilds
+    // the dynamic context envelope from this base in one assignment, so stale
+    // state/summary blocks can never accumulate or erase one another.
+    std::string                   m_contextBaseSystem;
 
     // Length enforcement: accumulate objects across "extension" rounds so the
     // mod can refuse to apply until the level is long enough. Each time
     // processFinalResponse parses a response with insufficient length, it
     // appends the parsed objects to m_accumulatedObjects and injects an
     // "extend further" user message into m_toolHistory, then runs another
-    // tool round. After m_maxExtensionRounds we give up and apply whatever
-    // we've got (so the AI can't pin the user forever).
+    // tool round. This is cancel-driven rather than time/round limited.
     matjson::Value m_accumulatedObjects = matjson::Value::array();
     LengthTarget   m_lengthTarget       = {"Medium", 30.f, 60.f};
     int            m_extensionRounds    = 0;
-    int            m_maxExtensionRounds = 4;
     int            m_passabilityFixRounds = 0;     // bounded by MAX_PASSABILITY_FIXES in processFinalResponse
-    int            m_refinementRounds     = 0;     // bounded by setting "refinement-rounds" (0 disables)
+    int            m_refinementRounds     = 0;     // fixed count, or AI-ended when until-done is on
+    // Until-done refinement: the AI decides when the level is finished by
+    // answering "LEVEL COMPLETE". It may take as many passes as it finds
+    // useful; Cancel is the user-owned escape hatch.
+    bool           m_refineDeclaredDone   = false;
+    int            m_aiPlaytestPasses     = 0;     // deliberately unbounded; user can cancel
     bool           m_critiqueDone         = false; // self-critique fired this generation
     bool           m_critiquePending      = false; // next response is the critique reply
     bool           m_decorationPassDone   = false; // two-pass decoration fired
@@ -13667,13 +14468,13 @@ protected:
     // ── Goal / task agenda (set_goal tool family) ────────────────────────
     // While m_goalActive, processFinalResponse keeps looping the model with
     // a "continue working" message after every answer (all other gates
-    // permitting) until goal_done is called or MAX_GOAL_ROUNDS trips.
+    // permitting) until goal_done is called. The user can cancel at any time;
+    // there is deliberately no arbitrary pass cap.
     struct GoalTask { std::string text; bool done = false; };
     std::string           m_goalText;
     std::vector<GoalTask> m_goalTasks;
     bool                  m_goalActive = false;
     int                   m_goalRounds = 0;
-    static constexpr int  MAX_GOAL_ROUNDS = 25;
 
     // ── Live placement ────────────────────────────────────────────────────
     // With the "live-placement" setting on, every accepted tool-loop round
@@ -13689,6 +14490,386 @@ protected:
     float  m_liveShift      = 0.f;    // Y shift captured on first live batch
     bool   m_liveShiftValid = false;
     matjson::Value m_liveSkippedOps = matjson::Value::array();  // ops deferred to final
+    // A real live-build protocol, not merely progressive spawning. On a safe
+    // empty/additive editor state the first model reply is a small playable
+    // scaffold; later replies are additive visible diffs. The model ends the
+    // phase with BUILD COMPLETE, after which the ordinary length, playability,
+    // refinement, decoration and critique gates still run.
+    bool   m_liveBuildProtocol     = false;
+    bool   m_liveBuildDeclaredDone = false;
+    int    m_liveBuildPasses       = 0;
+
+    // ── Live streaming ────────────────────────────────────────────────────
+    // When enabled (and the provider/platform can), a round's response is
+    // decoded token-by-token off a worker thread. m_streamSink is the mailbox;
+    // pollStream() (a 20 Hz scheduled tick) drains it on the main thread into
+    // the session's live bubble, and finalizes the round when the transfer
+    // completes. m_streamIsToolRound routes the finished result back to the
+    // right handler.
+    eaistream::SinkPtr m_streamSink;
+    bool               m_streamIsToolRound = false;
+    std::string        m_streamProvider;
+    bool              m_streamTicking     = false;
+
+    // Streaming is opportunistic, and on some setups the transport simply does
+    // not work: the mod borrows the GAME's libcurl, which is built against
+    // schannel (Windows' own TLS). Under Wine/Proton that is unreliable, so a
+    // plain-HTTP endpoint streams happily while an HTTPS one can accept the
+    // request, generate server-side, and never deliver a byte back.
+    //
+    // Rather than hang, a stream that produces NOTHING within
+    // STREAM_FIRST_BYTE_SECONDS is abandoned, the round is re-issued on the
+    // normal buffered path, and streaming is switched off for the rest of the
+    // endpoint. A slow or incompatible custom endpoint must never disable live
+    // output for a different provider later in the same game session.
+    static inline std::unordered_set<std::string> s_streamBrokenEndpoints;
+    static constexpr int STREAM_FIRST_BYTE_SECONDS = 45;
+    std::string m_streamUrl;
+
+    // ── Scheduling for headless engines ───────────────────────────────────
+    // CCNode::schedule() registers a selector PAUSED when the node isn't in
+    // the scene: it forwards `!m_bRunning` as curl's `bPaused`. The overlay's
+    // generation path NEVER shows this popup (editoraiStartGeneration builds a
+    // headless engine), so anything scheduled the normal way silently never
+    // ticks there. These two helpers register straight on the scheduler with
+    // bPaused=false, so a tick runs whether the popup is on screen or not.
+    // (The scheduler retains its target, so the engine can't die mid-tick.)
+    void scheduleAlways(cocos2d::SEL_SCHEDULE sel, float interval) {
+        if (auto* sch = this->getScheduler())
+            sch->scheduleSelector(sel, this, interval, false);
+    }
+    void unscheduleAlways(cocos2d::SEL_SCHEDULE sel) {
+        if (auto* sch = this->getScheduler())
+            sch->unscheduleSelector(sel, this);
+    }
+
+    void scheduleStreamPoll() {
+        if (m_streamTicking) return;
+        scheduleAlways(schedule_selector(AIGeneratorPopup::pollStream), 0.05f);
+        m_streamTicking = true;
+    }
+    void unscheduleStreamPoll() {
+        if (!m_streamTicking) return;
+        unscheduleAlways(schedule_selector(AIGeneratorPopup::pollStream));
+        m_streamTicking = false;
+    }
+
+    // Only ONE stream may be open per popup; a second start cancels the first.
+    void cancelStream() {
+        if (m_streamSink) {
+            m_streamSink->cancel();
+            m_streamSink.reset();
+        }
+        if (m_session && m_session->streamActive) {
+            m_session->streamEnd();
+        }
+        unscheduleStreamPoll();
+    }
+
+    // True when this turn should be streamed. Manual has no network; the
+    // buffered path stays the fallback whenever anything is unavailable.
+    bool streamingWanted(const std::string& provider, const std::string& url) const {
+        if (!Mod::get()->getSettingValue<bool>("stream-responses")) return false;
+        if (s_streamBrokenEndpoints.count(provider + "|" + url)) return false;
+        if (!eaistream::available()) return false;
+        if (!eaistream::supportsStreaming(provider)) return false;
+        if (provider == "manual") return false;
+        // Platinum IS streamable: its coordinator answers /api/generate with a
+        // chunked NDJSON long-poll (keepalive lines while the request is queued,
+        // then result lines), which is exactly what the Ollama decoder reads. An
+        // earlier revision excluded it on the theory that only one final object
+        // ever arrives — that was wrong twice over: it silently disabled
+        // streaming for the mod's most-used provider, and it also killed the
+        // liveness feedback that a queued Platinum request needs most.
+        return true;
+    }
+
+    // Fire a streaming POST. Returns false when streaming couldn't start (the
+    // caller then does its normal buffered request).
+    bool startStream(const std::string& provider, const std::string& apiKey,
+                     const std::string& url, matjson::Value body,
+                     bool isToolRound)
+    {
+        // The final stream URL is the identity of a capability failure. Gemini
+        // changes its RPC method for SSE, so keying the check on the buffered
+        // URL here but recording the streamed URL on failure would never match.
+        std::string streamUrl = eaistream::streamUrlFor(provider, url);
+        if (!streamingWanted(provider, streamUrl)) return false;
+        // Ask the provider to stream. Ollama's native API uses the same key;
+        // Gemini switches endpoint instead (streamUrlFor).
+        if (provider == "gemini") {
+            body.erase("stream");
+        } else {
+            // Ollama's /api/chat defaults to streaming and the OpenAI-compat
+            // builder explicitly turns it off — flip it back on here. (No
+            // stream_options/include_usage: we don't use the usage numbers, and
+            // strict servers 400 on parameters they don't recognize.)
+            body["stream"] = true;
+        }
+        std::string bodyStr = body.dump();
+        auto headers = providerAuthHeaderLines(provider, apiKey);
+        logApiRequest(provider, getProviderModel(provider), streamUrl, bodyStr);
+        log::info("Streaming POST {} ({} bytes, stall timeout {}s)",
+                  streamUrl, bodyStr.size(), providerTimeout(provider).count());
+
+        cancelStream();
+        m_streamSink = eaistream::post(provider, streamUrl, headers,
+                                       std::move(bodyStr),
+                                       (int)providerTimeout(provider).count());
+        if (!m_streamSink) return false;
+        m_streamIsToolRound = isToolRound;
+        m_streamProvider    = provider;
+        m_streamUrl         = streamUrl;
+        m_streamStartedAt   = std::chrono::steady_clock::now();
+        if (m_session) {
+            m_session->streamBegin();   // display-only; never persisted
+        }
+        scheduleStreamPoll();
+        log::info("Streaming round started ({} -> {})", provider, streamUrl);
+        return true;
+    }
+
+    std::chrono::steady_clock::time_point m_streamStartedAt;
+
+    // 20 Hz: move decoded text from the worker into the session, and finish
+    // the round when the transfer ends.
+    void pollStream(float) {
+        if (!m_streamSink) { unscheduleStreamPoll(); return; }
+        // Cancelled generation: drop the transfer and stop ticking.
+        if (!m_isGenerating) { cancelStream(); return; }
+
+        auto sink = m_streamSink;
+        if (m_session) {
+            std::string t, th;
+            if (sink->drain(t, th)) {
+                m_session->streamText     += t;
+                m_session->streamThinking += th;
+                // Bound the live buffers — a runaway model must not grow them
+                // without limit (the finished text is capped elsewhere).
+                if (m_session->streamText.size() > 200000)
+                    GenSession::utf8Trim(m_session->streamText, 200000);
+                if (m_session->streamThinking.size() > 60000)
+                    GenSession::utf8Trim(m_session->streamThinking, 60000);
+            }
+            // Liveness line: a queued Platinum request (or any slow model)
+            // sends keepalives that decode to NOTHING, so without this the UI
+            // looks frozen for minutes. Cheap: one small string per tick, and
+            // deliberately NOT a transcript entry.
+            int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - m_streamStartedAt).count();
+            size_t bytes = sink->bytes();
+            if (!m_session->streamText.empty() ||
+                !m_session->streamThinking.empty()) {
+                m_session->liveStatus = fmt::format("streaming {}s", secs);
+            } else if (bytes > 0) {
+                m_session->liveStatus = fmt::format("waiting {}s · {} B", secs, bytes);
+            } else {
+                m_session->liveStatus = fmt::format("connecting {}s", secs);
+            }
+        }
+
+        eaistream::Result res;
+        if (!sink->finished(res)) {
+            // First-byte watchdog. A stream that has delivered literally
+            // nothing this long isn't slow, it's broken (see s_streamBroken) —
+            // abandon it and redo the round buffered rather than sit here.
+            int waited = (int)std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - m_streamStartedAt).count();
+            if (sink->bytes() == 0 && waited >= STREAM_FIRST_BYTE_SECONDS)
+                this->abandonStreaming(waited);
+            return;
+        }
+
+        // Transfer over: tear down the tick before dispatching (the handlers
+        // may start the next round, which schedules its own).
+        m_streamSink.reset();
+        unscheduleStreamPoll();
+        std::string provider = m_streamProvider;
+        bool wasToolRound    = m_streamIsToolRound;
+        // Fold the live bubble into the transcript proper.
+        if (m_session) {
+            m_session->streamEnd();
+        }
+        finishStream(std::move(res), provider, wasToolRound);
+    }
+
+    // Is a partial streamed reply worth building from? Used when a stream ends
+    // in an error after the model had already produced most of its answer
+    // (Platinum's queue deadline fires mid-stream). Requires real level content
+    // — a couple of sentences of prose is not a level, and building nothing
+    // while claiming success would be worse than the error.
+    bool looksSalvageable(const std::string& text) const {
+        if (text.size() < 400) return false;
+        if (text.find("## Level Script") != std::string::npos) return true;
+        if (eas::looksLikeEAS(eas::extractScript(text)))        return true;
+        // JSON path: an objects array that actually opened.
+        if (text.find("\"objects\"") != std::string::npos &&
+            text.find('[') != std::string::npos) return true;
+        return false;
+    }
+
+    // The stream produced no bytes at all: give up on streaming for good and
+    // re-run this round through the ordinary buffered request path, so the
+    // generation completes normally instead of hanging.
+    void abandonStreaming(int waitedSeconds) {
+        log::warn("Stream delivered no bytes in {}s ({} -> {}) — falling back "
+                  "for this endpoint only",
+                  waitedSeconds, m_streamProvider, m_streamUrl);
+        s_streamBrokenEndpoints.insert(m_streamProvider + "|" + m_streamUrl);
+        bool wasToolRound = m_streamIsToolRound;
+        if (m_streamSink) { m_streamSink->cancel(); m_streamSink.reset(); }
+        unscheduleStreamPoll();
+        if (m_session) m_session->streamEnd();
+        pushSession(GenSession::Entry::Kind::Status,
+            "Live streaming timed out for this provider - switching this request "
+            "to the normal path; other providers can still stream");
+        if (!m_isGenerating) return;
+        if (wasToolRound) {
+            --m_toolIterations;   // the redo isn't a new round
+            this->doToolRound();
+        } else {
+            this->callAPI(m_lastCallPrompt, m_lastCallKey);
+        }
+    }
+
+    // Turn a completed stream into the same shapes the buffered paths produce.
+    void finishStream(eaistream::Result res, const std::string& provider,
+                      bool wasToolRound)
+    {
+        if (!m_isGenerating) return;
+        logApiResponse((int)res.httpCode, res.rawBody);
+        log::info("Stream finished: HTTP {}, {} chars text, {} chars thinking, "
+                  "{} tool call(s), transportOk={}{}",
+                  res.httpCode, res.text.size(), res.thinking.size(),
+                  res.toolCalls.size(), res.transportOk,
+                  res.transportError.empty()
+                      ? std::string()
+                      : fmt::format(", transport error: {}", res.transportError));
+
+        // A transport that died mid-stream (connection cut, stall timeout) but
+        // already delivered a usable level: build it rather than lose it. Same
+        // reasoning as the provider-error salvage below.
+        if (!res.transportOk && res.httpCode < 400 && !wasToolRound &&
+            res.transportError != "cancelled" && looksSalvageable(res.text)) {
+            log::warn("Stream transport failed ({}) but {} chars had arrived — "
+                      "building from that", res.transportError, res.text.size());
+            pushSession(GenSession::Entry::Kind::Status,
+                fmt::format("Connection dropped - building from the {} "
+                            "characters that arrived", res.text.size()));
+            resetGenerationUI();
+            this->processFinalResponse(std::move(res.text), provider);
+            return;
+        }
+
+        // HTTP-level failure: the body is an error JSON, not a stream.
+        if (res.httpCode >= 400 || (!res.transportOk && res.text.empty())) {
+            int code = (int)res.httpCode;
+            if (res.transportError == "cancelled") return;
+            if (wasToolRound) {
+                if (this->retryToolRoundIfTransient(code)) return;
+            } else if (this->retrySingleShotIfTransient(code, "")) {
+                return;
+            }
+            if (code > 0) {
+                auto [title, msg] = parseAPIError(
+                    res.rawBody.empty() ? "No body" : res.rawBody, code);                onError(title, msg);
+            } else {
+                onError("Connection Failed",
+                    fmt::format("The streamed request never completed: {}. "
+                                "Check your connection (or the local server) "
+                                "and try again. ({})",
+                                res.transportError.empty()
+                                    ? std::string("no response")
+                                    : res.transportError,
+                                autoErrorCode(10, 1)));
+            }
+            return;
+        }
+        // A provider error INSIDE the stream (Ollama / Platinum report queue
+        // timeouts and "no workers available" this way, with HTTP 200).
+        if (!res.providerError.empty()) {
+            // Salvage first. A streamed round that dies late (Platinum's 300s
+            // queue deadline fires even mid-stream) has usually already
+            // delivered most of the level — throwing that away and showing an
+            // error is the worst of both worlds. If enough text arrived to be
+            // worth building, use it and just note what happened.
+            if (!wasToolRound && looksSalvageable(res.text)) {
+                log::warn("Stream ended with a provider error but {} chars had "
+                          "already streamed — building from that instead: {}",
+                          res.text.size(), res.providerError);
+                pushSession(GenSession::Entry::Kind::Status,
+                    fmt::format("Provider cut off ({}) - building from the {} "
+                                "characters that did arrive",
+                                res.providerError, res.text.size()));
+                resetGenerationUI();
+                this->processFinalResponse(std::move(res.text), provider);
+                return;
+            }
+            if (wasToolRound) {
+                if (isTransientProviderError(res.providerError) &&
+                    this->retryToolRoundIfTransient(503)) return;
+            } else if (this->retrySingleShotIfTransient(
+                           (int)res.httpCode, res.providerError)) {
+                return;
+            }
+            bool platinum = provider == "ollama" &&
+                Mod::get()->getSettingValue<bool>("use-platinum");
+            onError(platinum ? "Platinum Error" : "Provider Error",
+                platinum
+                    ? fmt::format("{} — Platinum runs on volunteer machines, so a "
+                        "busy queue or a slow upstream shows up as this. Try "
+                        "again, ask for a shorter level, or switch to a direct "
+                        "provider with your own key in settings. ({})",
+                        res.providerError, autoErrorCode(60, 53))
+                    : fmt::format("{} ({})", res.providerError,
+                                  autoErrorCode(60, 53)));
+            return;
+        }
+
+        m_transientRetries = 0;
+
+        // Reasoning goes to the transcript as a thinking entry, exactly like
+        // the buffered path — the live bubble was display-only.
+        if (!res.thinking.empty())
+            pushSession(GenSession::Entry::Kind::Thinking, res.thinking);
+
+        if (!wasToolRound) {
+            if (res.text.empty()) {
+                onError("Invalid Response",
+                    fmt::format("The provider streamed an empty reply. Try again, "
+                                "or switch models in settings. ({})",
+                                autoErrorCode(60, 3)));
+                return;
+            }
+            resetGenerationUI();
+            this->processFinalResponse(std::move(res.text), provider);
+            return;
+        }
+
+        // Tool round: rebuild a ParsedResponse from the decoded stream.
+        // reasoningText is deliberately left empty — the thinking was already
+        // pushed to the transcript above, and dispatchToolRound would push it
+        // a second time.
+        toolUse::ParsedResponse parsed;
+        for (auto& tc : res.toolCalls) {
+            toolUse::ToolCall call;
+            call.id               = tc.id;
+            call.name             = tc.name;
+            call.args             = toolUse::parseToolArgs(matjson::Value(tc.argsJson));
+            call.thoughtSignature = tc.thoughtSignature;
+            parsed.toolCalls.push_back(std::move(call));
+        }
+        if (!parsed.toolCalls.empty()) {
+            parsed.assistantTextWithCalls = res.text;
+            parsed.ok = true;
+        } else {
+            parsed.finalText = res.text;
+            parsed.ok = !res.text.empty();
+            if (!parsed.ok)
+                parsed.errorMessage = "The provider streamed an empty reply";
+        }
+        this->dispatchToolRound(std::move(parsed));
+    }
 
     // Entry point. Called instead of callAPI's single-shot when tool use is
     // enabled and the selected provider supports it.
@@ -13710,17 +14891,17 @@ protected:
         { std::string mk = m_toolApiKey.size()>8 ? m_toolApiKey.substr(0,4)+"..."+m_toolApiKey.substr(m_toolApiKey.size()-4) : "***";
           log::info("Tool loop preflight: provider={} model='{}' keyLen={} mask='{}'", m_toolProvider, m_toolModel, m_toolApiKey.size(), mk); }
         // Tool use is unbounded — no round budget. The model runs until it
-        // emits a final answer; the per-tool caps + duplicate guard +
-        // backstop in doToolRound prevent runaway loops.
+        // emits a final answer; duplicate-call reuse prevents accidental
+        // repeated network work, while Cancel remains available throughout.
         m_toolIterations  = 0;
-        m_forceFinalize   = false;
-        m_forceFinalizeTries = 0;
         m_usingToolLoop   = true;
         m_toolHistory.clear();
         m_accumulatedObjects = matjson::Value::array();
         m_extensionRounds = 0;
         m_passabilityFixRounds = 0;
         m_refinementRounds = 0;
+        m_refineDeclaredDone = false;
+        m_aiPlaytestPasses   = 0;
         m_critiqueDone    = false;
         m_critiquePending = false;
         m_decorationPassDone = false;
@@ -13738,18 +14919,28 @@ protected:
         // generations clear the level only AT APPLY, so mid-run staging is
         // only safe when there is nothing to clear (empty/new level) or the
         // generation extends the existing level anyway.
-        m_livePlace      = Mod::get()->getSettingValue<bool>("live-placement");
+        // AI playtesting needs the draft visible so a vision-capable model can
+        // actually watch it. On empty/new or additive levels this is just the
+        // same reversible preview staging as live placement; replacement of a
+        // non-empty level stays virtual until final apply to preserve user data.
+        m_livePlace      = Mod::get()->getSettingValue<bool>("live-placement") ||
+                           Mod::get()->getSettingValue<bool>("ai-playtest");
         m_liveConsumed   = 0;
         m_liveStarted    = false;
         m_liveShift      = 0.f;
         m_liveShiftValid = false;
         m_liveSkippedOps = matjson::Value::array();
+        m_liveBuildProtocol = false;
+        m_liveBuildDeclaredDone = false;
+        m_liveBuildPasses = 0;
         m_liveEligible   = false;
         if (m_livePlace && revalidateEditor()) {
             size_t existing = (m_editorLayer && m_editorLayer->m_objects)
                 ? m_editorLayer->m_objects->count() : 0;
             m_liveEligible = !m_shouldClearLevel || existing == 0;
         }
+        m_liveBuildProtocol = m_livePlace && m_liveEligible
+                           && !m_editMode && !m_mutationMode && !m_coopMode;
         m_lengthTarget = lengthTargetForSetting(
             Mod::get()->getSettingValue<std::string>("length"));
 
@@ -13825,12 +15016,14 @@ protected:
             "non-trigger object. You MUST reach at least the user's target min\n"
             "seconds (max X ≥ {:.0f}). If your first JSON answer is shorter, the\n"
             "mod will ask you to EXTEND, and you will keep appending until the\n"
-            "target is met (capped at {} extension rounds).\n\n"
+            "target is met. There is no round cap; the user can cancel.\n\n"
             "You have tools available (declared in the request's tools field — each\n"
             "carries its own usage docs). The user does NOT see tool calls or their\n"
             "results; only you do. Call them whenever they'd help: verify drafts with\n"
             "get_level_length / check_passability between rounds, discover object\n"
-            "names with search_objects, pull references with download_level.\n"
+            "names with search_objects, find a named level with search_levels and\n"
+            "then study it with download_level, and (on image-capable models) LOOK at\n"
+            "your own work with render_level.\n"
             "MUSIC SYNC: get_bpm + get_waveform analyze the level's actual song —\n"
             "use them first when the request mentions sync/music/drops, and place\n"
             "hazards on the beat grid they return. get_ground_y gives the exact\n"
@@ -13838,39 +15031,40 @@ protected:
             "For big builds, set_goal + a task list turns this into a work loop:\n"
             "the mod keeps prompting you until you call goal_done — mark tasks as\n"
             "you finish and verify before declaring done.\n"
-            "There is NO limit on tool calls — use as many as the task needs. When\n"
-            "you have enough context, STOP calling tools and return your final answer.\n\n"
-            "Final answer JSON: \"analysis\" string, \"objects\" array, optional \"macros\"\n"
-            "array (use aggressively), optional \"level_metadata\". DO NOT wrap the\n"
-            "final JSON in another tool call — emit it as your normal assistant reply.",
+            "There is NO limit on tool calls or review passes. Once a draft exists,\n"
+            "call playtest_level to simulate it and, on a vision-capable endpoint,\n"
+            "watch the fresh render. Repair what you find and playtest again as many\n"
+            "times as useful. Each pass may choose its own focus: gameplay, visuals,\n"
+            "song sync, reference research, or another concrete weakness. When you\n"
+            "have enough context and the draft is genuinely ready, return the level.\n\n"
+            "VISUAL DESIGN CONTRACT: do not emit gameplay floating in an empty grid. "
+            "For each section choose one recognisable motif and build the play path "
+            "inside it: a dim background silhouette, a readable structural mid-layer, "
+            "and sparse foreground accents. Reuse a deliberate 2-3 channel palette; "
+            "change the silhouette and mood at section transitions. Before finalizing "
+            "a vision-capable build, call render_level and repair visibly empty or "
+            "unframed stretches.\n\n"
+            "Final answer: prefer the documented EAS format, one command per line. "
+            "JSON is also accepted: analysis string, objects array, optional macros "
+            "and level_metadata. Emit the level as your normal assistant reply, "
+            "not inside a tool call.",
             userPrompt, difficulty, style, length,
             m_lengthTarget.minSeconds, m_lengthTarget.maxSeconds,
             targetMinX, targetMaxX,
             levelDataSection,
             GD_PLAYER_SPEED_1X,
-            targetMinX, m_maxExtensionRounds
+            targetMinX
         );
 
-        // User-pinned reference levels ("example-level-ids" setting, saved
-        // across generations): instruct the model to pull each one down as a
-        // style reference before designing.
-        {
-            auto refIds = parseExampleLevelIds();
-            if (!refIds.empty()) {
-                std::string idList;
-                for (size_t i = 0; i < refIds.size(); ++i) {
-                    if (i) idList += ", ";
-                    idList += fmt::format("{}", refIds[i]);
-                }
-                fullUserPrompt += fmt::format(
-                    "\n\nREFERENCE LEVELS (user-pinned): before designing, call "
-                    "download_level for each of these IDs and absorb their pacing, "
-                    "density, and structure choices: {}. Imitate their feel, do "
-                    "not copy them verbatim.", idList);
-                log::info("Injecting {} pinned reference level(s): {}",
-                          refIds.size(), idList);
-            }
-        }
+        // Named references: the model resolves level NAMES itself now (there
+        // is no pinned-ID setting anymore) — search_levels finds the ID, then
+        // download_level pulls the summary.
+        fullUserPrompt +=
+            "\n\nREFERENCES: if the request names a real GD level or creator "
+            "(\"like Nine Circles\", \"Bloodbath style\"), call search_levels "
+            "with that name FIRST, then download_level on the best match, and "
+            "absorb its pacing/density/structure. Imitate the feel, never copy "
+            "it verbatim.";
 
         // "style: <ID>" reference — in tool mode the model fetches it itself.
         if (!m_styleRefId.empty()) {
@@ -13882,11 +15076,31 @@ protected:
         // Music sync: prompt named a BPM -> hand the model the beat grid.
         fullUserPrompt += buildBeatGridNote(userPrompt);
 
+        if (m_liveBuildProtocol) {
+            const float scaffoldX = std::clamp(targetMinX * 0.12f, 900.f, 1800.f);
+            fullUserPrompt += fmt::format(
+                "\n\nLIVE BUILD PROTOCOL: the player is watching blocks appear. "
+                "Do NOT return the whole level in your first level reply. First "
+                "emit only a simple, playable scaffold from X=0 to about X={:.0f}: "
+                "floor, a readable path, a few representative obstacles, and the "
+                "core palette/motif. Keep it intentionally light. The mod will "
+                "stage it immediately and ask for successive additive diffs. On "
+                "each later pass, add one meaningful section or layer without "
+                "re-emitting anything already built. You control how many passes "
+                "are useful; time is not a concern. When the watched build is "
+                "complete enough to enter final validation, put BUILD COMPLETE "
+                "on its own first line. You may include the final additive EAS/JSON "
+                "diff below that line. Never claim completion merely to save time.",
+                scaffoldX);
+        }
+
         // Build the conversation history.
         toolUse::Message sys;
         sys.role = toolUse::MessageRole::System;
         sys.text = buildSystemPrompt();
         appendModeContext(sys.text);  // co-op rides the tool loop too
+        m_contextBaseSystem = sys.text;
+        sys.text += buildContextEnvelope("create a validated level draft");
         m_toolHistory.push_back(std::move(sys));
 
         // ── In-context few-shot for small EditorAI Ollama fine-tunes ─────
@@ -13995,47 +15209,6 @@ protected:
         this->doToolRound();
     }
 
-    // Append the "stop and finalize" instruction to the conversation WITHOUT
-    // ever creating two consecutive user-role turns — Claude and Gemini both
-    // reject that with a 400 (a ToolResults turn maps to role=user too). So:
-    //   tail is Assistant / empty → push a fresh User turn (clean alternation)
-    //   tail is ToolResults       → ride on its last result's content (same user turn)
-    //   tail is User              → append to that user turn's text
-    void injectStopNudge() {
-        static const std::string STOP =
-            "STOP calling tools now. Output your COMPLETE level as EAS "
-            "('## Level Script' then the script) using everything you already "
-            "have. Do NOT call any tool.";
-        if (m_toolHistory.empty() ||
-            m_toolHistory.back().role == toolUse::MessageRole::Assistant) {
-            toolUse::Message stop;
-            stop.role = toolUse::MessageRole::User;
-            stop.text = STOP;
-            m_toolHistory.push_back(std::move(stop));
-            return;
-        }
-        auto& back = m_toolHistory.back();
-        if (back.role == toolUse::MessageRole::ToolResults) {
-            if (!back.toolResults.empty()) {
-                // Ride on the last result's content (the builders emit that;
-                // they do NOT emit a ToolResults message's .text field).
-                back.toolResults.back().content += "\n\n" + STOP;
-            } else {
-                // Degenerate empty ToolResults — its .text would be dropped by
-                // every builder, so push a fresh User turn instead (the tail
-                // is a user-role turn, but an empty ToolResults emits nothing,
-                // so this does not create a visible consecutive-user pair).
-                toolUse::Message stop;
-                stop.role = toolUse::MessageRole::User;
-                stop.text = STOP;
-                m_toolHistory.push_back(std::move(stop));
-            }
-        } else {  // User turn — append to its text.
-            if (!back.text.empty()) back.text += "\n\n";
-            back.text += STOP;
-        }
-    }
-
     void doToolRound() {
         // Loop-back gates in processFinalResponse call this AFTER
         // resetGenerationUI() dropped m_isGenerating — without re-arming it,
@@ -14043,30 +15216,19 @@ protected:
         // !m_isGenerating), transient retries are dropped, and Cancel
         // becomes a no-op mid-loop.
         m_isGenerating = true;
+        refreshSystemContext(
+            m_followUpTurn
+                ? (m_followUpMode == 1 ? "produce a read-only build plan"
+                   : m_followUpMode == 2 ? "answer without changing the level"
+                                         : "edit through a reversible preview")
+                : "continue building and validating the level draft");
         if (m_cancelBtn)   m_cancelBtn->setVisible(true);
         if (m_generateBtn) m_generateBtn->setVisible(false);
         ++m_toolIterations;
 
-        // Anti-runaway backstop. Tool use is unbounded — a real generation
-        // (even a heavy multi-phase edit with extension/refinement/critique
-        // continuations) tops out well under this. Reaching it means the
-        // model is stuck spinning; flip to forced finalize, which GRACEFULLY
-        // salvages a final answer (never errors out, never an arbitrary
-        // user-facing "limit"). Set high enough to be irrelevant to honest work.
-        static constexpr int TOOL_ROUND_BACKSTOP = 200;
-        if (!m_forceFinalize && m_toolIterations >= TOOL_ROUND_BACKSTOP) {
-            log::warn("Tool loop reached the {}-round anti-runaway backstop — "
-                      "forcing a final answer", TOOL_ROUND_BACKSTOP);
-            m_forceFinalize = true;
-            // Once finalizing, the loop-back gates must NOT re-loop the
-            // salvaged answer (they'd push more rounds past the backstop and
-            // stack another user turn after the STOP). Disabling the shared
-            // gate flag short-circuits all of them; it's re-armed for the
-            // next turn by runToolLoop / sendFollowUp.
-            m_usingToolLoop = false;
-        }
-        if (m_forceFinalize)
-            injectStopNudge();   // role-aware (never creates back-to-back user turns)
+        // Deliberately no round/pass limit: review, visual inspection and
+        // playtesting may loop for as long as the model still has useful work.
+        // Exact duplicate tool calls are reused below, and the user can Cancel.
 
         // History pruning: every round re-sends the whole conversation, and
         // old tool results (level dumps, search results) are its bulk. Keep
@@ -14113,6 +15275,12 @@ protected:
         std::string url     = toolUse::urlFor(m_toolProvider, m_toolModel);
         log::info("Tool round {}: POST {} ({} bytes)",
                   m_toolIterations, url, bodyStr.size());
+
+        // Streamed round: tokens land in the session's live bubble as they
+        // arrive. Falls through to the buffered request when unavailable.
+        if (this->startStream(m_toolProvider, m_toolApiKey, url, body, true))
+            return;
+
         logApiRequest(m_toolProvider, m_toolModel, url, bodyStr);
 
         auto request = web::WebRequest();
@@ -14134,9 +15302,7 @@ protected:
     // Ref<> keeps the popup alive across the backoff; m_isGenerating gates
     // the re-fire so a cancelled generation doesn't resurrect itself.
     bool retryToolRoundIfTransient(int httpCode) {
-        bool transient = httpCode == 429 || httpCode == 500 || httpCode == 502 ||
-                         httpCode == 503 || httpCode == 529;
-        if (!transient || m_transientRetries >= 1) return false;
+        if (!isTransientHttp(httpCode) || m_transientRetries >= 1) return false;
         ++m_transientRetries;
         log::warn("Transient HTTP {} — retrying round once in 2s", httpCode);
         showStatus(fmt::format("Provider hiccup (HTTP {}) — retrying...", httpCode));
@@ -14152,6 +15318,36 @@ protected:
                 self->doToolRound();
             });
             // thread-local self is moved-from (null) — destructor is a no-op
+        }).detach();
+        return true;
+    }
+
+    // One automatic retry when a single-shot generation fails transiently.
+    // Covers BOTH kinds of transient failure: an HTTP status in the retry set,
+    // and a 200-with-an-error-body (Ollama / the Platinum coordinator report
+    // "timed out" / "no workers available" that way). Returns true if a retry
+    // was scheduled — the caller must then return without erroring.
+    bool retrySingleShotIfTransient(int httpCode, const std::string& bodyError) {
+        bool transient = isTransientHttp(httpCode) ||
+                         (!bodyError.empty() && isTransientProviderError(bodyError));
+        if (!transient || m_transientRetries >= 1) return false;
+        ++m_transientRetries;
+        if (!bodyError.empty())
+            log::warn("Transient provider error — retrying once in 2s: {}", bodyError);
+        else
+            log::warn("Transient HTTP {} on single-shot — retrying once in 2s", httpCode);
+        showStatus(bodyError.empty()
+            ? fmt::format("Provider hiccup (HTTP {}) - retrying...", httpCode)
+            : "Provider was busy - retrying...");
+        // Move-through capture — see retryToolRoundIfTransient for why the
+        // worker thread must never destroy a Ref copy.
+        Ref<AIGeneratorPopup> self = this;
+        std::thread([self = std::move(self)]() mutable {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            Loader::get()->queueInMainThread([self = std::move(self)] {
+                if (!self->m_isGenerating) return;
+                self->callAPI(self->m_lastCallPrompt, self->m_lastCallKey);
+            });
         }).detach();
         return true;
     }
@@ -14181,7 +15377,13 @@ protected:
         }
         auto json   = jsonRes.unwrap();
         auto parsed = toolUse::parseResponse(m_toolProvider, json);
+        this->dispatchToolRound(std::move(parsed));
+    }
 
+    // Everything after a tool round's response has been parsed. Shared by the
+    // buffered path (onToolRoundResponse) and the streaming path, which
+    // assembles the same ParsedResponse from decoded SSE deltas.
+    void dispatchToolRound(toolUse::ParsedResponse parsed) {
         if (!parsed.ok) {
             log::error("Tool round {} parse error: {}", m_toolIterations, parsed.errorMessage);
             onError("Tool Response",
@@ -14204,44 +15406,7 @@ protected:
             return;
         }
 
-        // Forced finalize (anti-runaway backstop tripped in doToolRound): the
-        // model was told to stop but is here with more tool calls. Salvage
-        // any text it produced and finish; if it returned only tool calls and
-        // no text, give it a couple more forced rounds (the stop nudge is
-        // re-injected each time) before giving up gracefully. This never burns
-        // unlimited quota, yet never imposes an arbitrary limit on honest work.
-        if (m_forceFinalize) {
-            std::string finalText = !parsed.finalText.empty()
-                ? parsed.finalText
-                : parsed.assistantTextWithCalls;
-            if (!finalText.empty()) {
-                log::info("Backstop finalize: salvaging {} chars of model text",
-                          finalText.size());
-                this->processFinalResponse(std::move(finalText), m_toolProvider);
-                return;
-            }
-            if (++m_forceFinalizeTries >= 3) {
-                onError("AI Couldn't Finish",
-                    fmt::format("The AI kept calling tools and never produced a level, "
-                                "even after being told to stop. Try a more capable "
-                                "model or a simpler request. ({})",
-                                autoErrorCode(60, 52)));
-                return;
-            }
-            log::warn("Backstop finalize: no usable text yet — forcing another "
-                      "round ({}/3)", m_forceFinalizeTries);
-            // Record a minimal assistant turn (the model's ignored tool calls
-            // are deliberately dropped) so the next forced round's STOP nudge
-            // follows an assistant turn — strict alternation stays intact.
-            toolUse::Message ack;
-            ack.role = toolUse::MessageRole::Assistant;
-            ack.text = parsed.assistantTextWithCalls.empty()
-                ? "(Understood — emitting the level now.)"
-                : parsed.assistantTextWithCalls;
-            m_toolHistory.push_back(std::move(ack));
-            this->doToolRound();
-            return;
-        }
+        setFlowPhase("researching and inspecting");
 
         // Live thinking display: provider-reported reasoning first, then any
         // plain text the model wrote alongside its tool calls — this is the
@@ -14282,12 +15447,25 @@ protected:
                 // onCancel drop pending callbacks, but the synchronous-tool
                 // chain can still complete this batch.
                 if (!m_isGenerating) return;
-                // (No round-countdown nudge: tool use is unbounded. The
-                // per-tool caps + duplicate guard handle finalize pressure.)
+                // No round-countdown nudge: tool use is unbounded. Identical
+                // discovery calls are reused, while state-reading and
+                // playtest calls are intentionally repeatable.
                 toolUse::Message resMsg;
                 resMsg.role        = toolUse::MessageRole::ToolResults;
                 resMsg.toolResults = std::move(results);
                 m_toolHistory.push_back(std::move(resMsg));
+                // A render_level call in this batch produced an image; it must
+                // travel on a USER turn (tool results can't carry images on any
+                // provider), so send it as a one-line follow-up carrying the
+                // snapshot.
+                if (!m_pendingRenderB64.empty()) {
+                    toolUse::Message look;
+                    look.role = toolUse::MessageRole::User;
+                    look.text = "Here is the render you asked for. Look at it, "
+                                "then continue.";
+                    attachVision(look);   // consumes m_pendingRenderB64
+                    m_toolHistory.push_back(std::move(look));
+                }
                 this->doToolRound();
             }
         );
@@ -14310,7 +15488,8 @@ protected:
 
     static int toolHolderCategory(const std::string& name) {
         if (name == "web_search")     return 1;  // m_toolListenerWeb
-        if (name == "download_level") return 2;  // m_toolListenerLevel
+        if (name == "download_level" || name == "search_levels")
+            return 2;                             // m_toolListenerLevel
         if (name == "search_newgrounds" || name == "get_newgrounds_song")
             return 3;                             // m_toolListenerNG
         return 0;  // synchronous mod-side tools — no shared holder
@@ -14363,12 +15542,16 @@ protected:
     // powers ask_subagent. Minimal request bodies (no tools, no history):
     // OpenAI-compat family + ollama generate + claude + gemini.
     void fireSubagentCompletion(const std::string& provider,
+                                const std::string& selectedModel,
                                 const std::string& question,
                                 std::function<void(std::string)> onDone)
     {
-        std::string model = Mod::get()->getSettingValue<std::string>("subagent-model");
-        if (model.empty()) model = getProviderModel(provider);
-        std::string apiKey = trimKey(getProviderApiKey(provider));
+        const bool platinum = provider == "platinum";
+        const std::string apiProvider = platinum ? "ollama" : provider;
+        std::string model = selectedModel.empty()
+            ? getProviderModel(apiProvider) : selectedModel;
+        std::string apiKey = platinum ? std::string()
+                                      : trimKey(getProviderApiKey(apiProvider));
         static const char* SUB_SYS =
             "You are a concise expert consultant for a Geometry Dash level-design "
             "AI. Answer the question directly in under 250 words. No preamble.";
@@ -14377,9 +15560,12 @@ protected:
         std::string url;
         auto request = web::WebRequest();
         request.header("Content-Type", "application/json");
-        request.timeout(std::chrono::seconds(90));
+        request.timeout(std::chrono::seconds(
+            platinum
+                ? std::max(300, (int)Mod::get()->getSettingValue<int64_t>("ollama-timeout"))
+                : 90));
 
-        if (provider == "claude") {
+        if (apiProvider == "claude") {
             auto msg = matjson::Value::object();
             msg["role"] = "user";
             msg["content"] = question;
@@ -14388,7 +15574,7 @@ protected:
             body["system"] = SUB_SYS;
             body["messages"] = std::vector<matjson::Value>{msg};
             url = "https://api.anthropic.com/v1/messages";
-        } else if (provider == "gemini") {
+        } else if (apiProvider == "gemini") {
             auto part = matjson::Value::object();
             part["text"] = question;
             auto content = matjson::Value::object();
@@ -14408,11 +15594,12 @@ protected:
             url = fmt::format(
                 "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
                 model);
-        } else if (provider == "ollama") {
+        } else if (apiProvider == "ollama") {
             body["model"] = model;
             body["prompt"] = fmt::format("{}\n\n{}", SUB_SYS, question);
             body["stream"] = false;
-            url = getOllamaUrl() + "/api/generate";
+            url = (platinum ? std::string("http://sn-1.vltgg.net:21800")
+                            : getOllamaUrl()) + "/api/generate";
         } else {
             // OpenAI-compatible family (openai/openrouter/ministral/hf/
             // deepseek/lm-studio/llama-cpp).
@@ -14425,14 +15612,14 @@ protected:
             body["model"] = model;
             body["messages"] = msgs;
             body["max_tokens"] = 1024;
-            url = toolUse::urlFor(provider, model);
+            url = toolUse::urlFor(apiProvider, model);
         }
-        applyProviderAuth(request, provider, apiKey);
+        applyProviderAuth(request, apiProvider, apiKey);
         request.bodyString(body.dump());
         log::info("ask_subagent -> {} ({})", provider, model);
         m_subagentTask.spawn(
             request.post(url),
-            [provider, onDone = std::move(onDone)](web::WebResponse resp) mutable {
+            [apiProvider, onDone = std::move(onDone)](web::WebResponse resp) mutable {
                 if (!resp.ok()) {
                     onDone(fmt::format("(subagent HTTP {})", resp.code()));
                     return;
@@ -14441,12 +15628,12 @@ protected:
                 if (!json) { onDone("(subagent returned non-JSON)"); return; }
                 const auto j = json.unwrap();
                 std::string text;
-                if (provider == "claude") {
+                if (apiProvider == "claude") {
                     if (j.contains("content") && j["content"].isArray() && j["content"].size() > 0) {
                         auto t = j["content"][0]["text"].asString();
                         if (t) text = t.unwrap();
                     }
-                } else if (provider == "gemini") {
+                } else if (apiProvider == "gemini") {
                     if (j.contains("candidates") && j["candidates"].isArray() &&
                         j["candidates"].size() > 0) {
                         const auto& cand = j["candidates"][0];
@@ -14461,7 +15648,7 @@ protected:
                                         text += t.unwrap();
                         }
                     }
-                } else if (provider == "ollama") {
+                } else if (apiProvider == "ollama") {
                     auto t = j["response"].asString();
                     if (t) text = t.unwrap();
                 } else {
@@ -14488,6 +15675,121 @@ protected:
         }
         out += fmt::format("({}/{} complete)", done, (int)m_goalTasks.size());
         return out;
+    }
+
+    // Compact one-line summary of what the AI is currently working with.
+    // Refreshed each follow-up and persisted on the session, so the model can
+    // answer "what did you change / how's the level going?" even after a
+    // restart. Creation mode reports the accepted draft; edit mode reports the
+    // editor level.
+    std::string workingStateLine() const {
+        std::string line;
+        const matjson::Value& draft = m_accumulatedObjects;
+        bool haveDraft = draft.isArray() && draft.size() > 0;
+        if (haveDraft) {
+            size_t n = draft.size();
+            float maxX = computeMaxXFromObjects(draft);
+            line = fmt::format("CURRENT LEVEL STATE: working draft has {} object(s)"
+                               "{}", n,
+                               maxX > 0.f ? fmt::format(", spanning X 0–{:.0f}", maxX)
+                                          : std::string());
+            auto pass = levelcheck::check(draft);
+            if (pass.total_columns > 0)
+                line += fmt::format(", passability {:.0f}%", pass.pass_rate * 100.f);
+            auto sim = levelcheck::simulateCube(draft,
+                (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y"));
+            if (!sim.deaths.empty())
+                line += fmt::format(", physics bot: {} death(s) (first at X={:.0f})",
+                                    sim.deaths.size(), sim.deaths[0].x);
+        } else if (m_editorLayer && m_editorLayer->m_objects) {
+            line = fmt::format("CURRENT LEVEL STATE: editing the user's "
+                               "existing level ({} objects)",
+                               (int)m_editorLayer->m_objects->count());
+        } else {
+            line = "CURRENT LEVEL STATE: (no draft yet — this is the first turn)";
+        }
+        if (m_goalActive && !m_goalText.empty()) {
+            int done = 0;
+            for (auto& t : m_goalTasks) if (t.done) ++done;
+            line += fmt::format(" | goal: \"{}\" ({}/{} tasks done)",
+                                m_goalText, done, (int)m_goalTasks.size());
+        }
+        return line;
+    }
+
+    std::string buildContextEnvelope(const std::string& intent) {
+        bool haveLiveDraft = m_accumulatedObjects.isArray() &&
+                             m_accumulatedObjects.size() > 0;
+        bool haveLiveEditor = m_editorLayer &&
+                              m_editorLayer == LevelEditorLayer::get();
+        std::string state;
+        if (!haveLiveDraft && !haveLiveEditor && m_session &&
+            !m_session->workingState.empty()) {
+            state = m_session->workingState;
+        } else {
+            state = workingStateLine();
+            if (m_session) m_session->workingState = state;
+        }
+
+        std::string target = m_session && !m_session->targetLevelName.empty()
+            ? m_session->targetLevelName : "current editor level";
+        std::string provider = m_toolProvider.empty()
+            ? Mod::get()->getSettingValue<std::string>("ai-provider")
+            : m_toolProvider;
+        std::string model = m_toolModel.empty() ? getProviderModel(provider)
+                                                : m_toolModel;
+        std::string mode = m_followUpTurn
+            ? (m_followUpMode == 1 ? "plan (read-only)"
+               : m_followUpMode == 2 ? "chat (read-only)"
+                                     : "edit (reversible changes)")
+            : (m_editMode ? "edit existing level" : "generate replacement");
+        std::string out = fmt::format(
+            "\n\n## Runtime context envelope (authoritative; refreshed this turn)\n"
+            "Intent: {}\nMode: {}\nTarget: {}\n{}\n"
+            "Requested constraints: difficulty={} | style={} | length={}\n"
+            "Capabilities: provider={} model={} | tools={} | vision={} | "
+            "refinement={}{} | two-pass={} | self-check={}\n"
+            "Draft visibility: {}\n"
+            "Safety: all mutations must remain one reversible preview until the "
+            "user accepts; plan/chat turns must not emit level data.\n",
+            intent, mode, target, state,
+            Mod::get()->getSettingValue<std::string>("difficulty"),
+            Mod::get()->getSettingValue<std::string>("style"),
+            Mod::get()->getSettingValue<std::string>("length"),
+            provider, model,
+            Mod::get()->getSettingValue<bool>("enable-ai-tools") ? "on" : "off",
+            Mod::get()->getSettingValue<bool>("enable-vision") &&
+                    toolUse::supportsVision(provider, model) ? "available" : "off/unavailable",
+            Mod::get()->getSettingValue<int64_t>("refinement-rounds"),
+            Mod::get()->getSettingValue<bool>("refine-until-done") ? " until done" : " fixed",
+            Mod::get()->getSettingValue<bool>("two-pass-generation") ? "on" : "off",
+            Mod::get()->getSettingValue<bool>("enable-self-critique") ? "on" : "off",
+            m_liveStarted ? "partial draft is visible on the preview layer"
+                          : "the working draft is not yet visible in the editor");
+        if (m_goalActive && !m_goalText.empty())
+            out += fmt::format("Active goal: {}\n{}\n", m_goalText,
+                               goalTaskListText());
+        if (m_session && !m_session->chatSummary.empty())
+            out += "\nEarlier conversation digest (context, not a new request):\n" +
+                   m_session->chatSummary;
+        return out;
+    }
+
+    void refreshSystemContext(const std::string& intent) {
+        if (m_toolHistory.empty() ||
+            m_toolHistory.front().role != toolUse::MessageRole::System)
+            return;
+        if (m_contextBaseSystem.empty()) {
+            // Restored engines and old in-memory sessions may predate the
+            // explicit base. Strip our own envelope if one is present.
+            m_contextBaseSystem = m_toolHistory.front().text;
+            static const char* MARK =
+                "\n\n## Runtime context envelope (authoritative; refreshed this turn)\n";
+            auto pos = m_contextBaseSystem.find(MARK);
+            if (pos != std::string::npos) m_contextBaseSystem.resize(pos);
+        }
+        m_toolHistory.front().text = m_contextBaseSystem +
+                                     buildContextEnvelope(intent);
     }
 
     // Surface the goal state to the user (status line + session transcript),
@@ -14531,13 +15833,12 @@ protected:
         // re-running the network fetch — pure efficiency, never a stop signal,
         // and it does not limit varied tool use. State-reading tools
         // (analyze_level / get_level_length / check_passability /
-        // get_level_region) are NOT guarded at all — their output changes as
-        // the level evolves, so honest repeats are expected. The 200-round
-        // backstop in doToolRound is the sole anti-runaway catch.
+        // get_level_region / playtest_level) are NOT guarded at all — their
+        // output changes as the level evolves, so honest repeats are expected.
         {
             static const std::unordered_set<std::string> DISCOVERY = {
                 "search_objects", "web_search", "download_level",
-                "search_newgrounds", "get_newgrounds_song",
+                "search_levels", "search_newgrounds", "get_newgrounds_song",
             };
             if (DISCOVERY.count(call.name)) {
                 std::string sig = call.name + "|" + call.args.dump();
@@ -14740,10 +16041,10 @@ protected:
             announceGoal("Goal set");
             r.content = fmt::format(
                 "Goal locked in: \"{}\"\n{}\nThe mod will now keep prompting "
-                "you to continue after every answer until you call goal_done "
-                "(safety cap: {} rounds). Work task by task; use task_mark as "
+                "you to continue after every answer until you call goal_done. "
+                "There is no pass limit; work task by task, use task_mark as "
                 "you finish, verify before declaring victory.",
-                m_goalText, goalTaskListText(), MAX_GOAL_ROUNDS);
+                m_goalText, goalTaskListText());
             onDone(std::move(r)); return;
         }
 
@@ -14937,21 +16238,48 @@ protected:
             return;
         }
         if (call.name == "ask_subagent") {
-            std::string subProvider =
+            // "same" is explicit in the UI and copies BOTH provider and model.
+            // Empty remains a backwards-compatible alias for older settings.
+            // "platinum" is an independent route: it must not toggle the main
+            // Ollama provider's use-platinum setting behind the user's back.
+            std::string configuredProvider =
                 Mod::get()->getSettingValue<std::string>("subagent-provider");
+            std::string subProvider = configuredProvider;
+            std::string subModel;
+            if (subProvider.empty() || subProvider == "same") {
+                subProvider = Mod::get()->getSettingValue<std::string>("ai-provider");
+                // Same provider means same AI, including the model. Ignore a
+                // stale subagent-model left behind from an older split-provider
+                // setup; sending it to the main API can produce a confusing 404.
+                subModel = getProviderModel(subProvider);
+            } else if (subProvider == "platinum") {
+                subModel = getProviderModel("ollama");
+            } else {
+                subModel = Mod::get()->getSettingValue<std::string>("subagent-model");
+                if (subModel.empty()) subModel = getProviderModel(subProvider);
+            }
             auto q = call.args["question"].asString();
             std::string question = q ? q.unwrap() : "";
-            if (question.size() > 1500) question.resize(1500);
+            if (question.size() > 3000) question.resize(3000);
             if (subProvider.empty() || question.empty()) {
-                r.content = subProvider.empty()
-                    ? "(no subagent configured - the user must set Subagent "
-                      "Provider in settings. Continue without it.)"
-                    : "(ask_subagent needs a non-empty question)";
+                r.content = "(ask_subagent needs a non-empty question)";
                 r.isError = question.empty();
                 onDone(std::move(r));
                 return;
             }
-            this->fireSubagentCompletion(subProvider, question,
+            // Supply compact state automatically. The main AI no longer has
+            // to spend tokens restating facts the engine already knows, while
+            // the consultant still receives a focused bounded prompt.
+            std::string brief = fmt::format(
+                "TASK FROM MAIN AI:\n{}\n\nENGINE STATE:\n{}",
+                question, workingStateLine());
+            if (m_goalActive && !m_goalText.empty())
+                brief += fmt::format("\nActive goal: {}\n{}", m_goalText,
+                                     goalTaskListText());
+            brief +=
+                "\nReturn concrete findings or a decision the main AI can use "
+                "immediately. Flag uncertainty; do not restate the task.";
+            this->fireSubagentCompletion(subProvider, subModel, brief,
                 [r, onDone = std::move(onDone)](std::string answer) mutable {
                     if (answer.size() > 4000) { answer.resize(4000); answer += "..."; }
                     r.content = answer.empty()
@@ -14968,14 +16296,20 @@ protected:
             } else {
                 auto sim = levelcheck::simulateCube(m_accumulatedObjects,
                     (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y"));
+                float maxX = computeMaxXFromObjects(m_accumulatedObjects);
+                float pct = maxX > 0.f
+                    ? std::min(sim.reachedX / maxX, 1.f) * 100.f : 0.f;
                 if (sim.deaths.empty()) {
                     r.content = fmt::format(
-                        "Physics bot CLEARED the draft (reached X={:.0f}{}). "
-                        "Cube sections look jumpable.",
-                        sim.reachedX, sim.finished ? ", end of level" : "");
+                        "Physics bot CLEARED the draft: reached X={:.0f} ({:.0f}% "
+                        "of the level's span{}).",
+                        sim.reachedX, pct,
+                        sim.finished ? "; end of level reached" : "");
                 } else {
                     std::string body = fmt::format(
-                        "Physics bot died {} time(s):\n", sim.deaths.size());
+                        "Physics bot died {} time(s), reaching X={:.0f} ({:.0f}% "
+                        "of the level's span):\n",
+                        sim.deaths.size(), sim.reachedX, pct);
                     for (auto& d : sim.deaths)
                         body += fmt::format("  X={:.0f} Y={:.0f}: {}\n", d.x, d.y, d.reason);
                     body += "Fix these spots (wider spacing, lower obstacles, or an "
@@ -14983,6 +16317,83 @@ protected:
                     r.content = std::move(body);
                 }
             }
+            onDone(std::move(r));
+            return;
+        }
+        if (call.name == "playtest_level") {
+            ++m_aiPlaytestPasses;
+            std::string focus;
+            if (auto f = call.args["focus"].asString()) {
+                focus = f.unwrap();
+                if (focus.size() > 160) focus.resize(160);
+            }
+            if (m_accumulatedObjects.size() == 0) {
+                r.content = "(no accumulated draft yet - emit the first draft, "
+                            "then call playtest_level on the next pass.)";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+
+            float groundY = (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y");
+            auto pass = levelcheck::check(m_accumulatedObjects);
+            auto sim  = levelcheck::simulateCube(m_accumulatedObjects, groundY);
+            auto hist = levelcheck::difficultyHistogram(m_accumulatedObjects);
+            float maxX = computeMaxXFromObjects(m_accumulatedObjects);
+            float pct = maxX > 0.f ? std::min(sim.reachedX / maxX, 1.f) * 100.f : 0.f;
+
+            std::string out = fmt::format(
+                "AI PLAYTEST PASS {}{}:\n"
+                "- simulated cube run: reached X={:.0f} ({:.1f}% of span), {} death(s)\n"
+                "- geometric passability: {:.1f}% across {} columns, {} blocked zone(s)\n",
+                m_aiPlaytestPasses,
+                focus.empty() ? "" : fmt::format(" (focus: {})", focus),
+                sim.reachedX, pct, sim.deaths.size(),
+                pass.pass_rate * 100.f, pass.total_columns, pass.deaths.size());
+            for (size_t i = 0; i < sim.deaths.size() && i < 10; ++i)
+                out += fmt::format("  death {}: X={:.0f} Y={:.0f} - {}\n",
+                                   i + 1, sim.deaths[i].x, sim.deaths[i].y,
+                                   sim.deaths[i].reason);
+            if (!hist.empty()) {
+                float mean = 0.f, peak = 0.f;
+                for (auto& w : hist) { mean += w.density; peak = std::max(peak, w.density); }
+                mean /= (float)hist.size();
+                out += fmt::format("- difficulty windows: {}, mean {:.1f}, peak {:.1f} hazards/1000u\n",
+                                   hist.size(), mean, peak);
+            }
+
+            // Watching is visual, not a euphemism for coordinate analysis.
+            // The draft is live-staged on safe level states when AI playtest
+            // is enabled. Attach a genuinely fresh render to the next turn.
+            bool visibleDraft = m_liveStarted &&
+                m_liveConsumed >= m_accumulatedObjects.size();
+            std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
+            if (visibleDraft && Mod::get()->getSettingValue<bool>("enable-vision") &&
+                toolUse::supportsVision(
+                    provider, getProviderModel(provider))) {
+                auto image = captureLevelSnapshotB64(true);
+                if (!image.empty()) {
+                    m_pendingRenderB64 = std::move(image);
+                    out += "- visual watch: fresh full-level render attached; inspect composition, "
+                           "occlusion, empty stretches and hazard readability.\n";
+                } else {
+                    out += "- visual watch unavailable: the editor could not capture this frame.\n";
+                }
+            } else if (!visibleDraft) {
+                out += "- visual watch unavailable on this pass because replacing a non-empty "
+                       "level cannot be staged early without risking the original.\n";
+            } else {
+                out += "- visual watch unavailable for this model; use the diagnostics above.\n";
+            }
+            out += "This is an advisory automated playtest, not proof of every mode/input. "
+                   "Repair issues, then call playtest_level again as many times as useful. "
+                   "The user can run the real GD playtest before accepting.";
+            r.content = std::move(out);
+            if (m_session)
+                m_session->push(GenSession::Entry::Kind::Status,
+                    fmt::format("AI playtest pass {}: {:.1f}% passable, {} bot death(s)",
+                                m_aiPlaytestPasses, pass.pass_rate * 100.f,
+                                sim.deaths.size()));
             onDone(std::move(r));
             return;
         }
@@ -15040,6 +16451,56 @@ protected:
             onDone(std::move(r));
             return;
         }
+        if (call.name == "level_report") {
+            if (m_accumulatedObjects.size() == 0) {
+                r.content = "(no accepted draft yet — emit your first draft, then "
+                            "call this during EXTEND rounds.)";
+            } else {
+                float groundY = (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y");
+                auto pass = levelcheck::check(m_accumulatedObjects);
+                auto sim  = levelcheck::simulateCube(m_accumulatedObjects, groundY);
+                auto hist = levelcheck::difficultyHistogram(m_accumulatedObjects);
+                float maxX = computeMaxXFromObjects(m_accumulatedObjects);
+                float pct  = maxX > 0.f ? std::min(sim.reachedX / maxX, 1.f) * 100.f : 0.f;
+
+                std::string out = fmt::format(
+                    "LEVEL REPORT:\n"
+                    "• PASSABILITY: {:.1f}% across {} columns{}\n",
+                    pass.pass_rate * 100.f, pass.total_columns,
+                    pass.deaths.empty() ? " — no death zones."
+                    : fmt::format(" — {} death zone(s): ", pass.deaths.size()));
+                if (!pass.deaths.empty()) {
+                    for (size_t k = 0; k < pass.deaths.size() && k < 8; ++k)
+                        out += fmt::format("X={:.0f}-{:.0f} ",
+                                           pass.deaths[k].x_start, pass.deaths[k].x_end);
+                    out += "\n";
+                }
+                if (sim.deaths.empty()) {
+                    out += fmt::format(
+                        "• PHYSICS BOT: cleared, reached X={:.0f} ({:.0f}% of span).\n",
+                        sim.reachedX, pct);
+                } else {
+                    out += fmt::format(
+                        "• PHYSICS BOT: died {} time(s), reached X={:.0f} ({:.0f}% of span):\n",
+                        sim.deaths.size(), sim.reachedX, pct);
+                    for (auto& d : sim.deaths)
+                        out += fmt::format("    X={:.0f} Y={:.0f}: {}\n", d.x, d.y, d.reason);
+                }
+                if (!hist.empty()) {
+                    float mean = 0.f;
+                    for (auto& w : hist) mean += w.density;
+                    mean /= (float)hist.size();
+                    out += fmt::format("• DIFFICULTY (hazards/1000u, mean {:.1f}):\n", mean);
+                    for (auto& w : hist)
+                        out += fmt::format("    X {:>6.0f}-{:<6.0f}: {:.1f}\n",
+                                           w.x0, w.x1, w.density);
+                }
+                out += "Fix any death zones / bot deaths before finalizing.";
+                r.content = std::move(out);
+            }
+            onDone(std::move(r));
+            return;
+        }
         if (call.name == "get_level_region") {
             auto x0r = call.args["x_start"].asInt();
             auto x1r = call.args["x_end"].asInt();
@@ -15052,6 +16513,97 @@ protected:
             float x0 = (float)std::min(x0r.unwrap(), x1r.unwrap());
             float x1 = (float)std::max(x0r.unwrap(), x1r.unwrap());
             r.content = this->buildLevelRegionJson(x0, x1);
+            onDone(std::move(r));
+            return;
+        }
+        if (call.name == "count_objects_in_region") {
+            auto x0r = call.args["x_start"].asInt();
+            auto x1r = call.args["x_end"].asInt();
+            if (!x0r || !x1r) {
+                r.content = "(count_objects_in_region needs integer x_start and x_end)";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+            float x0 = (float)std::min(x0r.unwrap(), x1r.unwrap());
+            float x1 = (float)std::max(x0r.unwrap(), x1r.unwrap());
+            if (!revalidateEditor() || !m_editorLayer->m_objects) {
+                r.content = "(no editor level open)";
+                onDone(std::move(r));
+                return;
+            }
+            const auto& idToName = objectIdToName();
+            std::map<std::string, int> counts;
+            int total = 0;
+            for (auto* raw : CCArrayExt<CCObject*>(m_editorLayer->m_objects)) {
+                auto* gameObj = typeinfo_cast<GameObject*>(raw);
+                if (!gameObj) continue;
+                float x = gameObj->getPositionX();
+                if (x < x0 || x > x1) continue;
+                ++total;
+                std::string typeName = "unknown";
+                auto it = idToName.find(gameObj->m_objectID);
+                if (it != idToName.end()) typeName = it->second;
+                ++counts[typeName];
+            }
+            if (counts.empty()) {
+                r.content = fmt::format(
+                    "X {:.0f}–{:.0f}: 0 objects.", x0, x1);
+                onDone(std::move(r));
+                return;
+            }
+            // Sort descending by count, cap at 12 distinct types.
+            std::vector<std::pair<std::string, int>> rows(counts.begin(), counts.end());
+            std::sort(rows.begin(), rows.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (rows.size() > 12) rows.resize(12);
+            std::string body = fmt::format(
+                "X {:.0f}–{:.0f}: {} object(s), top types:\n", x0, x1, total);
+            for (auto& [name, n] : rows)
+                body += fmt::format("  {}: {}\n", name, n);
+            r.content = std::move(body);
+            onDone(std::move(r));
+            return;
+        }
+        if (call.name == "highlight_region") {
+            auto x0r = call.args["x_start"].asInt();
+            auto x1r = call.args["x_end"].asInt();
+            if (!x0r || !x1r) {
+                r.content = "(highlight_region needs integer x_start and x_end)";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+            float x0 = (float)std::min(x0r.unwrap(), x1r.unwrap());
+            float x1 = (float)std::max(x0r.unwrap(), x1r.unwrap());
+            std::string reason;
+            if (auto rs = call.args["reason"].asString()) {
+                reason = rs.unwrap();
+                if (reason.size() > 80) reason.resize(80);
+            }
+            bool drawn = revalidateEditor() &&
+                drawRegionHighlight(m_editorLayer, x0, x1, reason);
+            // Count the objects in the region for the reply.
+            int total = 0;
+            if (m_editorLayer && m_editorLayer->m_objects) {
+                for (auto* raw : CCArrayExt<CCObject*>(m_editorLayer->m_objects)) {
+                    auto* go = typeinfo_cast<GameObject*>(raw);
+                    if (!go) continue;
+                    float gx = go->getPositionX();
+                    if (gx >= x0 && gx <= x1) ++total;
+                }
+            }
+            if (m_session && !reason.empty())
+                m_session->push(GenSession::Entry::Kind::Status,
+                    fmt::format("AI highlighted X {:.0f}–{:.0f} ({}u span): {}",
+                                x0, x1, x1 - x0, reason));
+            r.content = drawn
+                ? fmt::format("Highlighted X {:.0f}–{:.0f} ({} objects in the "
+                              "band{}) — the user can see it now.",
+                              x0, x1, total,
+                              reason.empty() ? "" : fmt::format("; '{}'", reason))
+                : "(no editor open — cannot draw the highlight, but noted "
+                  "the region in the conversation)";
             onDone(std::move(r));
             return;
         }
@@ -15084,6 +16636,72 @@ protected:
                     r.content = result.empty() ? "(level not found)" : result;
                     onDone(std::move(r));
                 });
+            return;
+        }
+        if (call.name == "search_levels") {
+            auto q = call.args["query"].asString();
+            std::string query = q ? q.unwrap() : "";
+            std::string creator;
+            if (auto c = call.args["creator"].asString()) creator = c.unwrap();
+            bool featured = false;
+            if (auto f = call.args["featured"].asBool()) featured = f.unwrap();
+            this->fireSearchLevels(query, creator, featured,
+                [r, onDone = std::move(onDone)](const std::string& result) mutable {
+                    r.content = result.empty() ? "(no results)" : result;
+                    onDone(std::move(r));
+                });
+            return;
+        }
+        if (call.name == "render_level") {
+            // Attaching the image is the point: the snapshot rides on the NEXT
+            // user turn (vision channel), and the tool result just confirms it.
+            float x0 = 0.f, x1 = 0.f;
+            if (auto v = call.args["x0"].asDouble()) x0 = (float)v.unwrap();
+            if (auto v = call.args["x1"].asDouble()) x1 = (float)v.unwrap();
+            std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
+            if (!toolUse::supportsVision(provider, getProviderModel(provider))) {
+                r.content = "This model can't see images — use get_level_region, "
+                            "count_objects_in_region or level_report instead.";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+            // Fresh replacement over a non-empty editor cannot be live-staged:
+            // until final apply, m_objectLayer is still the OLD level. Never
+            // tell the model that image is its draft. Edit/extend turns may
+            // intentionally inspect the current editor; fresh empty levels are
+            // safe once live placement has staged at least one round.
+            bool hiddenFreshDraft = m_shouldClearLevel
+                && m_accumulatedObjects.size() > 0
+                && (!m_liveStarted || m_liveConsumed < m_accumulatedObjects.size());
+            if (hiddenFreshDraft) {
+                r.content = "The current draft is not visually staged yet, so a "
+                            "render would show the old editor level. Use level_report "
+                            "or get_level_region now; render after the blueprint is "
+                            "staged instead.";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+            // Explicit render requests are always fresh. The ordinary automatic
+            // vision path may cache, but a tool call means the model is checking
+            // changes and must never receive an earlier frame with the same count.
+            std::string b64 = (x1 > x0)
+                ? captureLevelSnapshotB64(x0, x1, true)
+                : captureLevelSnapshotB64(true);
+            if (b64.empty()) {
+                r.content = "Nothing to render yet (no objects placed).";
+                r.isError = true;
+                onDone(std::move(r));
+                return;
+            }
+            m_pendingRenderB64 = std::move(b64);
+            r.content = (x1 > x0)
+                ? fmt::format("Rendered X=[{:.0f},{:.0f}] — the image is "
+                              "attached to this message; look at it.", x0, x1)
+                : "Rendered the whole level — the image is attached to this "
+                  "message; look at it.";
+            onDone(std::move(r));
             return;
         }
         if (call.name == "search_newgrounds") {
@@ -15161,12 +16779,17 @@ protected:
 
         // Unknown tool — explicit error so the model knows to stop.
         r.content = fmt::format("Unknown tool '{}'. Use only: web_search, "
-                                "download_level, search_newgrounds, "
+                                "download_level, search_levels, render_level, "
+                                "search_newgrounds, "
                                 "get_newgrounds_song, analyze_level, "
                                 "get_level_length, search_objects, "
                                 "check_passability, analyze_difficulty_curve, "
-                                "simulate_physics, get_level_region. To reason, "
-                                "write plain text before your tool calls.",
+                                "simulate_physics, playtest_level, level_report, get_level_region, "
+                                "count_objects_in_region, highlight_region, "
+                                "get_bpm, get_waveform, get_ground_y, save_memory, "
+                                "get_memory, set_goal, task_add, task_get, task_mark, "
+                                "task_unmark, verify, goal_done, ask_subagent. "
+                                "To reason, write plain text before your tool calls.",
                                 call.name);
         r.isError = true;
         onDone(std::move(r));
@@ -15176,6 +16799,7 @@ protected:
     // cancel button, restore Generate.
     void resetGenerationUI() {
         m_isGenerating = false;
+        if (m_session) m_session->liveStatus.clear();   // stop the "working..." line
         m_cancelBtn->setVisible(false);
         m_generateBtn->setVisible(true);
         if (!m_isCreatingObjects) m_generateBtn->setEnabled(true);
@@ -15185,6 +16809,7 @@ protected:
     // The portion of onAPISuccess after aiResponse is in hand. Factored out so
     // the tool-use loop can call it once its loop completes.
     void processFinalResponse(std::string aiResponse, const std::string& provider) {
+        setFlowPhase("validating draft");
         resetGenerationUI();
         // Self-critique replies may legitimately contain no level content
         // ("ALL GOOD") — that must fall through to apply, not error out.
@@ -15215,6 +16840,41 @@ protected:
                                     val >= 8 ? "" : " - applying its own fixes"));
                     log::info("Self-review rating: {}/10", val);
                 }
+            }
+        }
+
+        // Until-done refinement: the AI signals completion with "LEVEL
+        // COMPLETE" (checked at a line start so the phrase inside prose or a
+        // comment can't end refinement early). Recorded here, before the
+        // response is mutated by the sanitizers below.
+        if (m_refinementRounds > 0 &&
+            Mod::get()->getSettingValue<bool>("refine-until-done"))
+        {
+            auto cp = aiResponse.find("LEVEL COMPLETE");
+            bool atLineStart = cp != std::string::npos &&
+                (cp == 0 || aiResponse[cp - 1] == '\n' || aiResponse[cp - 1] == '\r');
+            if (atLineStart) {
+                m_refineDeclaredDone = true;
+                log::info("Until-done refinement: AI declared the level complete "
+                          "after {} pass(es)", m_refinementRounds);
+                pushSession(GenSession::Entry::Kind::Status,
+                    fmt::format("AI says the level is finished ({} refinement "
+                                "pass{})", m_refinementRounds,
+                                m_refinementRounds == 1 ? "" : "es"));
+            }
+        }
+
+        // Live-build completion is separate from final refinement completion.
+        // Check the untouched response so fenced/script cleanup cannot hide it.
+        if (m_liveBuildProtocol && !m_liveBuildDeclaredDone) {
+            auto cp = aiResponse.find("BUILD COMPLETE");
+            bool atLineStart = cp != std::string::npos &&
+                (cp == 0 || aiResponse[cp - 1] == '\n' || aiResponse[cp - 1] == '\r');
+            if (atLineStart) {
+                m_liveBuildDeclaredDone = true;
+                log::info("Live build declared complete after {} visible pass(es)",
+                          m_liveBuildPasses + 1);
+                pushSession(GenSession::Entry::Kind::Status, "Live build complete");
             }
         }
 
@@ -15367,7 +17027,10 @@ protected:
                     pushSession(GenSession::Entry::Kind::Assistant, aiResponse);
                 if (m_session) m_session->chatPush(1, aiResponse);  // durable memory
                 log::info("Follow-up turn answered with prose only");
-                if (m_session) m_session->state = GenSession::State::Done;
+                if (m_session) {
+                    m_session->state = GenSession::State::Done;
+                    m_session->flowPhase = "complete";
+                }
                 m_followUpTurn = false;
                 showStatus("Answered", false);
                 return true;
@@ -15380,6 +17043,14 @@ protected:
                     if (wasCritiqueReply) {
                         // "ALL GOOD" (or any prose) — accept the level as-is.
                         log::info("Self-critique: no changes requested by the model");
+                        levelData = matjson::Value::object();
+                        goto critiquePassThrough;
+                    }
+                    // Both completion protocols explicitly allow a marker-only
+                    // reply. Earlier rounds already contain the authoritative
+                    // accumulated level, so an empty delta is valid here.
+                    if (m_accumulatedObjects.size() > 0 &&
+                        (m_refineDeclaredDone || m_liveBuildDeclaredDone)) {
                         levelData = matjson::Value::object();
                         goto critiquePassThrough;
                     }
@@ -15457,6 +17128,7 @@ protected:
                 if (m_session) {
                     m_session->chatPush(1, aiResponse);  // durable memory
                     m_session->state = GenSession::State::Done;
+                    m_session->flowPhase = "complete";
                 }
                 m_followUpTurn = false;
                 m_isGenerating = false;
@@ -15506,16 +17178,49 @@ protected:
             liveStageRound();
         }
 
+        // A watched build grows through genuine model turns. This gate runs
+        // before length/object/passability enforcement so the user first sees
+        // the model's intentional scaffold and section/layer diffs, rather
+        // than one giant final answer followed only by invisible validation.
+        if (m_liveBuildProtocol && !m_followUpTurn) {
+            ++m_liveBuildPasses;
+            if (!m_liveBuildDeclaredDone) {
+                float maxX = computeMaxXFromObjects(m_accumulatedObjects);
+                float secs = maxX / GD_PLAYER_SPEED_1X;
+                toolUse::Message next;
+                next.role = toolUse::MessageRole::User;
+                next.text = fmt::format(
+                    "LIVE BUILD PASS {}. The watched draft now has {} objects, "
+                    "reaches X={:.0f} ({:.1f}s), and the previous diff is already "
+                    "visible in the editor. Add the next meaningful DIFF only: "
+                    "extend one section, deepen one visual layer, improve a "
+                    "transition, or repair an observed weakness. Do not re-emit "
+                    "old objects. Use tools, playtest_level, render_level, or an "
+                    "assistant when they save work. Keep taking distinct passes; "
+                    "time is not a concern. When this watched construction phase "
+                    "is truly ready for final validation, start the reply with "
+                    "BUILD COMPLETE (alone on its line), optionally followed by "
+                    "one last additive EAS/JSON diff.",
+                    m_liveBuildPasses + 1, m_accumulatedObjects.size(), maxX, secs);
+                attachVision(next);
+                m_toolHistory.push_back(std::move(next));
+                setFlowPhase("building live pass");
+                showStatus(fmt::format("Live build pass {}", m_liveBuildPasses + 1));
+                this->doToolRound();
+                return;
+            }
+        }
+
         auto analysisResult = levelData["analysis"].asString();
         if (analysisResult) log::info("AI Analysis: {}", analysisResult.unwrap());
 
         // ── Length enforcement (tool-loop only) ─────────────────────────
         // If the user's "length" setting demands more seconds than the
         // running accumulator currently provides AND we have a tool-loop
-        // history (i.e. we're not on the single-shot/custom path AND not in
+        // history (i.e. we're not on a single-shot path AND not in
         // edit mode), inject an "extend further" user message and run
-        // another tool round. Capped by m_maxExtensionRounds so a stubborn
-        // model can't hang forever.
+        // another tool round. It is cancel-driven: quality/length wins over
+        // elapsed time, and the user always owns the escape hatch.
         // Loop-back eligibility: only a turn that genuinely ran through
         // doToolRound may loop back into it (m_usingToolLoop). Mutation and
         // co-op turns never loop — copilot fixes and "change this" mutations
@@ -15530,12 +17235,12 @@ protected:
             float targetSecs       = m_lengthTarget.minSeconds;
             float targetMinX       = targetSecs * GD_PLAYER_SPEED_1X;
 
-            if (!m_followUpTurn && curSecs < targetSecs && m_extensionRounds < m_maxExtensionRounds) {
+            if (!m_followUpTurn && curSecs < targetSecs) {
                 ++m_extensionRounds;
-                log::info("Length {}/{}s short of {}-{}s target. Extension {} / {}.",
+                log::info("Length {}/{}s short of {}-{}s target. Extension {}.",
                           curSecs, (int)currentMaxX,
                           m_lengthTarget.minSeconds, m_lengthTarget.maxSeconds,
-                          m_extensionRounds, m_maxExtensionRounds);
+                          m_extensionRounds);
 
                 // (assistant turn already recorded once, unconditionally,
                 // near the top of processFinalResponse)
@@ -15549,16 +17254,16 @@ protected:
                     "do not restart or re-emit prior objects. COPY from=x0..x1 "
                     "offset=DX and MIRROR can duplicate earlier sections in one "
                     "line — use them for repeats/variations instead of re-writing "
-                    "objects. Round {}/{}.",
+                    "objects. Continue until the target is met; round {}.",
                     curSecs, currentMaxX,
                     m_lengthTarget.label,
                     m_lengthTarget.minSeconds, m_lengthTarget.maxSeconds,
                     targetMinX, m_lengthTarget.maxSeconds * GD_PLAYER_SPEED_1X,
-                    currentMaxX,
-                    m_extensionRounds, m_maxExtensionRounds);
-                more.imageB64 = visionSnapshotIfSupported();
+                    currentMaxX, m_extensionRounds);
+                attachVision(more);
                 m_toolHistory.push_back(std::move(more));
 
+                setFlowPhase("repairing length");
                 showStatus(fmt::format("Length {}/{}s — asking for more (round {})",
                                        (int)curSecs, (int)targetSecs,
                                        m_extensionRounds));
@@ -15566,31 +17271,19 @@ protected:
                 return;
             }
 
-            if (curSecs < targetSecs) {
-                log::warn("Length still short ({:.1f}s < {:.0f}s target) after {} "
-                          "extension rounds — applying what we have.",
-                          curSecs, targetSecs, m_extensionRounds);
-                Notification::create(
-                    fmt::format("Level is {:.0f}s (target {:.0f}s) — extensions exhausted.",
-                                curSecs, targetSecs),
-                    NotificationIcon::Warning)->show();
-            } else {
-                log::info("Length OK: {:.1f}s ≥ {:.0f}s target.",
-                          curSecs, targetSecs);
-            }
+            log::info("Length OK: {:.1f}s ≥ {:.0f}s target.", curSecs, targetSecs);
         }
 
         // ── Target-object-count enforcement ─────────────────────────────
         // The "target-object-count" generation option: the level must reach
         // at least N total objects; too few and the model is asked to keep
         // building (densify + decorate, not just lengthen). Generation only
-        // (not edits/follow-ups), capped at 12 continuation rounds.
+        // (not edits/follow-ups), cancel-driven rather than round-limited.
         {
             int targetObjs = (int)Mod::get()->getSettingValue<int64_t>("target-object-count");
-            int maxObjs    = (int)Mod::get()->getSettingValue<int64_t>("max-objects");
+            int maxObjs    = (int)EAI_OBJECT_CAP;
             targetObjs = std::min(targetObjs, maxObjs);
-            if (targetObjs > 0 && inToolLoop && !m_followUpTurn
-                && m_targetObjRounds < 12) {
+            if (targetObjs > 0 && inToolLoop && !m_followUpTurn) {
                 int placed = 0;
                 for (size_t i = 0; i < m_accumulatedObjects.size(); ++i) {
                     const auto& e = m_accumulatedObjects[i];
@@ -15599,7 +17292,7 @@ protected:
                 if (placed < targetObjs) {
                     ++m_targetObjRounds;
                     log::info("Object count {}/{} below target - continuation "
-                              "round {}/12", placed, targetObjs, m_targetObjRounds);
+                              "round {}", placed, targetObjs, m_targetObjRounds);
                     toolUse::Message more;
                     more.role = toolUse::MessageRole::User;
                     more.text = fmt::format(
@@ -15609,12 +17302,13 @@ protected:
                         "structure dressing), and extend gameplay where it "
                         "helps - do not re-emit existing objects. Use macros "
                         "and COPY/MIRROR for bulk. Add at least {} objects "
-                        "this round. Round {}/12.",
+                        "this round. Continue until the target is met; round {}.",
                         placed, targetObjs,
                         std::min(targetObjs - placed, 800),
                         m_targetObjRounds);
-                    more.imageB64 = visionSnapshotIfSupported();
+                    attachVision(more);
                     m_toolHistory.push_back(std::move(more));
+                    setFlowPhase("repairing object coverage");
                     showStatus(fmt::format("Objects {}/{} — asking for more "
                                            "(round {})", placed, targetObjs,
                                            m_targetObjRounds));
@@ -15632,8 +17326,7 @@ protected:
         // a warning popup with a "Re-generate" button.
         //
         // The check skips itself when:
-        //   - extension rounds aren't available (single-shot/custom path
-        //     where we can't loop back) — falls through to popup
+        //   - a single-shot path cannot loop back — falls through to popup
         //   - the user already exceeded the max correction rounds (avoid
         //     hanging if the model can't fix it)
         //   - the level is in EDIT mode (player is iterating on an existing
@@ -15691,8 +17384,9 @@ protected:
                     "zones — open them up. Fix round {} of {}.",
                     passResult.pass_rate * 100.f, deathList,
                     m_passabilityFixRounds, MAX_PASSABILITY_FIXES);
-                fix.imageB64 = visionSnapshotIfSupported();
+                attachVision(fix);
                 m_toolHistory.push_back(std::move(fix));
+                setFlowPhase("repairing playability");
                 showStatus(fmt::format("Fixing impassable level (round {})...",
                     m_passabilityFixRounds));
                 this->doToolRound();
@@ -15720,7 +17414,7 @@ protected:
             // follow-ups the MODE of this turn decides, not the stale flag.
             bool editTurn  = m_followUpTurn ? m_followUpMode == 0 : m_editMode;
             bool canLoop   = m_usingToolLoop && !m_mutationMode && !m_coopMode;
-            if (editTarget > 0 && editTurn && canLoop && m_editEnforceRounds < 8) {
+            if (editTarget > 0 && editTurn && canLoop) {
                 int planned = countPlannedEdits();
                 // Surgical follow-ups stay surgical: a small targeted tweak
                 // ("delete the spike at x=300", < 30 edits) stages as-is —
@@ -15732,7 +17426,7 @@ protected:
                 if (planned > 0 && planned < editTarget && !surgical) {
                     ++m_editEnforceRounds;
                     log::info("Edit workload {}/{} below target - continuation "
-                              "round {}/8", planned, editTarget, m_editEnforceRounds);
+                              "round {}", planned, editTarget, m_editEnforceRounds);
                     toolUse::Message more;
                     more.role = toolUse::MessageRole::User;
                     more.text = fmt::format(
@@ -15744,10 +17438,11 @@ protected:
                         "sections, and ADD new geometry and decoration where "
                         "the level is thin. Bulk selectors count every object "
                         "they touch. Do not undo or repeat earlier ops. "
-                        "Round {}/8.",
+                        "Continue until the target is met; round {}.",
                         planned, editTarget, m_editEnforceRounds);
-                    more.imageB64 = visionSnapshotIfSupported();
+                    attachVision(more);
                     m_toolHistory.push_back(std::move(more));
+                    setFlowPhase("expanding edit pass");
                     showStatus(fmt::format("Edit workload {}/{} — asking for "
                                            "more (round {})", planned,
                                            editTarget, m_editEnforceRounds));
@@ -15760,57 +17455,66 @@ protected:
         }
 
         // ── Refinement loop ────────────────────────────────────────────
-        // After the level passes the length + passability checks, optionally
-        // bounce the AI N more times asking it to look at its own work and
-        // polish it. The setting "refinement-rounds" controls how many
-        // (default 3, range 0–10, 0 disables entirely).
+        // After the level passes the length + passability checks, bounce the
+        // AI back asking it to look at its own work and polish it.
         //
-        // Each pass asks the AI for a SMALL incremental polish — accent
-        // objects, better pacing, color cohesion, difficulty curve. Not a
-        // rebuild. The accumulator stacks each pass on top so all earlier
-        // work is preserved.
+        // Two modes:
+        //   "refine-until-done" ON (default) — keep going until the AI itself
+        //     answers "LEVEL COMPLETE". There is no arbitrary pass cap; the
+        //     user can cancel from the session UI at any time.
+        //   OFF — the classic fixed count from "refinement-rounds".
+        //
+        // Each pass asks for a SMALL incremental polish — accent objects,
+        // better pacing, color cohesion, difficulty curve. Not a rebuild. The
+        // accumulator stacks each pass on top so earlier work is preserved.
         //
         // Skipped when: not in a tool-capable loop, in edit mode, or rounds
-        // are exhausted. Also skipped if the user set the count to 0.
+        // are exhausted.
         {
-            int maxRefine = (int)Mod::get()->getSettingValue<int64_t>("refinement-rounds");
+            bool untilDone = Mod::get()->getSettingValue<bool>("refine-until-done");
+            int requestedRefine = (int)Mod::get()->getSettingValue<int64_t>("refinement-rounds");
+            int fixedRefine = std::max(requestedRefine, 0);
             bool canRefine = !m_followUpTurn
                           && m_usingToolLoop
                           && !m_mutationMode && !m_coopMode
                           && !m_editMode
-                          && maxRefine > 0
-                          && m_refinementRounds < maxRefine;
+                          && (untilDone || (fixedRefine > 0 &&
+                              m_refinementRounds < fixedRefine))
+                          // Until-done mode: the AI declares completion by
+                          // answering LEVEL COMPLETE (parsed near the top of
+                          // this function). Until then it keeps polishing.
+                          && !(untilDone && m_refineDeclaredDone);
             if (canRefine) {
                 ++m_refinementRounds;
-                log::info("Refinement pass {}/{}", m_refinementRounds, maxRefine);
+                if (untilDone) {
+                    log::info("Refinement pass {} (until-done; unlimited)",
+                              m_refinementRounds);
+                } else {
+                    log::info("Refinement pass {}/{}", m_refinementRounds, fixedRefine);
+                }
 
                 // Rotating focus per round so the AI doesn't repeat the same
                 // type of polish three times. We cycle through 5 angles and
                 // the model gets a different one each call.
                 static const std::vector<const char*> REFINEMENT_FOCUSES = {
-                    "PACING + OBSTACLE VARIETY: scan for runs of identical objects "
-                    "(e.g. 5 spike-trains in a row) and replace some with orbs, "
-                    "pads, stairs, or platform sections. Fix any spacing < 60 "
-                    "units between obstacles (too cramped) or > 300 units (boring "
-                    "gap).",
+                    "PACING + OBSTACLE VARIETY: inspect repeated input patterns, "
+                    "recovery space and musical phrases. Judge timing tolerance "
+                    "in the actual mode, speed, size and gravity, not a fixed "
+                    "distance between obstacles. Preserve deliberate breathers.",
 
-                    "VISUAL COHESION: add decoration objects (gears, blades, "
-                    "decorative blocks) sparsely to make the level feel built, "
-                    "not random. Ensure color channels are used consistently — "
-                    "if the level has a color palette, route blocks/spikes to "
-                    "those channels with `color=N`.",
+                    "VISUAL COHESION: follow the requested style recipe. Inspect "
+                    "large silhouettes, supporting architecture and palette roles "
+                    "before adding detail. Never use colliding gears or blades "
+                    "as scenery. Preserve the requested layout-only scope.",
 
-                    "DIFFICULTY CURVE: the level should ramp up, not be flat. "
-                    "Easy intro (first 25%), build-up (next 50%), climax (last "
-                    "25% — densest, hardest, with optional speed-up portal). If "
-                    "the level is uniformly easy or uniformly chaotic, add or "
-                    "remove obstacles to create a curve.",
+                    "DIFFICULTY CURVE: introduce, vary and combine mechanics "
+                    "with recovery between demanding phrases. Match the requested "
+                    "difficulty; a climax need not increase speed or input density.",
 
-                    "GAMEPLAY FLOW: verify every gamemode-change portal has a "
-                    "FLOOR or CORRIDOR on the OTHER side leading away from it. "
-                    "Verify orbs are reachable from the ground row (Y=105) with "
-                    "a single jump (Y=135-165). Add small details that make "
-                    "movement feel rhythmic — paired spikes, alternating orbs.",
+                    "GAMEPLAY FLOW: check entry/exit momentum, gravity, size "
+                    "and held-input behavior at portals. Use actual ground and "
+                    "landing heights. Check both players together in dual; do "
+                    "not infer non-cube playability from the cube simulator.",
 
                     "POLISH PASS: scan for anything that feels random — an "
                     "orphaned block in the air, a spike too close to a portal, "
@@ -15827,27 +17531,56 @@ protected:
 
                 toolUse::Message refine;
                 refine.role = toolUse::MessageRole::User;
-                refine.text = fmt::format(
-                    "Refinement pass {} of {}. Look back at the level you just "
-                    "built. It's {:.1f}% passable across {} columns. Don't "
-                    "rebuild it — emit a small polish update that adds, "
-                    "removes, or replaces 10-30 objects/macros to improve it.\n\n"
-                    "FOCUS for this pass: {}\n\n"
-                    "Emit additional EAS lines (or JSON objects/macros) that "
-                    "the mod will ACCUMULATE on top of what you've already "
-                    "produced. To remove or replace an earlier object, you "
-                    "can't 'delete' — but you can override its position with "
-                    "a `TRIGGER move` or hide it with `TRIGGER alpha to=0` "
-                    "targeting its group, OR you can just add new objects that "
-                    "improve the flow around the bad spot. After this pass the "
-                    "level will be applied — make it count.",
-                    m_refinementRounds, maxRefine,
-                    passResult.pass_rate * 100.f, passResult.total_columns,
-                    focus);
-                refine.imageB64 = visionSnapshotIfSupported();
+                if (untilDone) {
+                    // Open-ended mode: the model owns the stop condition, so
+                    // it must explicitly SAY when it is finished.
+                    refine.text = fmt::format(
+                        "Refinement pass {} — keep polishing until the level is "
+                        "genuinely finished. It's {:.1f}% passable across {} "
+                        "columns.\n\n"
+                        "SUGGESTED FOCUS for this pass (override it when the "
+                        "evidence points elsewhere): {}\n\n"
+                        "Emit only the changes justified by your review (EAS lines, "
+                        "JSON objects/macros, or supported edit operations); do not "
+                        "pad a quota or rebuild blindly. Use the tools (especially "
+                        "playtest_level, plus level_report and render_level) to decide "
+                        "what actually needs work. You may inspect, test, repair, "
+                        "decorate, or revise focus on each pass.\n\n"
+                        "WHEN THE LEVEL IS TRULY DONE — playable end to end, "
+                        "paced, decorated, faithful to the request, and you have "
+                        "nothing meaningful left to add — reply with exactly "
+                        "\"LEVEL COMPLETE\" on its own first line and nothing "
+                        "else. That ends refinement and applies the level. Do not "
+                        "say it early: an unfinished level wastes the user's time. "
+                        "You may take as many distinct review/playtest passes as needed.",
+                        m_refinementRounds,
+                        passResult.pass_rate * 100.f, passResult.total_columns,
+                        focus);
+                } else {
+                    refine.text = fmt::format(
+                        "Refinement pass {} of {}. Look back at the level you just "
+                        "built. It's {:.1f}% passable across {} columns. Don't "
+                        "rebuild it — emit only useful additive improvements.\n\n"
+                        "SUGGESTED FOCUS for this pass (override it when the "
+                        "evidence points elsewhere): {}\n\n"
+                        "Emit additional EAS lines (or JSON objects/macros) that "
+                        "the mod will ACCUMULATE on top of what you've already "
+                        "produced. This pass cannot delete earlier draft objects. "
+                        "Do NOT hide bad geometry with alpha: invisible objects "
+                        "still collide. Do not stack replacement hazards on top "
+                        "of existing ones. Report repairs requiring removal "
+                        "rather than claiming an additive patch removed them.",
+                        m_refinementRounds, fixedRefine,
+                        passResult.pass_rate * 100.f, passResult.total_columns,
+                        focus);
+                }
+                attachVision(refine);
                 m_toolHistory.push_back(std::move(refine));
-                showStatus(fmt::format("Refinement pass {}/{}...",
-                    m_refinementRounds, maxRefine));
+                setFlowPhase("refining draft");
+                showStatus(untilDone
+                    ? fmt::format("Refining (pass {})...", m_refinementRounds)
+                    : fmt::format("Refinement pass {}/{}...",
+                                  m_refinementRounds, fixedRefine));
                 this->doToolRound();
                 return;
             }
@@ -15870,32 +17603,30 @@ protected:
                 toolUse::Message decor;
                 decor.role = toolUse::MessageRole::User;
                 decor.text =
-                    "DECORATION PASS. The gameplay skeleton is done — now make "
-                    "it look BUILT, not generated. Work the checklist, every "
-                    "item, whole level:\n"
-                    "1. PALETTE: META bg/ground + COLOR lines for 2-3 custom "
-                    "channels; TRIGGER color at each section boundary so the "
-                    "mood shifts as the level progresses.\n"
-                    "2. GROUND DETAIL: decorative strips/slabs along the floor "
-                    "every 150-300u (vary them); small gears/plants/crystals "
-                    "in dead corners.\n"
-                    "3. BACKGROUND DEPTH: large slow decor (z_layer=-3, dim "
-                    "color) behind the play path every 400-600u — silhouettes "
-                    "make a level feel deep.\n"
-                    "4. STRUCTURE DRESSING: outline existing block clusters "
-                    "with slopes/connectors; glow edges (noglow off) on "
-                    "platform lips the player lands on.\n"
-                    "5. MOTION: TRIGGER pulse on the beat for 1-2 channels; "
-                    "slow TRIGGER rotate on big background gears; one camera "
-                    "zoom or shake at the biggest drop.\n"
-                    "6. NEGATIVE SPACE: any 300u stretch with nothing but "
-                    "floor gets at least one decor element.\n"
-                    "DO NOT add, move, or block anything in the play path — "
-                    "no new spikes, blocks at player height, portals, or "
-                    "orbs. Decor that overlaps the path goes passable + "
-                    "z_layer'd behind. Emit additional EAS lines only.";
-                decor.imageB64 = visionSnapshotIfSupported();
+                    "DECORATION PASS. Follow the requested style and the design "
+                    "workflow, not a universal glow/gear template. If the user "
+                    "requested layout only, reply ALL GOOD with no additions. "
+                    "Otherwise inspect the whole composition: strengthen large "
+                    "shapes, frame structures, establish palette roles, then add "
+                    "selective material detail and accents. Reuse motifs with "
+                    "variation; preserve intentional negative space. Avoid camera "
+                    "shake, flashing or motion unless they serve the request. "
+                    "Do not overwrite existing channel roles or reuse motion "
+                    "groups accidentally. Do not change the gameplay path: no "
+                    "new functional hazards, portals, or orbs. Decorative solids "
+                    "and decorative hazards must both be notouch even "
+                    "when behind the player or transparent. Keep landing edges "
+                    "and hazards readable. Emit additional EAS lines only.";
+                if (Mod::get()->getSettingValue<bool>("enable-vision") &&
+                    toolUse::supportsVision(m_toolProvider, m_toolModel)) {
+                    decor.text +=
+                        " FIRST call render_level, inspect the actual image for "
+                        "empty space and floating gameplay, then make the visual "
+                        "repair. Do not claim it looks good without inspecting it.";
+                }
+                attachVision(decor);
                 m_toolHistory.push_back(std::move(decor));
+                setFlowPhase("adding visual depth");
                 showStatus("Decoration pass...");
                 this->doToolRound();
                 return;
@@ -15924,18 +17655,21 @@ protected:
                     "line of your reply MUST be \"RATING: n/10\" - your "
                     "honest overall score. Judge like a harsh playtester: "
                     "(a) playability - every jump makeable, no blind traps; "
-                    "(b) pacing - density ramps with the difficulty curve; "
+                    "(b) pacing - purposeful phrases and recovery; "
                     "(c) variety - no copy-pasted obstacle spam; "
-                    "(d) decoration - no bare stretches, cohesive palette, "
-                    "background/ground colors set; (e) faithfulness to the "
+                    "(d) decoration - intentional space, cohesive palette, "
+                    "background/ground colors set, supporting architecture around "
+                    "the play path, and distinct section silhouettes; (e) faithfulness to the "
                     "user's request. If you rate 8+, follow the rating line "
                     "with exactly: ALL GOOD. Otherwise follow it with ONLY "
-                    "the fix - 10-40 additional EAS lines/macros repairing "
-                    "EVERY issue you found (fill empty stretches, fix "
-                    "impossible jumps, decorate bare sections, add missing "
-                    "color triggers). No rebuild, no commentary.";
-                crit.imageB64 = visionSnapshotIfSupported();
+                    "safe additive fixes using EAS. Do not add clutter to meet "
+                    "a quota or decorate a layout-only request. Do not claim "
+                    "additions removed collisions, or that a heuristic verified "
+                    "all modes. Report remaining issues needing removal or "
+                    "playtesting. No rebuild.";
+                attachVision(crit);
                 m_toolHistory.push_back(std::move(crit));
+                setFlowPhase("reviewing draft");
                 showStatus("Self-check...");
                 this->doToolRound();
                 return;
@@ -15945,40 +17679,31 @@ protected:
         // ── Goal loop (set_goal tool) ────────────────────────────────────
         // The model declared a goal for itself: keep the loop alive after
         // every answer until it calls goal_done, all other gates permitting
-        // (length/objects/passability fired above and returned early). The
-        // round cap is a hard safety net, and the force-finalize backstop
-        // always wins.
-        if (inToolLoop && m_goalActive && !m_forceFinalize) {
-            if (m_goalRounds < MAX_GOAL_ROUNDS) {
-                ++m_goalRounds;
-                std::string open;
-                for (size_t i = 0; i < m_goalTasks.size(); ++i)
-                    if (!m_goalTasks[i].done)
-                        open += fmt::format("  {}: {}\n", i, m_goalTasks[i].text);
-                toolUse::Message cont;
-                cont.role = toolUse::MessageRole::User;
-                cont.text = fmt::format(
-                    "GOAL LOOP {}/{}: your goal \"{}\" is still active.\n{}"
+        // (length/objects/passability fired above and returned early). There
+        // is no pass cap; Cancel remains available throughout.
+        if (inToolLoop && m_goalActive) {
+            ++m_goalRounds;
+            std::string open;
+            for (size_t i = 0; i < m_goalTasks.size(); ++i)
+                if (!m_goalTasks[i].done)
+                    open += fmt::format("  {}: {}\n", i, m_goalTasks[i].text);
+            toolUse::Message cont;
+            cont.role = toolUse::MessageRole::User;
+            cont.text = fmt::format(
+                    "GOAL LOOP {}: your goal \"{}\" is still active.\n{}"
                     "Continue working toward it now — add objects, refine, use "
-                    "tools, task_mark what you finish. When (and only when) "
+                    "tools, playtest/watch again when useful, and task_mark what "
+                    "you finish. When (and only when) "
                     "verify confirms everything is done, call goal_done and "
                     "then emit your final answer. Reply in the same output "
                     "format as before; additional objects only.",
-                    m_goalRounds, MAX_GOAL_ROUNDS, m_goalText,
+                    m_goalRounds, m_goalText,
                     open.empty() ? "" : fmt::format("Open tasks:\n{}", open));
-                cont.imageB64 = visionSnapshotIfSupported();
-                m_toolHistory.push_back(std::move(cont));
-                announceGoal(fmt::format("Goal round {}", m_goalRounds));
-                this->doToolRound();
-                return;
-            }
-            log::warn("Goal loop hit its {}-round cap — applying what we have",
-                      MAX_GOAL_ROUNDS);
-            Notification::create(
-                fmt::format("Goal loop reached {} rounds — applying the level as-is.",
-                            MAX_GOAL_ROUNDS),
-                NotificationIcon::Warning)->show();
-            m_goalActive = false;
+            attachVision(cont);
+            m_toolHistory.push_back(std::move(cont));
+            announceGoal(fmt::format("Goal round {}", m_goalRounds));
+            this->doToolRound();
+            return;
         }
 
         m_followUpTurn = false;  // staged: next generation's gates fire normally
@@ -16009,6 +17734,13 @@ protected:
         // moment it's done (rating 0 = not yet rated; the AI's self-review
         // score rides along; a second send follows if the user rates).
         autoContributeGeneration(0);
+
+        // Snapshot the authoritative draft digest BEFORE moving the object
+        // accumulator into the apply job. Computing this afterward made the
+        // durable context describe an empty accumulator (or only the old
+        // editor level), so a resumed conversation could forget what it had
+        // just generated.
+        std::string finalWorkingState = workingStateLine();
 
         // MOVE the accumulator into the apply snapshot — this is the final
         // apply (every loop path above returned early), nothing reads the
@@ -16042,6 +17774,7 @@ protected:
         auto metadata = std::make_shared<matjson::Value>(
             hasMetadata ? levelData["level_metadata"] : matjson::Value());
         auto applyResult = [this, metadata, applyObjects]() {
+            setFlowPhase("staging reversible preview");
             // No live editor (user left the level mid-generation): hold the
             // result; the next editor session adopts and stages it.
             if (!revalidateEditor()) {
@@ -16049,6 +17782,7 @@ protected:
                 m_pendingMetadata     = metadata;
                 if (m_session) {
                     m_session->state = GenSession::State::AwaitingEditor;
+                    m_session->flowPhase = "open target level to stage";
                     m_session->push(GenSession::Entry::Kind::Status,
                         "Generation finished — waiting for a level editor to stage into");
                 }
@@ -16108,6 +17842,12 @@ protected:
             }).detach();
         }
         applyResult();
+        // Persist a fresh working-state line now that the draft is final, so a
+        // restart that never gets a follow-up still knows the level's shape.
+        if (m_session) {
+            m_session->workingState = std::move(finalWorkingState);
+            editoraiMarkSessionsDirty();
+        }
     }
 
     // Appends the mutation / co-op framing (with the current level as EAS)
@@ -16194,8 +17934,8 @@ protected:
         // When the user has tool use on (default) and the selected provider
         // supports it, route through the tool-use loop — including edit
         // mode, which needs the analysis tools and enforcement rounds for
-        // heavyweight reworks. The "custom" provider deliberately
-        // never goes through this path: we don't know its tool-use dialect.
+        // heavyweight reworks. Custom endpoints use the OpenAI-compatible
+        // tools dialect and are handled by the same path.
         // Mutation and co-op are ALWAYS additive — the user's level must
         // never be cleared by these flows.
         if (m_mutationMode || m_coopMode) m_shouldClearLevel = false;
@@ -16242,6 +17982,13 @@ protected:
             systemPrompt += m_styleBrief;
             systemPrompt += "\nImitate its palette, object families, and density feel - NOT its layout.";
         }
+        m_contextBaseSystem = systemPrompt;
+        systemPrompt += buildContextEnvelope(
+            m_followUpTurn
+                ? (m_followUpMode == 1 ? "produce a read-only build plan"
+                   : m_followUpMode == 2 ? "answer without changing the level"
+                                         : "edit through a reversible preview")
+                : "create a validated level draft");
 
         // ── Level data context ────────────────────────────────────────────────
         // When the user is NOT clearing the level, we pass the existing objects
@@ -16274,13 +18021,19 @@ protected:
             "Request: {}\n"
             "Difficulty: {} | Style: {} | Length: {}{}\n\n"
             "Plan first (theme → 2-5 sections with X ranges → palette → "
-            "macro choices), then emit EAS (preferred) or JSON.",
+            "macro choices), then emit EAS (preferred) or JSON. Every section "
+            "needs a distinct silhouette and motif, readable gameplay embedded "
+            "inside supporting architecture, a dim background layer, a structural "
+            "mid-layer, and restrained foreground accents. Never leave gameplay "
+            "floating in empty grid space. Reuse 2-3 palette channels throughout "
+            "instead of random colors; make section transitions intentional.",
             prompt, difficulty, style, length, levelDataSection
         );
         fullPrompt += buildBeatGridNote(prompt);
 
         // Seed the conversation log so follow-up chat works for single-shot
-        // generations too (edit mode, tools off, Platinum, custom provider —
+        // generations too (edit mode, tools off, Platinum, or custom provider
+        // with tools disabled —
         // every path that skips the tool loop used to leave m_toolHistory
         // empty, which made sendFollowUp refuse with "No conversation yet").
         // Follow-up turns append to the existing log instead of reseeding.
@@ -16425,22 +18178,15 @@ protected:
             requestBody["model"]         = model;
             requestBody["messages"]      = std::vector<matjson::Value>{sysMsg, userMsg};
             requestBody[spec.field] = spec.limit;
-            // OpenAI o-series reasoning models reject a temperature param.
-            if (!(provider == "openai" && isOSeriesModel(model)))
+            // Custom endpoints get the smallest broadly-compatible request;
+            // temperature is optional and several reasoning-model proxies
+            // reject it with HTTP 400. Hosted reasoning/Codex models do too.
+            if (provider != "custom" && !modelRejectsTemperature(model))
                 requestBody["temperature"] = 0.7;
 
             if (provider == "custom") {
-                url = Mod::get()->getSettingValue<std::string>("custom-provider-url");
-                // The user may paste the base URL (https://api.x.com) or the
-                // full chat-completions URL. If it looks like a base URL (no
-                // /chat or /completions in the path), append the OpenAI-
-                // compatible path.
-                if (url.find("/chat/completions") == std::string::npos
-                    && url.find("/v1/messages") == std::string::npos
-                    && url.find("/completions") == std::string::npos) {
-                    if (!url.empty() && url.back() == '/') url.pop_back();
-                    url += "/v1/chat/completions";
-                }
+                url = resolveCustomChatUrl(
+                    Mod::get()->getSettingValue<std::string>("custom-provider-url"));
                 log::info("Custom provider URL resolved to: {}", url);
             } else {
                 // Same endpoints the tool-use loop hits.
@@ -16469,6 +18215,15 @@ protected:
 
         std::string jsonBody = requestBody.dump();
         log::info("Sending request to {} ({} bytes)", provider, jsonBody.length());
+        // Context construction is complete. Keeping the durable phase at
+        // "building context" for the entire network wait made a healthy slow
+        // model — and especially an SSE error that had not arrived yet — look
+        // like the client was stuck before dispatch.
+        setFlowPhase("waiting for model");
+
+        // Streamed single-shot: same body, decoded live. Falls back silently.
+        if (this->startStream(provider, apiKey, url, requestBody, false))
+            return;
 
         auto request = web::WebRequest();
         request.header("Content-Type", "application/json");
@@ -16513,6 +18268,7 @@ protected:
         }
 
         m_isGenerating = true;
+        setFlowPhase("building context");
         m_transientRetries = 0;
         m_generateBtn->setVisible(false);
         m_cancelBtn->setVisible(true);
@@ -16521,7 +18277,10 @@ protected:
         // surface now, and the spinner only obscured the editor.
         m_generationStartTime = std::chrono::steady_clock::now();
         showStatus("AI is generating...");
-        this->schedule(schedule_selector(AIGeneratorPopup::updateGenerationTimer), 1.0f);
+        // scheduleAlways, not schedule: the overlay path runs this engine
+        // headless (never added to the scene), and CCNode::schedule would
+        // register the tick PAUSED there — no elapsed-time updates at all.
+        scheduleAlways(schedule_selector(AIGeneratorPopup::updateGenerationTimer), 1.0f);
         log::info("=== Generation Request === Prompt: {}", prompt);
 
         if (m_session) {
@@ -16571,6 +18330,8 @@ protected:
         m_extensionRounds = 0;
         m_passabilityFixRounds = 0;
         m_refinementRounds = 0;
+        m_refineDeclaredDone = false;
+        m_aiPlaytestPasses   = 0;
         m_followUpTurn       = false;
         m_followUpMode       = 0;
         m_critiquePending    = false;
@@ -16592,6 +18353,9 @@ protected:
         m_liveShift      = 0.f;
         m_liveShiftValid = false;
         m_liveSkippedOps = matjson::Value::array();
+        m_liveBuildProtocol = false;
+        m_liveBuildDeclaredDone = false;
+        m_liveBuildPasses = 0;
         m_lengthTarget = lengthTargetForSetting(
             Mod::get()->getSettingValue<std::string>("length"));
 
@@ -16761,6 +18525,10 @@ protected:
         // path in processFinalResponse).
         m_accumulatedObjects = matjson::Value::array();
         m_extensionRounds = 0; m_passabilityFixRounds = 0; m_refinementRounds = 0;
+        m_refineDeclaredDone = false;
+        m_liveBuildProtocol = false;
+        m_liveBuildDeclaredDone = false;
+        m_liveBuildPasses = 0;
         m_targetObjRounds = 0;  m_editEnforceRounds = 0;
         m_followUpTurn = false; m_followUpMode = 0;
         m_critiquePending = false; m_critiqueDone = false; m_decorationPassDone = false;
@@ -16783,25 +18551,7 @@ protected:
         // Transient-failure retry runs BEFORE the UI reset so the loading
         // state survives the backoff.
         if (!response.ok()) {
-            int code = response.code();
-            bool transient = code == 429 || code == 500 || code == 502 ||
-                             code == 503 || code == 529;
-            if (transient && m_transientRetries < 1) {
-                ++m_transientRetries;
-                log::warn("Transient HTTP {} on single-shot — retrying once in 2s", code);
-                showStatus(fmt::format("Provider hiccup (HTTP {}) — retrying...", code));
-                // Move-through capture — see retryToolRoundIfTransient for
-                // why the worker thread must never destroy a Ref copy.
-                Ref<AIGeneratorPopup> self = this;
-                std::thread([self = std::move(self)]() mutable {
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                    Loader::get()->queueInMainThread([self = std::move(self)] {
-                        if (!self->m_isGenerating) return;
-                        self->callAPI(self->m_lastCallPrompt, self->m_lastCallKey);
-                    });
-                }).detach();
-                return;
-            }
+            if (this->retrySingleShotIfTransient(response.code(), "")) return;
         }
 
         resetGenerationUI();
@@ -16882,14 +18632,29 @@ protected:
                         isDone = true;
                     }
 
-                    // Also surface any Ollama-level error messages
+                    // Also surface any Ollama-level error messages. Platinum's
+                    // coordinator reports queue timeouts / "no workers" through
+                    // this same field — those are transient, so retry once
+                    // before showing the user a failure.
                     auto errorMsg = lineObj["error"].asString();
                     if (errorMsg) {
-                        onError("Ollama Error",
-                            fmt::format("Ollama reported: {}. Check that the model is installed "
-                                        "(`ollama list`), the server is running (`ollama serve`), and "
-                                        "your selected model name in mod settings matches exactly. ({})",
-                                        errorMsg.unwrap(), autoErrorCode(80, 1)));
+                        std::string em = errorMsg.unwrap();
+                        if (this->retrySingleShotIfTransient(response.code(), em))
+                            return;
+                        bool platinum =
+                            Mod::get()->getSettingValue<bool>("use-platinum");
+                        onError(platinum ? "Platinum Error" : "Ollama Error",
+                            platinum
+                                ? fmt::format("{} — Platinum runs on volunteer "
+                                    "machines, so a busy queue or a slow upstream "
+                                    "shows up as this. Try again, ask for a shorter "
+                                    "level, or switch to a direct provider with your "
+                                    "own key in settings. ({})",
+                                    em, autoErrorCode(80, 1))
+                                : fmt::format("Ollama reported: {}. Check that the model is installed "
+                                    "(`ollama list`), the server is running (`ollama serve`), and "
+                                    "your selected model name in mod settings matches exactly. ({})",
+                                    em, autoErrorCode(80, 1)));
                         return;
                     }
                 }
@@ -17037,6 +18802,7 @@ protected:
 
     void onError(const std::string& title, const std::string& message) {
         resetGenerationUI();
+        cancelStream();              // no live bubble left hanging on failure
         m_followUpTurn    = false;   // turn-scoped flags die with the turn
         m_critiquePending = false;
         // Objects live-placed before the failure need their Accept/Deny —
@@ -17047,6 +18813,7 @@ protected:
         log::error("Generation failed: {}", message);
         if (m_session) {
             m_session->state = GenSession::State::Failed;
+            m_session->flowPhase = "failed";
             m_session->push(GenSession::Entry::Kind::Error,
                             fmt::format("{}: {}", title, message));
         }
@@ -17118,13 +18885,11 @@ public:
         sys.role = toolUse::MessageRole::System;
         sys.text = buildSystemPrompt();
         appendModeContext(sys.text);
+        m_contextBaseSystem = sys.text;
+        sys.text += buildContextEnvelope("resume this conversation");
         m_toolHistory.push_back(std::move(sys));
 
         std::vector<std::pair<int, std::string>> merged;
-        if (!m_session->chatSummary.empty())
-            merged.push_back({0, "(Summary of this conversation's earlier "
-                                 "turns - context, not a new request:)\n"
-                                 + m_session->chatSummary});
         for (auto& m : m_session->chat) {
             if (m.text.empty()) continue;
             if (!merged.empty() && merged.back().first == m.role)
@@ -17231,8 +18996,6 @@ public:
         m_isGenerating       = true;
         m_transientRetries   = 0;
         m_toolIterations     = 0;        // fresh, unbounded round count this turn
-        m_forceFinalize      = false;
-        m_forceFinalizeTries = 0;
         m_editEnforceRounds  = 0;
         m_toolCallSigCounts.clear();
         m_shouldClearLevel = false;      // follow-ups always modify additively
@@ -17323,23 +19086,16 @@ public:
             m_toolHistory.erase(it);
         }
 
-        // Pruned turns aren't lost: the session's rolling summary (chatPush
-        // folds old turns into it) is pinned inside the system message, so
-        // however long the conversation runs, the request stays bounded at
-        // roughly system + summary + the newest turns. Idempotent — the
-        // marker section is replaced, never stacked.
-        if (m_session && !m_session->chatSummary.empty() && !m_toolHistory.empty()
-            && m_toolHistory.front().role == toolUse::MessageRole::System) {
-            static const char* MARK =
-                "\n\n## Conversation summary (earlier turns, condensed)\n";
-            auto& sysText = m_toolHistory.front().text;
-            auto pos = sysText.find(MARK);
-            if (pos != std::string::npos) sysText.resize(pos);
-            sysText += MARK + m_session->chatSummary;
-        }
+        // Replace the complete dynamic envelope in one operation. This keeps
+        // state, intent, goals and the rolling summary synchronized and avoids
+        // the old marker-order bug where refreshing one block could truncate
+        // another.
+        refreshSystemContext(mode == 1 ? "produce a read-only build plan"
+                             : mode == 2 ? "answer without changing the level"
+                                       : "edit the level through a reversible preview");
 
-        // Strict alternation: a prior turn that ended in an error or the
-        // force-finalize give-up can leave the history tail on a user-equivalent
+        // Strict alternation: a prior turn that ended in an error can leave
+        // the history tail on a user-equivalent
         // role (User, or ToolResults which maps to role=user on Claude/Gemini).
         // Pushing this follow-up's User turn after that would be back-to-back
         // user turns → 400. Insert a minimal assistant turn to keep roles
@@ -17361,7 +19117,7 @@ public:
         // Vision models see the CURRENT state of the level with every
         // follow-up — "make the drop section harder" works off the actual
         // picture, not coordinate guesswork.
-        user.imageB64 = visionSnapshotIfSupported();
+        attachVision(user);
         m_toolHistory.push_back(std::move(user));
 
         // Tool-capable providers continue the native tool conversation.
@@ -17539,6 +19295,7 @@ class $modify(AIEditorUI, EditorUI) {
             s_editOpJournal.clear();
             s_editOpDeleted.clear();
             removePlaytestGhost();  // Ref would otherwise leak a dead-scene node
+            removeRegionHighlight();
         }
 
         // Ensure NodeIDs has assigned IDs before we look anything up.
@@ -17814,9 +19571,8 @@ class $modify(AIEditorUI, EditorUI) {
         if (m_fields->m_previewButtonMenu) return;
 
         CCMenu* menu = nullptr;
-        // menuH must cover the Why button at y=135 (menu touch rect =
-        // contentSize) — 140 gives it margin.
-        auto container = buildTrayFrame(162.f, 140.f, &menu);
+        // Five actions, including a real GD playtest before the decision.
+        auto container = buildTrayFrame(190.f, 168.f, &menu);
 
         // Object-count line under the header, with a "why?" info dot that
         // opens the AI's own plan narration for this generation.
@@ -17824,7 +19580,7 @@ class $modify(AIEditorUI, EditorUI) {
             fmt::format("{} objects", s_previewObjects.size()).c_str(), "chatFont.fnt");
         count->limitLabelWidth(70.f, 0.45f, 0.45f);
         count->setColor(ui::TEXT_SECONDARY);
-        count->setPosition({42.f, 135.f});
+        count->setPosition({42.f, 163.f});
         container->addChild(count);
         if (!s_lastAINarration.empty()) {
             auto whySpr = CCSprite::createWithSpriteFrameName("GJ_infoIcon_001.png");
@@ -17832,15 +19588,20 @@ class $modify(AIEditorUI, EditorUI) {
             auto whyBtn = CCMenuItemSpriteExtra::create(whySpr, this,
                 menu_selector(AIEditorUI::onWhyPreview));
             whyBtn->setID("why-btn"_spr);
-            whyBtn->setPosition({86.f, 135.f});
+            whyBtn->setPosition({86.f, 163.f});
             menu->addChild(whyBtn);
         }
-        ui::addGroove(container, 76.f, 48.f, 126.f);
+        ui::addGroove(container, 76.f, 48.f, 154.f);
 
         auto acceptBtn = trayButton("Accept", "GJ_button_01.png",
             menu_selector(AIEditorUI::onAcceptPreview), "accept-btn"_spr);
-        acceptBtn->setPosition({48.f, 98.f});
+        acceptBtn->setPosition({48.f, 126.f});
         menu->addChild(acceptBtn);
+
+        auto playBtn = trayButton("Play", "GJ_button_04.png",
+            menu_selector(AIEditorUI::onPlayPreview), "play-btn"_spr);
+        playBtn->setPosition({48.f, 98.f});
+        menu->addChild(playBtn);
 
         auto editBtn = trayButton("Edit", "GJ_button_02.png",
             menu_selector(AIEditorUI::onEditPreview), "edit-btn"_spr);
@@ -17858,11 +19619,27 @@ class $modify(AIEditorUI, EditorUI) {
         menu->addChild(exportBtn);
 
         auto winSize = CCDirector::sharedDirector()->getWinSize();
-        container->setPosition({70.f, winSize.height - 92.f});
+        container->setPosition({70.f, winSize.height - 100.f});
         this->addChild(container, 1000);
 
         m_fields->m_previewButtonMenu = container;
-        log::info("EditorAI: preview accept/deny/edit buttons shown");
+        log::info("EditorAI: preview accept/play/edit/deny buttons shown");
+    }
+
+    void onPlayPreview(CCObject*) {
+        if (!s_inPreviewMode || !m_editorLayer) return;
+        removePlaytestGhost();
+        if (m_fields->m_previewButtonMenu)
+            m_fields->m_previewButtonMenu->setVisible(false);
+        for (auto it = genSessions().rbegin(); it != genSessions().rend(); ++it) {
+            if (*it && (*it)->state == GenSession::State::Staged) {
+                (*it)->push(GenSession::Entry::Kind::Status,
+                            "User started a real GD playtest of the staged preview");
+                break;
+            }
+        }
+        log::info("EditorAI: user playtesting staged preview before decision");
+        m_editorLayer->onPlaytest();
     }
 
     void showDoneButton() {
@@ -17894,6 +19671,7 @@ class $modify(AIEditorUI, EditorUI) {
 
     void onAcceptPreview(CCObject*) {
         removePlaytestGhost();
+        removeRegionHighlight();   // a fresh generation replaces any AI highlight
         log::info("EditorAI: accepting {} preview objects", s_previewObjects.size());
 
         // Before accepting new objects, check if the user edited the PREVIOUS
@@ -17918,7 +19696,10 @@ class $modify(AIEditorUI, EditorUI) {
         // Region rebuild: the replacement was accepted — remove the ORIGINAL
         // objects inside the marked range. Preview objects are exempt (the
         // pointer set), so the freshly accepted replacement survives. The
-        // deletion itself is not in the undo batch (v1 limitation, logged).
+        // Preserve the originals as a normal multi-delete undo record before
+        // removing them. The accepted additions are a separate Paste record,
+        // so Ctrl+Z first removes the replacement and a second Ctrl+Z restores
+        // the old region — no accepted AI operation is irreversible.
         if (s_pendingRegionDelete.active && m_editorLayer && m_editorLayer->m_objects) {
             std::unordered_set<GameObject*> previewSet;
             previewSet.reserve(s_previewObjects.size());
@@ -17933,10 +19714,17 @@ class $modify(AIEditorUI, EditorUI) {
                 if (ox >= s_pendingRegionDelete.x0 && ox <= s_pendingRegionDelete.x1)
                     toDelete.push_back(gameObj);
             }
+            if (!toDelete.empty() && m_editorLayer->m_undoObjects) {
+                auto deletionBatch = CCArray::create();
+                for (auto* obj : toDelete) deletionBatch->addObject(obj);
+                if (auto* undo = UndoObject::createWithArray(
+                        deletionBatch, UndoCommand::DeleteMulti))
+                    m_editorLayer->m_undoObjects->addObject(undo);
+            }
             for (auto* obj : toDelete)
                 m_editorLayer->removeObject(obj, true);
             log::info("Region rebuild: deleted {} original objects in X=[{:.0f},{:.0f}] "
-                      "(not undoable - the added batch is)",
+                      "(recorded as a multi-delete undo step)",
                       toDelete.size(), s_pendingRegionDelete.x0, s_pendingRegionDelete.x1);
             s_pendingRegionDelete = {};
         }
@@ -18034,6 +19822,7 @@ class $modify(AIEditorUI, EditorUI) {
 
     void onDenyPreview(CCObject*) {
         removePlaytestGhost();
+        removeRegionHighlight();
         s_pendingRegionDelete = {};  // replacement denied - originals stay
         // Undo every AI edit op: moved objects return, soft-deleted ones
         // reappear, restyles revert.
@@ -18072,11 +19861,18 @@ class $modify(AIEditorUI, EditorUI) {
         Notification::create("Objects denied and removed.", NotificationIcon::Warning)->show();
 
         s_lastWasAccepted = false;
+        for (auto it = genSessions().rbegin(); it != genSessions().rend(); ++it) {
+            if (*it && (*it)->state == GenSession::State::Staged) {
+                (*it)->flowPhase = "denied";
+                break;
+            }
+        }
         showRatingIfEnabled();
     }
 
     void onEditPreview(CCObject*) {
         removePlaytestGhost();
+        removeRegionHighlight();
         log::info("EditorAI: entering edit mode for {} preview objects", s_previewObjects.size());
 
         // The user is taking over from here — keep the AI's edit ops (they
@@ -18100,6 +19896,13 @@ class $modify(AIEditorUI, EditorUI) {
             m_editorLayer->m_editorUI->updateButtons();
 
         Notification::create("Edit the objects, then press Done.", NotificationIcon::Info)->show();
+        for (auto it = genSessions().rbegin(); it != genSessions().rend(); ++it) {
+            if (*it && (*it)->state == GenSession::State::Staged) {
+                (*it)->flowPhase = "manual editing";
+                editoraiMarkSessionsDirty();
+                break;
+            }
+        }
     }
 
     void onDoneEditing(CCObject*) {
@@ -18127,6 +19930,12 @@ class $modify(AIEditorUI, EditorUI) {
         Notification::create("Edits saved!", NotificationIcon::Success)->show();
 
         s_lastWasAccepted = true;
+        for (auto it = genSessions().rbegin(); it != genSessions().rend(); ++it) {
+            if (*it && (*it)->state == GenSession::State::Staged) {
+                (*it)->flowPhase = "complete";
+                break;
+            }
+        }
         showRatingIfEnabled();
     }
 };
@@ -18139,15 +19948,17 @@ static void showPreviewButtonsOnEditorUI(EditorUI* ui) {
 
 // Shows the rating popup if the setting is enabled.
 static void showRatingIfEnabled() {
-    if (!Mod::get()->getSettingValue<bool>("enable-rating")) return;
-    // Rating now lives inline in the overlay's session view (the old
-    // RatingPopup is retired). Flag the latest session and nudge.
+    bool ratingEnabled = Mod::get()->getSettingValue<bool>("enable-rating");
+    // Completion is independent of the optional rating UI. Previously this
+    // function returned early when ratings were disabled, leaving accepted or
+    // denied sessions stuck in Staged forever.
     for (auto it = genSessions().rbegin(); it != genSessions().rend(); ++it) {
         if ((*it)->state == GenSession::State::Staged ||
             (*it)->state == GenSession::State::Done) {
             auto& s = *it;
-            s->needsRating = true;
+            s->needsRating = ratingEnabled;
             s->state = GenSession::State::Done;
+            s->flowPhase = s_lastWasAccepted ? "accepted" : "denied";
             // Snapshot the feedback data NOW, while the s_last* globals
             // still describe this generation — by rating time a newer
             // generation may have overwritten them.
@@ -18159,9 +19970,11 @@ static void showRatingIfEnabled() {
             s->fbEditedObjectsJson = s_lastEditedObjectsJson;
             s->fbEditSummary       = s_lastEditSummary;
             s->fbAccepted          = s_lastWasAccepted;
+            editoraiMarkSessionsDirty();
             break;
         }
     }
+    if (!ratingEnabled) return;
     Notification::create(
 #ifdef GEODE_IS_MOBILE
         "Rate this generation in the AI panel (AI bubble)",
@@ -18230,20 +20043,16 @@ class $modify(EditorPauseLayer) {
 
 class $modify(AILevelEditorLayer, LevelEditorLayer) {
     void onPlaytest() {
-        // Block playtest while ghost objects are awaiting accept/deny/edit
-        if (s_inPreviewMode || s_inEditMode) {
-            Notification::create(
-                s_inEditMode
-                    ? "Press Done to finish editing first!"
-                    : "Accept, edit, or deny the AI preview first!",
-                NotificationIcon::Warning
-            )->show();
-            return;
-        }
+        // Preview objects are real staged GameObjects, so the safest and most
+        // faithful review is Geometry Dash's own playtest. Keep the decision
+        // pending and merely hide its tray until playtest ends.
+        if (s_inPreviewMode) removePlaytestGhost();
         LevelEditorLayer::onPlaytest();
         if (auto editorUI = this->m_editorUI) {
             if (auto btn = getAIButton(editorUI))
                 btn->setVisible(false);
+            if (auto previewMenu = editorUI->getChildByID("ai-preview-menu"_spr))
+                previewMenu->setVisible(false);
         }
     }
 
@@ -18274,18 +20083,37 @@ class $modify(AILevelEditorLayer, LevelEditorLayer) {
 static bool s_bypassCharFilter = false;
 static bool s_bypassCharLimit  = false;
 
-// Tracks whether ANY GD text box currently has keyboard focus — the overlay
+// Tracks the GD text box that currently has keyboard focus — the overlay
 // hotkey reads this so 'E' types normally while editing text.
-static int s_gdTextInputFocusCount = 0;
-bool editoraiIsGDTextInputActive() { return s_gdTextInputFocusCount > 0; }
+//
+// A validated Ref, NOT an attach/detach counter: GD destroys focused inputs
+// on scene changes without ever firing the detach callback, so a counter
+// leaks upward and sticks at "active" forever — which silently disabled the
+// panel hotkey for the rest of the session (the "E does nothing / E goes to
+// the editor" bug). With a Ref, a focused input that died without detaching
+// simply fails the parent/isRunning check and the guard self-heals.
+static Ref<CCTextInputNode> s_gdFocusedTextInput;
+bool editoraiIsGDTextInputActive() {
+    CCTextInputNode* n = s_gdFocusedTextInput;
+    if (!n || !n->getParent() || !n->isRunning()) return false;
+    // Visibility walk: GD's 2.2 editor keeps a HIDDEN text field IME-attached
+    // while the editor is open — an input the user cannot see is not one they
+    // are typing in, and treating it as focused made the overlay hotkey dead
+    // in the main editor (while working fine in the pause menu, which drops
+    // the attachment). Real dialogs (level name, descriptions, search) are
+    // visible through their whole parent chain and still block the hotkey.
+    for (CCNode* p = n; p; p = p->getParent())
+        if (!p->isVisible()) return false;
+    return true;
+}
 
 class $modify(BypassCCTextInputNode, CCTextInputNode) {
     bool onTextFieldAttachWithIME(cocos2d::CCTextFieldTTF* tField) {
-        ++s_gdTextInputFocusCount;
+        s_gdFocusedTextInput = this;
         return CCTextInputNode::onTextFieldAttachWithIME(tField);
     }
     bool onTextFieldDetachWithIME(cocos2d::CCTextFieldTTF* tField) {
-        if (s_gdTextInputFocusCount > 0) --s_gdTextInputFocusCount;
+        if (s_gdFocusedTextInput == this) s_gdFocusedTextInput = nullptr;
         return CCTextInputNode::onTextFieldDetachWithIME(tField);
     }
 
@@ -19121,12 +20949,125 @@ bool editoraiGetBool(const char* id) {
 void editoraiSetBool(const char* id, bool v) {
     Mod::get()->setSettingValue<bool>(id, v);
 }
-int64_t editoraiGetInt(const char* id) {
-    return Mod::get()->getSettingValue<int64_t>(id);
-}
-void editoraiSetInt(const char* id, int64_t v) {
-    Mod::get()->setSettingValue<int64_t>(id, v);
-}
+ int64_t editoraiGetInt(const char* id) {
+     return Mod::get()->getSettingValue<int64_t>(id);
+ }
+ void editoraiSetInt(const char* id, int64_t v) {
+     Mod::get()->setSettingValue<int64_t>(id, v);
+ }
+
+ // ── Test-connection bridge (Settings → provider row) ─────────────────────────
+ // Mirrors AISettingsPopup::runValidate: a real authenticated HTTP probe of
+ // the current provider, with the result polled by the overlay via
+ // editoraiTestStatus(). One probe at a time.
+ static std::string s_testStatus;
+ static bool       s_testInFlight = false;
+ static async::TaskHolder<web::WebResponse> s_testTask;
+
+ void editoraiTestProvider() {
+     if (s_testInFlight) return;
+     std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
+     std::string url;
+     bool postCustom = false;
+     if      (provider == "ollama")      url = getOllamaUrl() + "/api/tags";
+     else if (provider == "lm-studio")   url = Mod::get()->getSettingValue<std::string>("lm-studio-url") + "/v1/models";
+     else if (provider == "llama-cpp")   url = Mod::get()->getSettingValue<std::string>("llama-cpp-url") + "/v1/models";
+     else if (provider == "openai")      url = "https://api.openai.com/v1/models";
+     else if (provider == "claude")      url = "https://api.anthropic.com/v1/models";
+     else if (provider == "ministral")   url = "https://api.mistral.ai/v1/models";
+     else if (provider == "deepseek")    url = "https://api.deepseek.com/v1/models";
+     else if (provider == "groq")        url = "https://api.groq.com/openai/v1/models";
+     else if (provider == "huggingface") url = "https://huggingface.co/api/whoami-v2";
+     else if (provider == "openrouter")  url = "https://openrouter.ai/api/v1/auth/key";
+     else if (provider == "gemini")      url = "https://generativelanguage.googleapis.com/v1beta/models";
+     else if (provider == "custom") {
+         url = resolveCustomChatUrl(
+             Mod::get()->getSettingValue<std::string>("custom-provider-url"));
+         if (url.empty() || url == "/v1/chat/completions") {
+             s_testStatus = "Enter a custom provider URL first.";
+             return;
+         }
+         if (Mod::get()->getSettingValue<std::string>("custom-provider-model").empty()) {
+             s_testStatus = "Enter the custom provider's model name first.";
+             return;
+         }
+         // Many OpenAI-compatible servers implement chat completions but not
+         // GET /models. Probe the exact generation path with a one-token reply
+         // so Test connection cannot report a false failure for a valid server.
+         postCustom = true;
+     }
+     else if (provider == "manual")      { s_testStatus = "Manual mode: copy-paste, no network."; return; }
+     else { s_testStatus = "No test endpoint for this provider."; return; }
+
+     s_testStatus = "Testing...";
+     s_testInFlight = true;
+     auto req = web::WebRequest();
+     req.timeout(std::chrono::seconds(10));
+     applyProviderAuth(req, provider, getProviderApiKey(provider));
+     if (postCustom) {
+         auto msg = matjson::Value::object();
+         msg["role"] = "user";
+         msg["content"] = "Reply OK";
+         auto body = matjson::Value::object();
+         body["model"] = Mod::get()->getSettingValue<std::string>("custom-provider-model");
+         body["messages"] = std::vector<matjson::Value>{msg};
+         body["max_tokens"] = 1;
+         req.header("Content-Type", "application/json");
+         req.bodyString(body.dump());
+     }
+     auto finish = [](web::WebResponse resp) {
+         s_testStatus = resp.ok()
+             ? "✓ Connected."
+             : fmt::format("✗ HTTP {}. Check URL, auth template, and server API compatibility.", resp.code());
+         s_testInFlight = false;
+     };
+     if (postCustom) s_testTask.spawn(req.post(url), finish);
+     else            s_testTask.spawn(req.get(url),  finish);
+ }
+
+ std::string editoraiTestStatus() {
+     return s_testStatus;
+ }
+
+ // ── Local-backend auto-detect (Settings → provider picker) ──────────────────
+ // Probes the default ports for a running Ollama / LM Studio / llama.cpp once,
+ // so the provider picker can tag what's actually installed. Cheap localhost
+ // calls with a short timeout; results are read back with
+ // editoraiDetectedBackends() (comma-joined names, main thread only).
+ static std::vector<std::string> s_detectedBackends;
+ static bool       s_detectStarted = false;
+ static int        s_detectPending = 0;
+ static async::TaskHolder<web::WebResponse> s_detectTasks[3];
+
+ void editoraiProbeLocalBackends() {
+     if (s_detectStarted) return;
+     s_detectStarted = true;
+     struct Probe { const char* name; const char* url; };
+     static const Probe kProbes[3] = {
+         {"ollama",    "http://localhost:11434/api/tags"},
+         {"lm-studio", "http://localhost:1234/v1/models"},
+         {"llama-cpp", "http://localhost:8080/v1/models"},
+     };
+     for (int i = 0; i < 3; ++i) {
+         ++s_detectPending;
+         auto req = web::WebRequest();
+         req.timeout(std::chrono::seconds(2));
+         s_detectTasks[i].spawn(req.get(kProbes[i].url),
+             [name = std::string(kProbes[i].name)](web::WebResponse resp) {
+                 if (resp.ok()) s_detectedBackends.push_back(name);
+                 --s_detectPending;
+             });
+     }
+ }
+
+ std::string editoraiDetectedBackends() {
+     std::string out;
+     for (auto& b : s_detectedBackends) {
+         if (!out.empty()) out += ",";
+         out += b;
+     }
+     return out;
+ }
 
 // ── Saved-value bridge (persists overlay inputs / theme across restarts) ───
 std::string editoraiGetSavedStr(const char* key, const std::string& def) {
@@ -19187,7 +21128,51 @@ bool editoraiShareSession(const std::shared_ptr<GenSession>& session,
                           : "Share failed (collector unreachable) - try again later",
                 resp.ok() ? NotificationIcon::Success
                           : NotificationIcon::Warning)->show();
+         });
+    return true;
+}
+
+// Export a session's full transcript to a text file in the mod save dir
+// (background write — never blocks the frame). For debugging or sharing a
+// conversation with the AI's reasoning visible.
+bool editoraiExportSession(const std::shared_ptr<GenSession>& session,
+                           std::string& err) {
+    if (!session) { err = "No session."; return false; }
+    std::string text;
+    text += fmt::format("EditorAI session #{} — {}\n", session->id,
+                        session->title.empty() ? "(untitled)" : session->title);
+    text += fmt::format("State: {}\n", session->stateName());
+    if (!session->flowPhase.empty())
+        text += fmt::format("Flow phase: {}\n", session->flowPhase);
+    if (!session->workingState.empty())
+        text += "\n" + session->workingState + "\n";
+    text += "\n";
+    for (auto& e : session->transcript) {
+        const char* tag = "?";
+        switch (e.kind) {
+            case GenSession::Entry::Kind::User:       tag = "USER";    break;
+            case GenSession::Entry::Kind::Assistant:  tag = "AI";      break;
+            case GenSession::Entry::Kind::Thinking:   tag = "THINKING";break;
+            case GenSession::Entry::Kind::ToolCall:   tag = "TOOL";    break;
+            case GenSession::Entry::Kind::ToolResult: tag = "RESULT";  break;
+            case GenSession::Entry::Kind::Status:     tag = "STATUS";  break;
+            case GenSession::Entry::Kind::Error:      tag = "ERROR";   break;
+        }
+        text += fmt::format("[{}] {}\n", tag, e.text);
+    }
+    auto path = Mod::get()->getSaveDir() / fmt::format("session-{}.txt", session->id);
+    std::thread([path, text = std::move(text)] {
+        static std::mutex s_exportMutex;
+        std::lock_guard lock(s_exportMutex);
+        auto res = utils::file::writeString(path, text);
+        Loader::get()->queueInMainThread([ok = res.isOk()] {
+            Notification::create(
+                ok ? "Session exported to session-<id>.txt"
+                   : "Failed to export session (see logs)",
+                ok ? NotificationIcon::Info : NotificationIcon::Error)->show();
         });
+    }).detach();
+    err = "Export queued for " + utils::string::pathToString(path);
     return true;
 }
 

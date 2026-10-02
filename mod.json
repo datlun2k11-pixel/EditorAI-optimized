@@ -64,27 +64,13 @@
    "name": "Length",
    "description": "Approximate level length. Canned values: short / medium / long / xl / xxl. Free-form text is also accepted."
   },
-  "max-objects": {
-   "type": "int",
-   "default": 500,
-   "min": 10,
-   "max": 1000000,
-   "name": "Max Objects",
-   "description": "Upper bound on objects the AI may emit per generation."
-  },
   "target-object-count": {
    "type": "int",
    "default": 0,
    "min": 0,
    "max": 20000,
    "name": "Target Objects",
-   "description": "Minimum total objects a generation must reach. The AI is asked to continue until it gets there (or extension rounds run out). <cg>0 = off</c>. Capped by Max Objects."
-  },
-  "example-level-ids": {
-   "type": "string",
-   "default": "",
-   "name": "Example Level IDs",
-   "description": "Up to 5 comma-separated GD level IDs the AI downloads as style references at the start of every generation (requires AI tools). Leave empty for none."
+   "description": "Minimum total objects a generation must reach. The AI is asked to continue until it gets there (or extension rounds run out). <cg>0 = off</c>."
   },
   "_placement-header": {
    "type": "title",
@@ -124,6 +110,17 @@
    "type": "title",
    "name": "AI Behavior"
   },
+  "quality-profile": {
+   "type": "string",
+   "default": "premium",
+   "name": "Quality Preset",
+   "description": "One-click presets for speed versus quality. <cg>Premium</c> is the default and keeps working until the AI says the level is done. Choose Balanced or Fast when you want less work.",
+   "one-of": [
+    "fast",
+    "balanced",
+    "premium"
+   ]
+  },
   "enable-ai-tools": {
    "type": "bool",
    "default": true,
@@ -144,11 +141,29 @@
   },
   "refinement-rounds": {
    "type": "int",
-   "default": 3,
+   "default": 5,
    "min": 0,
    "max": 10,
-   "name": "Refinement Rounds",
-   "description": "How many self-review passes the AI runs after the initial draft. 0 disables refinement."
+   "name": "Fixed Refinement Rounds",
+   "description": "Number of self-review passes when <cy>Refine Until Done</c> is off. This setting is ignored in unlimited mode; 0 disables fixed refinement."
+  },
+  "refine-until-done": {
+   "type": "bool",
+   "default": true,
+   "name": "Refine Until Done",
+   "description": "Instead of a fixed number of polish passes, keep refining until the AI itself reports the level is finished. There is no pass cap; you can cancel at any time."
+  },
+  "ai-playtest": {
+   "type": "bool",
+   "default": true,
+   "name": "AI Playtest & Watch",
+   "description": "Let the AI repeatedly run simulated playtests and inspect fresh level renders between passes. Drafts are staged early only when doing so cannot overwrite an existing level."
+  },
+  "stream-responses": {
+   "type": "bool",
+   "default": true,
+   "name": "Stream Responses",
+   "description": "Show the AI's reply <cg>as it is written</c>, token by token, formatted live in the chat. Falls back to waiting for the whole reply if the provider or platform can't stream."
   },
   "enable-self-critique": {
    "type": "bool",
@@ -176,23 +191,9 @@
   },
   "subagent-provider": {
    "type": "string",
-   "default": "",
+   "default": "same",
    "name": "Subagent Provider",
-   "description": "Optional second model the main AI can consult via the ask_subagent tool (e.g. a big cloud model asking your local Ollama for object suggestions, or vice versa). Empty disables the tool.",
-   "one-of": [
-    "",
-    "gemini",
-    "claude",
-    "openai",
-    "openrouter",
-    "ministral",
-    "huggingface",
-    "deepseek",
-    "groq",
-    "ollama",
-    "lm-studio",
-    "llama-cpp"
-   ]
+   "description": "The consultant used by ask_subagent. <cy>same</c> copies the main provider and model. <cy>platinum</c> uses the free community Ollama network independently of the main provider."
   },
   "subagent-model": {
    "type": "string",
@@ -425,6 +426,12 @@
    "default": true,
    "name": "Check For Updates",
    "description": "Once a day, check GitHub for a newer EditorAI release and offer a one-click install. Nothing installs without your confirmation."
+  },
+  "hotkey-priority": {
+   "type": "bool",
+   "default": true,
+   "name": "Hotkey Priority",
+   "description": "The panel hotkey wins over the editor's own keybinds and other mods - the key is consumed by EditorAI. Text boxes still receive typing normally. Turn off to let the key also trigger whatever else is bound to it."
   },
   "ui-anim-speed": {
    "name": "UI Animation Speed",
