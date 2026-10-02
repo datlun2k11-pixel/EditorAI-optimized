@@ -217,6 +217,12 @@
    "name": "Gemini API Key",
    "description": "From Google AI Studio. Stays on this device in Geode save data."
   },
+  "disable-thinking": {
+   "type": "bool",
+   "default": true,
+   "name": "Disable Thinking",
+   "description": "For Gemini Flash models, skip the thinking/reasoning phase for much faster (but shallower) answers. Pro models cannot disable thinking and ignore this. Gemini only; takes effect on the next generation."
+  },
   "_provider-claude": {
    "type": "title",
    "name": "Provider — Claude"
@@ -319,7 +325,7 @@
   },
   "groq-model": {
    "type": "string",
-   "default": "llama-3.3-70b-versatile",
+   "default": "openai/gpt-oss-120b",
    "name": "Groq Model",
    "description": "Pick a preset or type any Groq model id in the in-mod Provider tab. Use <cg>Fetch model list</c> to pull the live list."
   },

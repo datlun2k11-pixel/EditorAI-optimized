@@ -1347,6 +1347,15 @@ inline std::string urlFor(const std::string& provider, const std::string& model)
     return "";
 }
 
+// "flash" substring check, case-insensitive — model ids are typed by hand
+// ("gemini-2.5-flash", "Gemini-2.5-Flash", ...) and a case-sensitive match
+// would silently leave thinking enabled (slow) on Flash models.
+inline bool isGeminiFlashModel(const std::string& model) {
+    std::string low = model;
+    for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+    return low.find("flash") != std::string::npos;
+}
+
 // ── OpenAI-compatible: tools + messages array, role=tool for tool results ─
 // Provider is needed so we can branch on Ollama, which has two divergences
 // from the rest of the OpenAI-compat family: (1) it streams by default, so
@@ -1965,10 +1974,11 @@ inline matjson::Value buildGeminiRequest(const std::vector<Message>& history,
     auto genConfig = matjson::Value::object();
     genConfig["temperature"]     = 0.7;
     genConfig["maxOutputTokens"] = 32768;
-    // Disable the thinking budget for latency — but ONLY on Flash models.
-    // Pro models cannot disable thinking and reject thinkingBudget: 0 with
-    // HTTP 400 INVALID_ARGUMENT.
-    if (model.find("flash") != std::string::npos) {
+    // Disable the thinking budget for latency — but ONLY on Flash models and
+    // only when the user left "Disable Thinking" on. Pro models cannot
+    // disable thinking and reject thinkingBudget: 0 with HTTP 400.
+    if (isGeminiFlashModel(model)
+        && geode::Mod::get()->getSettingValue<bool>("disable-thinking")) {
         auto thinkConfig = matjson::Value::object();
         thinkConfig["thinkingBudget"] = 0;
         genConfig["thinkingConfig"] = thinkConfig;
@@ -3125,11 +3135,20 @@ static std::string resolveCustomChatUrl(std::string url) {
     size_t first = 0;
     while (first < url.size() && std::isspace((unsigned char)url[first])) ++first;
     if (first) url.erase(0, first);
+    // Pasted "localhost:1234" with no scheme never reaches the server (the
+    // request fails locally, looking like a freeze) — assume plain http.
+    if (!url.empty() && url.find("://") == std::string::npos)
+        url = "http://" + url;
     if (url.find("/chat/completions") == std::string::npos
         && url.find("/v1/messages") == std::string::npos
         && url.find("/completions") == std::string::npos) {
         if (!url.empty() && url.back() == '/') url.pop_back();
-        url += "/v1/chat/completions";
+        // A bare ".../v1" base already carries the version prefix — don't
+        // double it into ".../v1/v1/chat/completions" (404 on every server).
+        if (url.size() >= 3 && url.compare(url.size() - 3, 3, "/v1") == 0)
+            url += "/chat/completions";
+        else
+            url += "/v1/chat/completions";
     }
     return url;
 }
@@ -8456,9 +8475,13 @@ protected:
         // Hosted providers: a free-text field (type ANY model id) plus a row
         // of tappable presets. Type-or-pick — every provider now accepts a
         // custom model id, not just the presets.
-        if (p == "gemini")
+        if (p == "gemini") {
             addModelChooser("gemini-model", "type any Gemini model id",
                 {"gemini-3-flash","gemini-3-pro","gemini-2.5-flash","gemini-2.5-pro"});
+            addToggle("Disable thinking", "disable-thinking",
+                "Skips the thinking phase on Flash models: much faster, shallower.\n\n"
+                "Pro models can't disable thinking and ignore this.");
+        }
         else if (p == "claude")
             addModelChooser("claude-model", "type any Claude model id",
                 {"claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5"});
@@ -8474,8 +8497,7 @@ protected:
                 {"deepseek-chat","deepseek-reasoner","deepseek-coder"});
         else if (p == "groq")
             addModelChooser("groq-model", "type any Groq model id",
-                {"llama-3.3-70b-versatile","llama-3.1-8b-instant",
-                 "openai/gpt-oss-120b","openai/gpt-oss-20b",
+                {"openai/gpt-oss-120b","openai/gpt-oss-20b",
                  "moonshotai/kimi-k2-instruct"});
         else if (p == "openrouter")
             addModelChooser("openrouter-model", "vendor/model-name",
@@ -8706,6 +8728,7 @@ protected:
         runValidate(p, key);
     }
     void onTestKey(CCObject*) {
+        flushInputs();
         std::string p = geode::Mod::get()->getSettingValue<std::string>("ai-provider");
         std::string key = getProviderApiKey(p);
         setAuthStatus("Testing...", ui::BUSY_COL);
@@ -8740,6 +8763,9 @@ protected:
         m_authNet.spawn(req.get(url),
             [this](web::WebResponse resp) {
                 if (resp.ok()) setAuthStatus("✓ Connected.", ui::SUCCESS_COL);
+                else if (resp.code() == 401)
+                    setAuthStatus("✗ HTTP 401: key rejected. Re-paste key, Save & test.",
+                                   ui::ERROR_COL);
                 else setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
                                    ui::ERROR_COL);
             });
@@ -8772,6 +8798,11 @@ protected:
         if (provider == "custom") {
             std::string base = geode::Mod::get()->getSettingValue<std::string>("custom-provider-url");
             if (base.empty()) return "";
+            while (!base.empty() && std::isspace((unsigned char)base.back())) base.pop_back();
+            size_t f = 0;
+            while (f < base.size() && std::isspace((unsigned char)base[f])) ++f;
+            if (f) base.erase(0, f);
+            if (base.find("://") == std::string::npos) base = "http://" + base;
             auto pos = base.find("/chat/completions");
             if (pos != std::string::npos) base = base.substr(0, pos);
             while (!base.empty() && base.back() == '/') base.pop_back();
@@ -18078,9 +18109,10 @@ protected:
             genConfig["temperature"]     = 0.7;
             genConfig["maxOutputTokens"] = 65536;
             // Disable the thinking budget for latency — but ONLY on Flash
-            // models. Pro models cannot disable thinking and reject
-            // thinkingBudget: 0 with HTTP 400 INVALID_ARGUMENT.
-            if (model.find("flash") != std::string::npos) {
+            // models with "Disable Thinking" on. Pro models cannot disable
+            // thinking and reject thinkingBudget: 0 with HTTP 400.
+            if (toolUse::isGeminiFlashModel(model)
+                && Mod::get()->getSettingValue<bool>("disable-thinking")) {
                 auto thinkingConfig = matjson::Value::object();
                 thinkingConfig["thinkingBudget"] = 0;
                 genConfig["thinkingConfig"] = thinkingConfig;
@@ -21015,12 +21047,16 @@ void editoraiSetBool(const char* id, bool v) {
          req.header("Content-Type", "application/json");
          req.bodyString(body.dump());
      }
-     auto finish = [](web::WebResponse resp) {
-         s_testStatus = resp.ok()
-             ? "✓ Connected."
-             : fmt::format("✗ HTTP {}. Check URL, auth template, and server API compatibility.", resp.code());
-         s_testInFlight = false;
-     };
+      auto finish = [](web::WebResponse resp) {
+          if (resp.ok()) {
+              s_testStatus = "✓ Connected.";
+          } else if (resp.code() == 401) {
+              s_testStatus = "✗ HTTP 401: key rejected. Re-paste the key for THIS provider, Save/Test again (typing alone doesn't save).";
+          } else {
+              s_testStatus = fmt::format("✗ HTTP {}. Check URL, auth template, and server API compatibility.", resp.code());
+          }
+          s_testInFlight = false;
+      };
      if (postCustom) s_testTask.spawn(req.post(url), finish);
      else            s_testTask.spawn(req.get(url),  finish);
  }

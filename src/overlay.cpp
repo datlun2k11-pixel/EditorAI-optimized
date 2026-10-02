@@ -279,6 +279,16 @@ std::unordered_map<std::string, TextBuf>& textBufs() {
     return b;
 }
 
+// Flush staged ImGui text buffers into Geode settings. settingText() only
+// writes back on IsItemDeactivatedAfterEdit, so a user who types an API key
+// and immediately hits "Test connection" would otherwise test the OLD key
+// (stale buffer → spurious HTTP 401). Call before any network probe that
+// reads the key / URL / model from settings.
+void flushTextBufs() {
+    for (auto& [id, tb] : textBufs())
+        editoraiSetStr(id.c_str(), tb.buf.data());
+}
+
 // Named BYOPAK profiles. Geode saved values live in this mod's local save
 // directory; nothing here is synced or sent anywhere. A profile includes the
 // key because endpoints commonly use different credentials, and loading a
@@ -1062,8 +1072,7 @@ void providerModelWidget(const std::string& p) {
             {"deepseek-chat", "deepseek-reasoner", "deepseek-coder"}, tip);
     else if (p == "groq")
         settingModelCombo("groq-model",
-            {"llama-3.3-70b-versatile", "llama-3.1-8b-instant",
-             "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+            {"openai/gpt-oss-120b", "openai/gpt-oss-20b",
              "moonshotai/kimi-k2-instruct"}, tip);
     else if (p == "huggingface")
         settingModelCombo("huggingface-model",
@@ -1842,7 +1851,7 @@ void tabSettings() {
             // Test connection — a real authenticated probe of the current
             // provider (the same endpoints the AI generation calls).
             ImGui::SameLine();
-            if (ImGui::SmallButton("Test connection")) editoraiTestProvider();
+            if (ImGui::SmallButton("Test connection")) { flushTextBufs(); editoraiTestProvider(); }
             tipIfHovered("Sends a tiny authenticated request to this provider "
                          "to confirm the key/URL work before you generate.");
             std::string tstat = editoraiTestStatus();
@@ -1885,6 +1894,10 @@ void tabSettings() {
                 "Stored locally on this device and only sent to the "
                 "provider itself.", true);
         }
+        if (p == "gemini")
+            settingToggle("disable thinking (faster, shallower)", "disable-thinking",
+                "Skips the thinking phase on Flash models. Pro models can't "
+                "disable thinking and ignore this.");
         // One-click sign-in where the provider supports it — no key-copying.
         if (editoraiOAuthAvailable(p)) {
             ImGui::BeginDisabled(editoraiOAuthActive());
