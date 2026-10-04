@@ -205,12 +205,12 @@
    "type": "title",
    "name": "Providers"
   },
-  "gemini-model": {
-   "type": "string",
-   "default": "gemini-2.5-flash",
-   "name": "Gemini Model",
-   "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Gemini model id."
-  },
+   "gemini-model": {
+    "type": "string",
+    "default": "gemini-3.8-flash",
+    "name": "Gemini Model",
+    "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Gemini model id."
+   },
   "gemini-api-key": {
    "type": "string",
    "default": "",
@@ -275,12 +275,12 @@
    "type": "title",
    "name": "Provider — Hugging Face"
   },
-  "huggingface-model": {
-   "type": "string",
-   "default": "meta-llama/Llama-3.1-8B-Instruct",
-   "name": "HF Model",
-   "description": "Repo-style id, e.g. meta-llama/Llama-3.1-8B-Instruct."
-  },
+   "huggingface-model": {
+    "type": "string",
+    "default": "meta-llama/Llama-3.1-8B-Instruct",
+    "name": "HF Model",
+    "description": "Repo-style id, e.g. meta-llama/Llama-3.1-8B-Instruct."
+   },
   "huggingface-api-key": {
    "type": "string",
    "default": "",
@@ -291,12 +291,12 @@
    "type": "title",
    "name": "Provider — OpenRouter"
   },
-  "openrouter-model": {
-   "type": "string",
-   "default": "google/gemini-2.5-flash",
-   "name": "OpenRouter Model",
-   "description": "Provider/model slug, e.g. google/gemini-2.5-flash or anthropic/claude-3.5-sonnet."
-  },
+   "openrouter-model": {
+    "type": "string",
+    "default": "google/gemini-3.8-flash",
+    "name": "OpenRouter Model",
+    "description": "Provider/model slug, e.g. google/gemini-3.8-flash or anthropic/claude-3.5-sonnet."
+   },
   "openrouter-api-key": {
    "type": "string",
    "default": "",

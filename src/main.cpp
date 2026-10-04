@@ -8477,7 +8477,7 @@ protected:
         // custom model id, not just the presets.
         if (p == "gemini") {
             addModelChooser("gemini-model", "type any Gemini model id",
-                {"gemini-3-flash","gemini-3-pro","gemini-2.5-flash","gemini-2.5-pro"});
+                {"gemini-3.8-flash","gemini-3.5-flash-lite","gemini-3.1-pro","gemma-4-31b-it"});
             addToggle("Disable thinking", "disable-thinking",
                 "Skips the thinking phase on Flash models: much faster, shallower.\n\n"
                 "Pro models can't disable thinking and ignore this.");
@@ -8498,11 +8498,12 @@ protected:
         else if (p == "groq")
             addModelChooser("groq-model", "type any Groq model id",
                 {"openai/gpt-oss-120b","openai/gpt-oss-20b",
-                 "moonshotai/kimi-k2-instruct"});
+                 "qwen/qwen3.8-27b"});
         else if (p == "openrouter")
             addModelChooser("openrouter-model", "vendor/model-name",
-                {"google/gemini-2.5-flash","anthropic/claude-sonnet-4",
-                 "openai/gpt-4o","meta-llama/llama-3.3-70b-instruct"});
+                {"google/gemini-3.8-flash","google/gemini-3.5-flash-lite",
+                 "google/gemma-4-31b-it","anthropic/claude-sonnet-4",
+                  "openai/gpt-4o","meta-llama/llama-3.3-70b-instruct"});
         else if (p == "huggingface")
             addModelChooser("huggingface-model", "owner/repo",
                 {"meta-llama/Llama-3.1-8B-Instruct","Qwen/Qwen2.5-7B-Instruct"});

@@ -1056,7 +1056,7 @@ void providerModelWidget(const std::string& p) {
                       "any model id.";
     if (p == "gemini")
         settingModelCombo("gemini-model",
-            {"gemini-3-flash", "gemini-3-pro", "gemini-2.5-flash", "gemini-2.5-pro"}, tip);
+            {"gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro", "gemma-4-31b-it"}, tip);
     else if (p == "claude")
         settingModelCombo("claude-model",
             {"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"}, tip);
@@ -1073,13 +1073,13 @@ void providerModelWidget(const std::string& p) {
     else if (p == "groq")
         settingModelCombo("groq-model",
             {"openai/gpt-oss-120b", "openai/gpt-oss-20b",
-             "moonshotai/kimi-k2-instruct"}, tip);
+             "qwen/qwen3.8-27b"}, tip);
     else if (p == "huggingface")
         settingModelCombo("huggingface-model",
             {"meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"}, tip);
     else if (p == "openrouter")
         settingModelCombo("openrouter-model",
-            {"google/gemini-2.5-flash", "anthropic/claude-sonnet-4",
+            {"google/gemini-3.8-flash", "google/gemini-3.5-flash-lite", "google/gemma-4-31b-it", "anthropic/claude-sonnet-4",
              "openai/gpt-4o", "meta-llama/llama-3.3-70b-instruct"}, tip);
     else if (p == "ollama")
         ollamaModelSelector();
