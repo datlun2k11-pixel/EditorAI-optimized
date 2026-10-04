@@ -14555,8 +14555,8 @@ protected:
                 "Open Settings → paste a fresh key, then save.", makeErrorCode(m_toolProvider,20,1)));
             return;
         }
-        { std::string mk = m_toolApiKey.size()>8 ? m_toolApiKey.substr(0,4)+"..."+m_toolApiKey.substr(m_toolApiKey.size()-4) : "***";
-          log::info("Tool loop preflight: provider={} model='{}' keyLen={} mask='{}'", m_toolProvider, m_toolModel, m_toolApiKey.size(), mk); }
+        // Diagnostics only: never log key material or fragments (first/last chars).
+        log::debug("Tool loop preflight: provider={} model='{}' hasKey={}", m_toolProvider, m_toolModel, !m_toolApiKey.empty());
         // Tool use is unbounded — no round budget. The model runs until it
         // emits a final answer; duplicate-call reuse prevents accidental
         // repeated network work, while Cancel remains available throughout.
@@ -17862,12 +17862,11 @@ protected:
                 "Open Settings → paste a fresh key from the provider dashboard, then save.", makeErrorCode(provider,20,1)));
             return;
         }
-        // Masked diagnostics: length + prefix, never full key
+        // Diagnostics only: never log key material, fragments, or length.
         {
-            std::string masked = apiKey.size()>8 ? apiKey.substr(0,4)+"..."+apiKey.substr(apiKey.size()-4) : "***";
-            log::info("API preflight: provider={} model='{}' keyLen={} keyMask='{}' url='{}'", provider, model, apiKey.size(), masked, url);
+            log::debug("API preflight: provider={} model='{}' hasKey={} url='{}'", provider, model, !apiKey.empty(), url);
             if (apiKey.size()<8 && provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp" && provider!="manual" && provider!="custom")
-                log::warn("API key looks suspiciously short ({} chars) — pasted correctly?", apiKey.size());
+                log::warn("API key looks suspiciously short — pasted correctly?");
         }
 
         std::string jsonBody = requestBody.dump();
