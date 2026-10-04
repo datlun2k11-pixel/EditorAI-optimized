@@ -14550,7 +14550,7 @@ protected:
                 "Open Settings → Provider tab and pick a model.", makeErrorCode(m_toolProvider,40,0)));
             return;
         }
-        if (m_toolApiKey.empty() && m_toolProvider!="ollama" && m_toolProvider!="lm-studio" && m_toolProvider!="llama-cpp" && m_toolProvider!="manual") {
+        if (m_toolApiKey.empty() && m_toolProvider!="ollama" && m_toolProvider!="lm-studio" && m_toolProvider!="llama-cpp" && m_toolProvider!="manual" && m_toolProvider!="custom") {
             onError("API Key Required", fmtUserError("No API key saved for provider '"+m_toolProvider+"' (tool loop would get HTTP 401).",
                 "Open Settings → paste a fresh key, then save.", makeErrorCode(m_toolProvider,20,1)));
             return;
@@ -17857,7 +17857,7 @@ protected:
                 "Open Settings → Provider tab and pick a model (use Fetch model list).", makeErrorCode(provider,40,0)));
             return;
         }
-        if (provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp" && provider!="manual" && apiKey.empty()) {
+        if (provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp" && provider!="manual" && provider!="custom" && apiKey.empty()) {
             onError("API Key Required", fmtUserError("No API key saved for provider '"+provider+"' (HTTP 401 would follow).",
                 "Open Settings → paste a fresh key from the provider dashboard, then save.", makeErrorCode(provider,20,1)));
             return;
@@ -17866,7 +17866,7 @@ protected:
         {
             std::string masked = apiKey.size()>8 ? apiKey.substr(0,4)+"..."+apiKey.substr(apiKey.size()-4) : "***";
             log::info("API preflight: provider={} model='{}' keyLen={} keyMask='{}' url='{}'", provider, model, apiKey.size(), masked, url);
-            if (apiKey.size()<8 && provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp")
+            if (apiKey.size()<8 && provider!="ollama" && provider!="lm-studio" && provider!="llama-cpp" && provider!="manual" && provider!="custom")
                 log::warn("API key looks suspiciously short ({} chars) — pasted correctly?", apiKey.size());
         }
 
