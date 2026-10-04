@@ -273,7 +273,7 @@ void settingInt(const char* label, const char* id, int mn, int mx,
 // editing flags for fields NOT rendered this frame — settingText is used in
 // BOTH tabs (composer's custom difficulty/style), and a blanket clear while
 // the Chat tab renders one would clobber in-progress typing every frame.
-struct TextBuf { std::array<char, 256> buf{}; bool editing = false; int lastFrame = -1; };
+struct TextBuf { std::array<char, 1024> buf{}; bool editing = false; int lastFrame = -1; };
 std::unordered_map<std::string, TextBuf>& textBufs() {
     static std::unordered_map<std::string, TextBuf> b;
     return b;
@@ -441,6 +441,30 @@ void settingText(const char* label, const std::string& id,
             tb.editing = false;
         }
         tipIfHovered("Reveal the key to proofread or repair it by hand.");
+    }
+    // Mobile keyboards (especially on iOS) often offer no paste action at
+    // all, so every settings field gets its own Paste button that pulls the
+    // system clipboard straight into the field.
+    if (uiMobile()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(fmt::format("Paste##paste-{}", id).c_str())) {
+            if (const char* clip = ImGui::GetClipboardText()) {
+                std::string s = clip;
+                auto a = s.find_first_not_of(" \t\r\n");
+                if (a != std::string::npos) {
+                    auto b = s.find_last_not_of(" \t\r\n");
+                    s = s.substr(a, b - a + 1);
+                    snprintf(tb.buf.data(), tb.buf.size(), "%s", s.c_str());
+                    tb.editing = false;
+                    editoraiSetStr(id.c_str(), tb.buf.data());
+                    if (autoBypass && tb.buf[0]) {
+                        editoraiSetBool("bypass-char-filter", true);
+                        editoraiSetBool("bypass-char-limit", true);
+                    }
+                }
+            }
+        }
+        tipIfHovered("Paste from the system clipboard.");
     }
     if (finished) {
         editoraiSetStr(id.c_str(), tb.buf.data());
