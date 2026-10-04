@@ -284,9 +284,15 @@ std::unordered_map<std::string, TextBuf>& textBufs() {
 // and immediately hits "Test connection" would otherwise test the OLD key
 // (stale buffer → spurious HTTP 401). Call before any network probe that
 // reads the key / URL / model from settings.
+// Only flush fields rendered this frame: a hidden custom-model buffer must
+// not clobber a freshly picked preset (preset pick hides the text field,
+// leaving a stale buf behind).
 void flushTextBufs() {
-    for (auto& [id, tb] : textBufs())
+    int curFrame = ImGui::GetFrameCount();
+    for (auto& [id, tb] : textBufs()) {
+        if (tb.lastFrame != curFrame) continue;
         editoraiSetStr(id.c_str(), tb.buf.data());
+    }
 }
 
 // Named BYOPAK profiles. Geode saved values live in this mod's local save
@@ -978,7 +984,17 @@ void settingModelCombo(const char* id,
     if (ImGui::BeginCombo(fmt::format("model##{}", id).c_str(), preview)) {
         for (auto* opt : presets) {
             bool sel = !custom && cur == opt;
-            if (ImGui::Selectable(opt, sel)) { editoraiSetStr(id, opt); custom = false; }
+            if (ImGui::Selectable(opt, sel)) {
+                editoraiSetStr(id, opt);
+                custom = false;
+                // Sync the text buffer immediately: otherwise the hidden
+                // custom-model buffer still holds the old free-text value and
+                // a later flushTextBufs() (Test connection) would undo this pick.
+                auto& tb = textBufs()[id];
+                snprintf(tb.buf.data(), tb.buf.size(), "%s", opt);
+                tb.editing = false;
+                tb.lastFrame = ImGui::GetFrameCount();
+            }
             if (sel) ImGui::SetItemDefaultFocus();
         }
         ImGui::Separator();
