@@ -416,14 +416,33 @@ void settingText(const char* label, const std::string& id,
         std::string cur = editoraiGetStr(id.c_str());
         snprintf(tb.buf.data(), tb.buf.size(), "%s", cur.c_str());
     }
+    // Per-field key reveal (masked fields can't be proofread by hand).
+    // Defaults to hidden every restart; the buffer itself always holds the
+    // real text, only the display is masked.
+    static std::unordered_map<std::string, bool> revealed;
+    bool show = secret && revealed[id];
     ImGui::SetNextItemWidth(std::min(280.f, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint(fmt::format("{}##{}", label, id).c_str(), hint,
         tb.buf.data(), tb.buf.size(), TEXT_SELECTION_FLAGS |
-        (secret ? ImGuiInputTextFlags_Password : ImGuiInputTextFlags_None),
+        (secret && !show ? ImGuiInputTextFlags_Password : ImGuiInputTextFlags_None),
         textSelectionCallback);
     tb.editing = ImGui::IsItemActive();
     tipIfHovered(tip);
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
+    // Capture BEFORE the Show/Hide button below: afterwards "last item" is
+    // the button, and this query would read the wrong widget.
+    bool finished = ImGui::IsItemDeactivatedAfterEdit();
+    if (secret) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(fmt::format("{}##show-{}",
+                show ? "Hide" : "Show", id).c_str())) {
+            revealed[id] = !show;
+            // Force the buffer back through the widget so it redraws in the
+            // new mode even while it keeps focus.
+            tb.editing = false;
+        }
+        tipIfHovered("Reveal the key to proofread or repair it by hand.");
+    }
+    if (finished) {
         editoraiSetStr(id.c_str(), tb.buf.data());
         if (autoBypass && tb.buf[0]) {
             editoraiSetBool("bypass-char-filter", true);
