@@ -2111,13 +2111,17 @@ void drawOverlay() {
     // Floating bubble — the touch-device way in (no E key there).
     // Hidden COMPLETELY inside any level (PlayLayer exists = playing a
     // level): the window isn't even created, so it can never eat taps or
-    // cover gameplay. Draggable: hold and move to reposition (saved across
-    // restarts); a quick tap toggles the panel. Auto-dims to 50% opacity
-    // after 5 s without touching it; any touch/drag restores full opacity.
+    // cover gameplay. Round 56 px bubble, easy to drag: just hold it 0.1 s
+    // then move (position saved across restarts); a quick tap toggles the
+    // panel. Auto-dims to 50% opacity after 5 s without touching it;
+    // any touch/drag restores full opacity.
     static ImVec2 s_bubblePos = ImVec2(8, 60);
     static bool s_bubblePosLoaded = false;
     static bool s_bubbleDragging = false;
-    static float s_bubbleDragDist = 0.f;
+    static double s_bubblePressT = 0.0;
+    static ImVec2 s_bubblePressMouse = ImVec2(0, 0);
+    static ImVec2 s_bubbleGrabOff = ImVec2(0, 0);
+    static float s_bubbleMoved = 0.f;
     static double s_bubbleLastTouch = -1e9;
     static float s_bubbleAlpha = 1.f;
     if (uiMobile() && !PlayLayer::get()) {
@@ -2137,30 +2141,49 @@ void drawOverlay() {
             s_bubbleAlpha = std::max(bTarget, s_bubbleAlpha - bDt * 2.f);
         {
             const ImVec2 disp = ImGui::GetIO().DisplaySize;
-            s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - 52.f));
-            s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - 52.f));
+            s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - 60.f));
+            s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - 60.f));
             ImGui::SetNextWindowPos(s_bubblePos, ImGuiCond_Always);
         }
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s_bubbleAlpha);
+        // Zero padding + no background: the window wraps the drawn circle
+        // exactly, so the whole round bubble is the touch target.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         if (ImGui::Begin("##eaibubble", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-                ImGuiWindowFlags_NoSavedSettings)) {
-            ImGui::Button("AI", ImVec2(44, 44));
-            // Any touch on the bubble (hover, press, or drag) counts as
-            // interacting — restores full opacity immediately.
-            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings)) {
+            constexpr float R = 28.f;   // 56 px round bubble
+            ImVec2 c0 = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##eaibubblebtn", ImVec2(R * 2.f, R * 2.f));
+            bool bHover = ImGui::IsItemHovered();
+            bool bActive = ImGui::IsItemActive();
+            // Any touch on the bubble restores full opacity immediately.
+            if (bHover || bActive)
                 s_bubbleLastTouch = ImGui::GetTime();
-            // Tap-vs-drag: the button stays "active" while held, so finger
-            // movement accumulates here. Past the threshold it's a drag —
-            // follow the finger and skip the toggle on release.
-            if (ImGui::IsItemActive()) {
-                const ImVec2 d = ImGui::GetIO().MouseDelta;
-                s_bubbleDragDist += std::fabs(d.x) + std::fabs(d.y);
-                if (s_bubbleDragDist > 8.f) {
+            auto& bIo = ImGui::GetIO();
+            if (ImGui::IsItemActivated()) {
+                // Fresh press: remember when/where the finger landed and the
+                // grab offset inside the bubble (keeps it glued, no jump).
+                s_bubblePressT = bNow;
+                s_bubblePressMouse = bIo.MousePos;
+                s_bubbleGrabOff = ImVec2(bIo.MousePos.x - s_bubblePos.x,
+                                         bIo.MousePos.y - s_bubblePos.y);
+                s_bubbleDragging = false;
+                s_bubbleMoved = 0.f;
+            }
+            if (bActive) {
+                float mdx = bIo.MousePos.x - s_bubblePressMouse.x;
+                float mdy = bIo.MousePos.y - s_bubblePressMouse.y;
+                float m = std::sqrt(mdx * mdx + mdy * mdy);
+                if (m > s_bubbleMoved) s_bubbleMoved = m;
+                // Arm the drag after a 0.1 s hold (or a fast swipe, which is
+                // unambiguous drag intent); a quick small tap still toggles.
+                if (!s_bubbleDragging && s_bubbleMoved > 3.f &&
+                    ((bNow - s_bubblePressT) >= 0.1 || s_bubbleMoved > 12.f))
                     s_bubbleDragging = true;
-                    s_bubblePos.x += d.x;
-                    s_bubblePos.y += d.y;
+                if (s_bubbleDragging) {
+                    s_bubblePos.x = bIo.MousePos.x - s_bubbleGrabOff.x;
+                    s_bubblePos.y = bIo.MousePos.y - s_bubbleGrabOff.y;
                     const ImVec2 disp = ImGui::GetIO().DisplaySize;
                     const ImVec2 ws = ImGui::GetWindowSize();
                     s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - ws.x));
@@ -2176,8 +2199,18 @@ void drawOverlay() {
                     g_st.panelOpen = !g_st.panelOpen;
                 }
                 s_bubbleDragging = false;
-                s_bubbleDragDist = 0.f;
             }
+            // Draw the round bubble (green tint while the panel is open).
+            ImVec2 center = ImVec2(c0.x + R, c0.y + R);
+            ImVec4 bBase = g_st.panelOpen ? COL_OK : COL_ACCENT;
+            auto* bDl = ImGui::GetWindowDrawList();
+            bDl->AddCircleFilled(center, R,
+                ImGui::GetColorU32(ImVec4(bBase.x, bBase.y, bBase.z, 0.95f * s_bubbleAlpha)), 32);
+            bDl->AddCircle(center, R - 1.f,
+                ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 0.85f * s_bubbleAlpha)), 32, 1.5f);
+            ImVec2 bTs = ImGui::CalcTextSize("AI");
+            bDl->AddText(ImVec2(center.x - bTs.x * 0.5f, center.y - bTs.y * 0.5f),
+                ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, s_bubbleAlpha)), "AI");
         }
         ImGui::End();
         ImGui::PopStyleVar();
