@@ -2094,7 +2094,6 @@ void tabSettings() {
 
 // ── Main draw ─────────────────────────────────────────────────────────────────
 #ifdef GEODE_IS_MOBILE
-#include <Geode/loader/SceneManager.hpp>
 // ── Native cocos floating bubble (mobile) ────────────────────────────────────
 // Eclipse-style: a real CCMenu targeted touch delegate, NOT an ImGui window.
 // ImGui's touch emulation only delivers hover on the first tap, which forced
@@ -2154,11 +2153,23 @@ public:
         static EAIBubble* s_inst = nullptr;
         if (!s_inst) {
             s_inst = new EAIBubble();
-            if (s_inst->init())
-                s_inst->autorelease();
-            else {
+            if (s_inst->init()) {
+                // Geode >= 5.10 removed SceneManager/keepAcrossScenes.
+                // Retain the bubble for the app lifetime and re-parent it
+                // to the current scene whenever the scene changes.
+                s_inst->retain();
+            } else {
                 delete s_inst;
                 s_inst = nullptr;
+            }
+        }
+        if (s_inst) {
+            if (auto* cur = CCScene::get()) {
+                if (s_inst->getParent() != cur) {
+                    if (s_inst->getParent())
+                        s_inst->removeFromParentAndCleanup(false);
+                    cur->addChild(s_inst);
+                }
             }
         }
         return s_inst;
@@ -2188,8 +2199,8 @@ protected:
         m_label->setPosition(CCPoint(ss.width / 2.f, ss.height / 2.f));
         m_sprite->addChild(m_label);
 
-        CCScene::get()->addChild(this);
-        geode::SceneManager::get()->keepAcrossScenes(this);
+        if (auto* scene = CCScene::get())
+            scene->addChild(this);
         return true;
     }
 
