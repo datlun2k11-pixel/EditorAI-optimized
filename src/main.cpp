@@ -2945,6 +2945,21 @@ static std::string sanitizeStoredKey(std::string raw) {
     e = raw.find_last_not_of(ws);
     return raw.substr(s, e-s+1);
 }
+// macOS IME double-insert workaround (paste + Return duplicates the field).
+// On macOS, pasting into a CCTextInputNode leaves an IME composition open
+// and confirming it with Return inserts the pasted text a SECOND time, so
+// the field reads URLURL / KEYKEY. No legitimate value in these settings
+// (URLs, keys, model ids, auth templates, names) is an exact 2x repetition,
+// so an exactly-duplicated value is safely collapsed to one copy.
+// P+P always has even length, so this also catches pastes carrying a
+// trailing newline/BOM ("key\nkey\n" -> "key\n", cleaned by sanitize after).
+static std::string collapseImeDoublePaste(const std::string& v) {
+    if (v.size() >= 2 && (v.size() % 2) == 0) {
+        size_t h = v.size() / 2;
+        if (v.compare(0, h, v, h, h) == 0) return v.substr(0, h);
+    }
+    return v;
+}
 static std::string getProviderApiKey(const std::string& provider) {
     if (provider == "huggingface") {
         std::string t = oauth::savedToken(provider);
@@ -7857,6 +7872,14 @@ protected:
     void flushInputs() {
         for (auto& r : m_texts) {
             std::string v = std::string(r.in->getString());
+            // Collapse a macOS paste+Return double-insert BEFORE sanitizing:
+            // the duplicated half may itself carry a trailing newline/BOM
+            // ("key\nkey\n"), which sanitize alone cannot repair.
+            std::string fixed = collapseImeDoublePaste(v);
+            if (fixed != v) {
+                v = fixed;
+                r.in->setString(v);  // visible field matches what is stored
+            }
             // Sanitize API keys on save: pasted keys often carry a trailing
             // newline/space, BOM, zero-width chars or a "Bearer " prefix.
             // Without this the stored key keeps the junk and every validation
