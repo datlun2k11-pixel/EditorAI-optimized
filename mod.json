@@ -8,7 +8,7 @@
  },
  "id": "entity12208.edit-ai",
  "name": "Editor AI",
- "version": "v2.1.10",
+ "version": "v2.1.11",
  "developer": "entity12208",
  "description": "Generate Geometry Dash levels using AI!",
  "dependencies": {
@@ -158,12 +158,6 @@
    "default": true,
    "name": "AI Playtest & Watch",
    "description": "Let the AI repeatedly run simulated playtests and inspect fresh level renders between passes. Drafts are staged early only when doing so cannot overwrite an existing level."
-  },
-  "stream-responses": {
-   "type": "bool",
-   "default": true,
-   "name": "Stream Responses",
-   "description": "Show the AI's reply <cg>as it is written</c>, token by token, formatted live in the chat. Falls back to waiting for the whole reply if the provider or platform can't stream."
   },
   "enable-self-critique": {
    "type": "bool",

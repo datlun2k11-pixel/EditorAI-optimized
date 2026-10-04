@@ -410,7 +410,6 @@ inline constexpr std::string_view EXAMPLE_SECTIONS_JSON = R"eai_v2(
 #include <deque>
 #include <unordered_set>
 #include "sessions.hpp"
-#include "stream.hpp"
 #include <cstring>
 #include <functional>
 #include <random>
@@ -468,7 +467,7 @@ inline constexpr const char* HF_SCOPES          = "inference-api";
 
 // ── SHA-256 (public domain — minimal RFC 6234 implementation) ──────────────
 // Just enough to compute the PKCE S256 challenge from a verifier string.
-// We don't need a streaming API; one-shot hash is fine.
+// A one-shot hash is sufficient here.
 struct Sha256 {
     static constexpr uint32_t K[64] = {
         0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,
@@ -1277,8 +1276,7 @@ inline TokenLimitSpec tokenLimitSpec(const std::string& provider) {
 // Each takes the conversation so far and returns the provider's expected JSON
 // body. The OpenAI-compat builder takes the provider too because Ollama —
 // which speaks the same dialect for tools — has two quirks that need
-// branching: it defaults to stream:true (which gives back NDJSON instead of
-// a single JSON object, breaking the parser) and it expects
+// branching: it must be told to return one complete JSON object, and it expects
 // tool_call.function.arguments to be an OBJECT, not a JSON-encoded string.
 matjson::Value buildOpenAICompatRequest(const std::string& provider,
                                         const std::vector<Message>& history,
@@ -3199,37 +3197,6 @@ static void applyProviderAuth(web::WebRequest& req,
         }
     }
     // ollama / lm-studio / llama-cpp: no auth header
-}
-
-// Same auth headers as applyProviderAuth, but as raw "Name: value" strings
-// for the streaming path (which talks to libcurl directly and can't take a
-// WebRequest). One source of truth would be nicer, but WebRequest exposes no
-// way to read its headers back out, so the two share this switch by shape.
-static std::vector<std::string> providerAuthHeaderLines(
-    const std::string& provider, const std::string& apiKey)
-{
-    std::vector<std::string> out;
-    out.push_back("Content-Type: application/json");
-    if (provider == "gemini") {
-        out.push_back(fmt::format("x-goog-api-key: {}", apiKey));
-    } else if (provider == "claude") {
-        out.push_back(fmt::format("x-api-key: {}", apiKey));
-        out.push_back("anthropic-version: 2023-06-01");
-    } else if (provider == "openai"     || provider == "ministral" ||
-               provider == "huggingface"|| provider == "deepseek"  ||
-               provider == "groq")
-    {
-        out.push_back(fmt::format("Authorization: Bearer {}", apiKey));
-    } else if (provider == "openrouter") {
-        out.push_back(fmt::format("Authorization: Bearer {}", apiKey));
-        out.push_back("Referer: https://editorai.pages.dev");
-        out.push_back("X-Title: EditorAI");
-    } else if (provider == "custom") {
-        if (auto header = parseCustomAuthHeader(apiKey))
-            out.push_back(fmt::format("{}: {}", header->first, header->second));
-    }
-    // ollama / lm-studio / llama-cpp: no auth header
-    return out;
 }
 
 // Per-provider request timeout, shared by the single-shot and tool-loop
@@ -8223,10 +8190,6 @@ protected:
             "it - pacing, visuals, difficulty curve - this many times.\n\n"
             "<cg>0</c> = off.  More rounds = better quality but more tokens "
             "and time. <cg>3</c> is a good balance.");
-        addToggle("Stream responses", "stream-responses",
-            "Show the AI's reply <cg>as it is written</c>, token by token, "
-            "formatted live in the overlay chat.\n\n"
-            "Turn off to wait for each complete reply instead.");
         addToggle("AI playtest & watch", "ai-playtest",
             "Lets the AI repeatedly run simulated playtests and inspect a "
             "fresh render between revision passes.\n\n"
@@ -10929,7 +10892,6 @@ protected:
     void onCancel(CCObject*) {
         if (!m_isGenerating) return;
         m_listener = {};  // destroy the task holder, cancelling the request
-        cancelStream();   // abort an in-flight streamed round too
         // Also cancel any in-flight TOOL requests — with parallel tool
         // execution these run on their own holders, and a surviving callback
         // would push results into m_toolHistory and silently restart the
@@ -11116,8 +11078,6 @@ protected:
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_generationStartTime).count();
-        // A streamed round owns the live line (it reports bytes/tokens too).
-        if (m_streamSink) return;
         showLiveStatus(fmt::format("working... {}s", elapsed));
     }
 
@@ -14561,36 +14521,9 @@ protected:
     bool   m_liveBuildDeclaredDone = false;
     int    m_liveBuildPasses       = 0;
 
-    // ── Live streaming ────────────────────────────────────────────────────
-    // When enabled (and the provider/platform can), a round's response is
-    // decoded token-by-token off a worker thread. m_streamSink is the mailbox;
-    // pollStream() (a 20 Hz scheduled tick) drains it on the main thread into
-    // the session's live bubble, and finalizes the round when the transfer
-    // completes. m_streamIsToolRound routes the finished result back to the
-    // right handler.
-    eaistream::SinkPtr m_streamSink;
-    bool               m_streamIsToolRound = false;
-    std::string        m_streamProvider;
-    bool              m_streamTicking     = false;
-
-    // Streaming is opportunistic, and on some setups the transport simply does
-    // not work: the mod borrows the GAME's libcurl, which is built against
-    // schannel (Windows' own TLS). Under Wine/Proton that is unreliable, so a
-    // plain-HTTP endpoint streams happily while an HTTPS one can accept the
-    // request, generate server-side, and never deliver a byte back.
-    //
-    // Rather than hang, a stream that produces NOTHING within
-    // STREAM_FIRST_BYTE_SECONDS is abandoned, the round is re-issued on the
-    // normal buffered path, and streaming is switched off for the rest of the
-    // endpoint. A slow or incompatible custom endpoint must never disable live
-    // output for a different provider later in the same game session.
-    static inline std::unordered_set<std::string> s_streamBrokenEndpoints;
-    static constexpr int STREAM_FIRST_BYTE_SECONDS = 45;
-    std::string m_streamUrl;
-
     // ── Scheduling for headless engines ───────────────────────────────────
     // CCNode::schedule() registers a selector PAUSED when the node isn't in
-    // the scene: it forwards `!m_bRunning` as curl's `bPaused`. The overlay's
+    // the scene: it forwards `!m_bRunning` as the scheduler's `bPaused`. The overlay's
     // generation path NEVER shows this popup (editoraiStartGeneration builds a
     // headless engine), so anything scheduled the normal way silently never
     // ticks there. These two helpers register straight on the scheduler with
@@ -14603,334 +14536,6 @@ protected:
     void unscheduleAlways(cocos2d::SEL_SCHEDULE sel) {
         if (auto* sch = this->getScheduler())
             sch->unscheduleSelector(sel, this);
-    }
-
-    void scheduleStreamPoll() {
-        if (m_streamTicking) return;
-        scheduleAlways(schedule_selector(AIGeneratorPopup::pollStream), 0.05f);
-        m_streamTicking = true;
-    }
-    void unscheduleStreamPoll() {
-        if (!m_streamTicking) return;
-        unscheduleAlways(schedule_selector(AIGeneratorPopup::pollStream));
-        m_streamTicking = false;
-    }
-
-    // Only ONE stream may be open per popup; a second start cancels the first.
-    void cancelStream() {
-        if (m_streamSink) {
-            m_streamSink->cancel();
-            m_streamSink.reset();
-        }
-        if (m_session && m_session->streamActive) {
-            m_session->streamEnd();
-        }
-        unscheduleStreamPoll();
-    }
-
-    // True when this turn should be streamed. Manual has no network; the
-    // buffered path stays the fallback whenever anything is unavailable.
-    bool streamingWanted(const std::string& provider, const std::string& url) const {
-        if (!Mod::get()->getSettingValue<bool>("stream-responses")) return false;
-        if (s_streamBrokenEndpoints.count(provider + "|" + url)) return false;
-        if (!eaistream::available()) return false;
-        if (!eaistream::supportsStreaming(provider)) return false;
-        if (provider == "manual") return false;
-        // Platinum IS streamable: its coordinator answers /api/generate with a
-        // chunked NDJSON long-poll (keepalive lines while the request is queued,
-        // then result lines), which is exactly what the Ollama decoder reads. An
-        // earlier revision excluded it on the theory that only one final object
-        // ever arrives — that was wrong twice over: it silently disabled
-        // streaming for the mod's most-used provider, and it also killed the
-        // liveness feedback that a queued Platinum request needs most.
-        return true;
-    }
-
-    // Fire a streaming POST. Returns false when streaming couldn't start (the
-    // caller then does its normal buffered request).
-    bool startStream(const std::string& provider, const std::string& apiKey,
-                     const std::string& url, matjson::Value body,
-                     bool isToolRound)
-    {
-        // The final stream URL is the identity of a capability failure. Gemini
-        // changes its RPC method for SSE, so keying the check on the buffered
-        // URL here but recording the streamed URL on failure would never match.
-        std::string streamUrl = eaistream::streamUrlFor(provider, url);
-        if (!streamingWanted(provider, streamUrl)) return false;
-        // Ask the provider to stream. Ollama's native API uses the same key;
-        // Gemini switches endpoint instead (streamUrlFor).
-        if (provider == "gemini") {
-            body.erase("stream");
-        } else {
-            // Ollama's /api/chat defaults to streaming and the OpenAI-compat
-            // builder explicitly turns it off — flip it back on here. (No
-            // stream_options/include_usage: we don't use the usage numbers, and
-            // strict servers 400 on parameters they don't recognize.)
-            body["stream"] = true;
-        }
-        std::string bodyStr = body.dump();
-        auto headers = providerAuthHeaderLines(provider, apiKey);
-        logApiRequest(provider, getProviderModel(provider), streamUrl, bodyStr);
-        log::info("Streaming POST {} ({} bytes, stall timeout {}s)",
-                  streamUrl, bodyStr.size(), providerTimeout(provider).count());
-
-        cancelStream();
-        m_streamSink = eaistream::post(provider, streamUrl, headers,
-                                       std::move(bodyStr),
-                                       (int)providerTimeout(provider).count());
-        if (!m_streamSink) return false;
-        m_streamIsToolRound = isToolRound;
-        m_streamProvider    = provider;
-        m_streamUrl         = streamUrl;
-        m_streamStartedAt   = std::chrono::steady_clock::now();
-        if (m_session) {
-            m_session->streamBegin();   // display-only; never persisted
-        }
-        scheduleStreamPoll();
-        log::info("Streaming round started ({} -> {})", provider, streamUrl);
-        return true;
-    }
-
-    std::chrono::steady_clock::time_point m_streamStartedAt;
-
-    // 20 Hz: move decoded text from the worker into the session, and finish
-    // the round when the transfer ends.
-    void pollStream(float) {
-        if (!m_streamSink) { unscheduleStreamPoll(); return; }
-        // Cancelled generation: drop the transfer and stop ticking.
-        if (!m_isGenerating) { cancelStream(); return; }
-
-        auto sink = m_streamSink;
-        if (m_session) {
-            std::string t, th;
-            if (sink->drain(t, th)) {
-                m_session->streamText     += t;
-                m_session->streamThinking += th;
-                // Bound the live buffers — a runaway model must not grow them
-                // without limit (the finished text is capped elsewhere).
-                if (m_session->streamText.size() > 200000)
-                    GenSession::utf8Trim(m_session->streamText, 200000);
-                if (m_session->streamThinking.size() > 60000)
-                    GenSession::utf8Trim(m_session->streamThinking, 60000);
-            }
-            // Liveness line: a queued Platinum request (or any slow model)
-            // sends keepalives that decode to NOTHING, so without this the UI
-            // looks frozen for minutes. Cheap: one small string per tick, and
-            // deliberately NOT a transcript entry.
-            int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - m_streamStartedAt).count();
-            size_t bytes = sink->bytes();
-            if (!m_session->streamText.empty() ||
-                !m_session->streamThinking.empty()) {
-                m_session->liveStatus = fmt::format("streaming {}s", secs);
-            } else if (bytes > 0) {
-                m_session->liveStatus = fmt::format("waiting {}s · {} B", secs, bytes);
-            } else {
-                m_session->liveStatus = fmt::format("connecting {}s", secs);
-            }
-        }
-
-        eaistream::Result res;
-        if (!sink->finished(res)) {
-            // First-byte watchdog. A stream that has delivered literally
-            // nothing this long isn't slow, it's broken (see s_streamBroken) —
-            // abandon it and redo the round buffered rather than sit here.
-            int waited = (int)std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - m_streamStartedAt).count();
-            if (sink->bytes() == 0 && waited >= STREAM_FIRST_BYTE_SECONDS)
-                this->abandonStreaming(waited);
-            return;
-        }
-
-        // Transfer over: tear down the tick before dispatching (the handlers
-        // may start the next round, which schedules its own).
-        m_streamSink.reset();
-        unscheduleStreamPoll();
-        std::string provider = m_streamProvider;
-        bool wasToolRound    = m_streamIsToolRound;
-        // Fold the live bubble into the transcript proper.
-        if (m_session) {
-            m_session->streamEnd();
-        }
-        finishStream(std::move(res), provider, wasToolRound);
-    }
-
-    // Is a partial streamed reply worth building from? Used when a stream ends
-    // in an error after the model had already produced most of its answer
-    // (Platinum's queue deadline fires mid-stream). Requires real level content
-    // — a couple of sentences of prose is not a level, and building nothing
-    // while claiming success would be worse than the error.
-    bool looksSalvageable(const std::string& text) const {
-        if (text.size() < 400) return false;
-        if (text.find("## Level Script") != std::string::npos) return true;
-        if (eas::looksLikeEAS(eas::extractScript(text)))        return true;
-        // JSON path: an objects array that actually opened.
-        if (text.find("\"objects\"") != std::string::npos &&
-            text.find('[') != std::string::npos) return true;
-        return false;
-    }
-
-    // The stream produced no bytes at all: give up on streaming for good and
-    // re-run this round through the ordinary buffered request path, so the
-    // generation completes normally instead of hanging.
-    void abandonStreaming(int waitedSeconds) {
-        log::warn("Stream delivered no bytes in {}s ({} -> {}) — falling back "
-                  "for this endpoint only",
-                  waitedSeconds, m_streamProvider, m_streamUrl);
-        s_streamBrokenEndpoints.insert(m_streamProvider + "|" + m_streamUrl);
-        bool wasToolRound = m_streamIsToolRound;
-        if (m_streamSink) { m_streamSink->cancel(); m_streamSink.reset(); }
-        unscheduleStreamPoll();
-        if (m_session) m_session->streamEnd();
-        pushSession(GenSession::Entry::Kind::Status,
-            "Live streaming timed out for this provider - switching this request "
-            "to the normal path; other providers can still stream");
-        if (!m_isGenerating) return;
-        if (wasToolRound) {
-            --m_toolIterations;   // the redo isn't a new round
-            this->doToolRound();
-        } else {
-            this->callAPI(m_lastCallPrompt, m_lastCallKey);
-        }
-    }
-
-    // Turn a completed stream into the same shapes the buffered paths produce.
-    void finishStream(eaistream::Result res, const std::string& provider,
-                      bool wasToolRound)
-    {
-        if (!m_isGenerating) return;
-        logApiResponse((int)res.httpCode, res.rawBody);
-        log::info("Stream finished: HTTP {}, {} chars text, {} chars thinking, "
-                  "{} tool call(s), transportOk={}{}",
-                  res.httpCode, res.text.size(), res.thinking.size(),
-                  res.toolCalls.size(), res.transportOk,
-                  res.transportError.empty()
-                      ? std::string()
-                      : fmt::format(", transport error: {}", res.transportError));
-
-        // A transport that died mid-stream (connection cut, stall timeout) but
-        // already delivered a usable level: build it rather than lose it. Same
-        // reasoning as the provider-error salvage below.
-        if (!res.transportOk && res.httpCode < 400 && !wasToolRound &&
-            res.transportError != "cancelled" && looksSalvageable(res.text)) {
-            log::warn("Stream transport failed ({}) but {} chars had arrived — "
-                      "building from that", res.transportError, res.text.size());
-            pushSession(GenSession::Entry::Kind::Status,
-                fmt::format("Connection dropped - building from the {} "
-                            "characters that arrived", res.text.size()));
-            resetGenerationUI();
-            this->processFinalResponse(std::move(res.text), provider);
-            return;
-        }
-
-        // HTTP-level failure: the body is an error JSON, not a stream.
-        if (res.httpCode >= 400 || (!res.transportOk && res.text.empty())) {
-            int code = (int)res.httpCode;
-            if (res.transportError == "cancelled") return;
-            if (wasToolRound) {
-                if (this->retryToolRoundIfTransient(code)) return;
-            } else if (this->retrySingleShotIfTransient(code, "")) {
-                return;
-            }
-            if (code > 0) {
-                auto [title, msg] = parseAPIError(
-                    res.rawBody.empty() ? "No body" : res.rawBody, code);                onError(title, msg);
-            } else {
-                onError("Connection Failed",
-                    fmt::format("The streamed request never completed: {}. "
-                                "Check your connection (or the local server) "
-                                "and try again. ({})",
-                                res.transportError.empty()
-                                    ? std::string("no response")
-                                    : res.transportError,
-                                autoErrorCode(10, 1)));
-            }
-            return;
-        }
-        // A provider error INSIDE the stream (Ollama / Platinum report queue
-        // timeouts and "no workers available" this way, with HTTP 200).
-        if (!res.providerError.empty()) {
-            // Salvage first. A streamed round that dies late (Platinum's 300s
-            // queue deadline fires even mid-stream) has usually already
-            // delivered most of the level — throwing that away and showing an
-            // error is the worst of both worlds. If enough text arrived to be
-            // worth building, use it and just note what happened.
-            if (!wasToolRound && looksSalvageable(res.text)) {
-                log::warn("Stream ended with a provider error but {} chars had "
-                          "already streamed — building from that instead: {}",
-                          res.text.size(), res.providerError);
-                pushSession(GenSession::Entry::Kind::Status,
-                    fmt::format("Provider cut off ({}) - building from the {} "
-                                "characters that did arrive",
-                                res.providerError, res.text.size()));
-                resetGenerationUI();
-                this->processFinalResponse(std::move(res.text), provider);
-                return;
-            }
-            if (wasToolRound) {
-                if (isTransientProviderError(res.providerError) &&
-                    this->retryToolRoundIfTransient(503)) return;
-            } else if (this->retrySingleShotIfTransient(
-                           (int)res.httpCode, res.providerError)) {
-                return;
-            }
-            bool platinum = provider == "ollama" &&
-                Mod::get()->getSettingValue<bool>("use-platinum");
-            onError(platinum ? "Platinum Error" : "Provider Error",
-                platinum
-                    ? fmt::format("{} — Platinum runs on volunteer machines, so a "
-                        "busy queue or a slow upstream shows up as this. Try "
-                        "again, ask for a shorter level, or switch to a direct "
-                        "provider with your own key in settings. ({})",
-                        res.providerError, autoErrorCode(60, 53))
-                    : fmt::format("{} ({})", res.providerError,
-                                  autoErrorCode(60, 53)));
-            return;
-        }
-
-        m_transientRetries = 0;
-
-        // Reasoning goes to the transcript as a thinking entry, exactly like
-        // the buffered path — the live bubble was display-only.
-        if (!res.thinking.empty())
-            pushSession(GenSession::Entry::Kind::Thinking, res.thinking);
-
-        if (!wasToolRound) {
-            if (res.text.empty()) {
-                onError("Invalid Response",
-                    fmt::format("The provider streamed an empty reply. Try again, "
-                                "or switch models in settings. ({})",
-                                autoErrorCode(60, 3)));
-                return;
-            }
-            resetGenerationUI();
-            this->processFinalResponse(std::move(res.text), provider);
-            return;
-        }
-
-        // Tool round: rebuild a ParsedResponse from the decoded stream.
-        // reasoningText is deliberately left empty — the thinking was already
-        // pushed to the transcript above, and dispatchToolRound would push it
-        // a second time.
-        toolUse::ParsedResponse parsed;
-        for (auto& tc : res.toolCalls) {
-            toolUse::ToolCall call;
-            call.id               = tc.id;
-            call.name             = tc.name;
-            call.args             = toolUse::parseToolArgs(matjson::Value(tc.argsJson));
-            call.thoughtSignature = tc.thoughtSignature;
-            parsed.toolCalls.push_back(std::move(call));
-        }
-        if (!parsed.toolCalls.empty()) {
-            parsed.assistantTextWithCalls = res.text;
-            parsed.ok = true;
-        } else {
-            parsed.finalText = res.text;
-            parsed.ok = !res.text.empty();
-            if (!parsed.ok)
-                parsed.errorMessage = "The provider streamed an empty reply";
-        }
-        this->dispatchToolRound(std::move(parsed));
     }
 
     // Entry point. Called instead of callAPI's single-shot when tool use is
@@ -15338,11 +14943,6 @@ protected:
         log::info("Tool round {}: POST {} ({} bytes)",
                   m_toolIterations, url, bodyStr.size());
 
-        // Streamed round: tokens land in the session's live bubble as they
-        // arrive. Falls through to the buffered request when unavailable.
-        if (this->startStream(m_toolProvider, m_toolApiKey, url, body, true))
-            return;
-
         logApiRequest(m_toolProvider, m_toolModel, url, bodyStr);
 
         auto request = web::WebRequest();
@@ -15442,9 +15042,7 @@ protected:
         this->dispatchToolRound(std::move(parsed));
     }
 
-    // Everything after a tool round's response has been parsed. Shared by the
-    // buffered path (onToolRoundResponse) and the streaming path, which
-    // assembles the same ParsedResponse from decoded SSE deltas.
+    // Everything after a tool round's response has been parsed.
     void dispatchToolRound(toolUse::ParsedResponse parsed) {
         if (!parsed.ok) {
             log::error("Tool round {} parse error: {}", m_toolIterations, parsed.errorMessage);
@@ -18187,10 +17785,6 @@ protected:
             url = "https://api.anthropic.com/v1/messages";
 
         // ── Ollama ─────────────────────────────────────────────────────────────
-        // stream=true is REQUIRED — without it, curl times out on large responses
-        // because Ollama doesn't send the final HTTP chunk until generation is done.
-        // With stream=true we get newline-delimited JSON (NDJSON); onAPISuccess
-        // handles the line-by-line parsing and accumulation of the response field.
         } else if (provider == "ollama") {
             std::string ollamaUrl = getOllamaUrl();
             log::info("Using Ollama at: {}", ollamaUrl + "/api/generate");
@@ -18201,7 +17795,7 @@ protected:
             requestBody            = matjson::Value::object();
             requestBody["model"]   = model;
             requestBody["prompt"]  = systemPrompt + "\n\n" + fullPrompt;
-            requestBody["stream"]  = true;   // REQUIRED: prevents curl timeout
+            requestBody["stream"]  = false;
             // NO format:"json" — the system prompt prefers EAS (a line-based
             // DSL) and grammar-constraining the output to one JSON value
             // fought that instruction. The response pipeline handles EAS,
@@ -18280,13 +17874,9 @@ protected:
         log::info("Sending request to {} ({} bytes)", provider, jsonBody.length());
         // Context construction is complete. Keeping the durable phase at
         // "building context" for the entire network wait made a healthy slow
-        // model — and especially an SSE error that had not arrived yet — look
-        // like the client was stuck before dispatch.
+        // model — and especially a delayed provider error — look like the
+        // client was stuck before dispatch.
         setFlowPhase("waiting for model");
-
-        // Streamed single-shot: same body, decoded live. Falls back silently.
-        if (this->startStream(provider, apiKey, url, requestBody, false))
-            return;
 
         auto request = web::WebRequest();
         request.header("Content-Type", "application/json");
@@ -18631,136 +18221,46 @@ protected:
 
         {
             std::string aiResponse;
+            auto jsonRes = response.json();
+            if (!jsonRes) {
+                onError("Invalid Response",
+                    fmt::format("The provider returned data that didn't look like JSON at all. "
+                                "This is almost always a temporary upstream outage — try again "
+                                "in a minute, or switch providers in settings. ({})",
+                                autoErrorCode(60, 1)));
+                return;
+            }
 
-            // ── Ollama: NDJSON streaming response ─────────────────────────────
-            // With stream=true, Ollama sends one JSON object per line:
-            //   {"model":"...","response":"chunk","done":false}
-            //   {"model":"...","response":"chunk","done":false}
-            //   {"model":"...","response":"","done":true,"context":[...]}
-            //
-            // response.json() tries to parse the whole body as one JSON object
-            // and always fails on streaming output. We must parse line by line,
-            // accumulate all "response" fields, and verify "done":true on the
-            // final line.
+            const auto json = jsonRes.unwrap();  // const: reads must not insert
+
             if (provider == "ollama") {
-                auto rawResult = response.string();
-                if (!rawResult) {
-                    onError("Invalid Response",
-                        fmt::format("The provider returned data that didn't look like JSON at all. "
-                                    "This is almost always a temporary upstream outage — try again "
-                                    "in a minute, or switch providers in settings. ({})",
-                                    autoErrorCode(60, 1)));
-                    return;
-                }
-
-                std::string rawBody = rawResult.unwrap();
-                std::string accumulated;
-                bool isDone = false;
-                int  lineCount = 0;
-
-                // Walk the buffer in place — istringstream would copy the
-                // whole (potentially multi-MB) stream body just to split it
-                // into lines. matjson::parse accepts the string_view directly.
-                size_t scanPos = 0;
-                while (scanPos < rawBody.size()) {
-                    size_t eol = rawBody.find('\n', scanPos);
-                    if (eol == std::string::npos) eol = rawBody.size();
-                    std::string_view line(rawBody.data() + scanPos, eol - scanPos);
-                    scanPos = eol + 1;
-
-                    // Trim carriage return from Windows line endings
-                    if (!line.empty() && line.back() == '\r')
-                        line.remove_suffix(1);
-                    if (line.empty()) continue;
-
-                    ++lineCount;
-                    auto lineJson = matjson::parse(line);
-                    if (!lineJson) {
-                        // Non-JSON line in the stream — skip silently
-                        log::warn("Ollama: skipping non-JSON stream line {}: {}", lineCount, line.substr(0, 80));
-                        continue;
-                    }
-
-                    // Const: non-const matjson operator[] would insert a null
-                    // member per missing key, thousands of lines per response.
-                    const auto lineObj = lineJson.unwrap();
-
-                    // Accumulate text chunks
-                    auto chunk = lineObj["response"].asString();
-                    if (chunk) accumulated += chunk.unwrap();
-
-                    // Check done flag — Ollama sets this true on the final line
-                    auto doneResult = lineObj["done"].asBool();
-                    if (doneResult && doneResult.unwrap()) {
-                        isDone = true;
-                    }
-
-                    // Also surface any Ollama-level error messages. Platinum's
-                    // coordinator reports queue timeouts / "no workers" through
-                    // this same field — those are transient, so retry once
-                    // before showing the user a failure.
-                    auto errorMsg = lineObj["error"].asString();
-                    if (errorMsg) {
-                        std::string em = errorMsg.unwrap();
-                        if (this->retrySingleShotIfTransient(response.code(), em))
-                            return;
-                        bool platinum =
-                            Mod::get()->getSettingValue<bool>("use-platinum");
-                        onError(platinum ? "Platinum Error" : "Ollama Error",
-                            platinum
-                                ? fmt::format("{} — Platinum runs on volunteer "
-                                    "machines, so a busy queue or a slow upstream "
-                                    "shows up as this. Try again, ask for a shorter "
-                                    "level, or switch to a direct provider with your "
-                                    "own key in settings. ({})",
-                                    em, autoErrorCode(80, 1))
-                                : fmt::format("Ollama reported: {}. Check that the model is installed "
-                                    "(`ollama list`), the server is running (`ollama serve`), and "
-                                    "your selected model name in mod settings matches exactly. ({})",
-                                    em, autoErrorCode(80, 1)));
+                auto errorMsg = json["error"].asString();
+                if (errorMsg && !errorMsg.unwrap().empty()) {
+                    std::string em = errorMsg.unwrap();
+                    if (this->retrySingleShotIfTransient(response.code(), em))
                         return;
-                    }
-                }
-
-                log::info("Ollama stream: {} lines parsed, done={}, accumulated {} chars",
-                    lineCount, isDone, accumulated.size());
-
-                if (!isDone) {
-                    onError("Incomplete Response",
-                        fmt::format("Ollama cut the stream off before saying it was done. The model "
-                                    "probably hit its context window. Pick a shorter \"length\" setting, "
-                                    "lower \"max objects\", or switch to a model with a bigger context "
-                                    "(num_ctx 16k+). ({})",
-                                    autoErrorCode(80, 3)));
+                    bool platinum = Mod::get()->getSettingValue<bool>("use-platinum");
+                    onError(platinum ? "Platinum Error" : "Ollama Error",
+                        platinum
+                            ? fmt::format("{} — Platinum runs on volunteer machines. "
+                                "Try again, ask for a shorter level, or switch to "
+                                "a direct provider. ({})", em, autoErrorCode(80, 1))
+                            : fmt::format("Ollama reported: {}. Check that the model "
+                                "is installed and the server is running. ({})",
+                                em, autoErrorCode(80, 1)));
                     return;
                 }
-
-                if (accumulated.empty()) {
+                auto textResult = json["response"].asString();
+                if (!textResult || textResult.unwrap().empty()) {
                     onError("Invalid Response",
-                        fmt::format("Ollama finished cleanly but the response text was empty. The "
-                                    "model may have refused, or the system prompt may have overflowed "
-                                    "the context. Lower max objects or simplify the prompt. ({})",
+                        fmt::format("Ollama returned an empty response. The model may "
+                                    "have refused or exceeded its context window. ({})",
                                     autoErrorCode(80, 2)));
                     return;
                 }
+                aiResponse = textResult.unwrap();
 
-                aiResponse = accumulated;
-
-            // ── All other providers: standard single-JSON response ─────────────
-            } else {
-                auto jsonRes = response.json();
-                if (!jsonRes) {
-                    onError("Invalid Response",
-                        fmt::format("The provider returned data that didn't look like JSON at all. "
-                                    "This is almost always a temporary upstream outage — try again "
-                                    "in a minute, or switch providers in settings. ({})",
-                                    autoErrorCode(60, 1)));
-                    return;
-                }
-
-                const auto json = jsonRes.unwrap();  // const: reads must not insert
-
-                if (provider == "gemini") {
+            } else if (provider == "gemini") {
                     // Check if the entire request was blocked before generation started.
                     if (json.contains("promptFeedback")) {
                         auto blockReasonResult = json["promptFeedback"]["blockReason"].asString();
@@ -18854,7 +18354,6 @@ protected:
                     if (!textResult) { onError("Invalid Response", fmt::format("[{}] Failed to extract text from AI response.", autoErrorCode(60, 3))); return; }
                     aiResponse = textResult.unwrap();
                 }
-            }
 
             // Final text in hand — hand off to the shared post-processing
             // path (same logic the tool-use loop calls when its final answer
@@ -18865,7 +18364,6 @@ protected:
 
     void onError(const std::string& title, const std::string& message) {
         resetGenerationUI();
-        cancelStream();              // no live bubble left hanging on failure
         m_followUpTurn    = false;   // turn-scoped flags die with the turn
         m_critiquePending = false;
         // Objects live-placed before the failure need their Accept/Deny —

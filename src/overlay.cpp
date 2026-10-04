@@ -1187,64 +1187,6 @@ void renderEntry(const GenSession::Entry& e, int idx) {
     ImGui::PopID();
 }
 
-// The live bubble: the in-flight assistant turn, re-rendered every frame from
-// the streamed buffers. Same visual language as a finished AI message, plus a
-// blinking caret so it's obvious the text is still arriving.
-void renderStreamingBubble(const GenSession& s) {
-    if (!s.streamActive && s.streamText.empty() && s.streamThinking.empty())
-        return;
-    ImGui::PushID("stream");
-    ImGui::Spacing();
-    ImVec2 barTop = ImGui::GetCursorScreenPos();
-    ImGui::Indent(10.f);
-    ImGui::TextColored(COL_AI, "AI");
-    if (s.streamActive) {
-        ImGui::SameLine();
-        // Three-dot pulse: cheap, no textures, reads as "working".
-        int phase = (int)(ImGui::GetTime() * 3.0) % 4;
-        ImGui::TextColored(COL_DIM, "%s",
-            phase == 0 ? "" : phase == 1 ? "." : phase == 2 ? ".." : "...");
-        // Elapsed / bytes line, so a slow or queued provider never looks frozen.
-        if (!s.liveStatus.empty()) {
-            ImGui::SameLine();
-            ImGui::TextColored(COL_DIM, "(%s)", s.liveStatus.c_str());
-        }
-    }
-    // Reasoning first: thinking models spend their first stretch entirely in
-    // the reasoning channel, so this is the only thing to show at that point.
-    if (!s.streamThinking.empty())
-    {
-        // Open while the model is still only reasoning; fold once the answer
-        // starts, so the user always sees the newest content without scrolling.
-        bool open = s.streamText.empty();
-        renderThinkingBlock("thinking...", s.streamThinking, &open);
-    }
-    if (!s.streamText.empty())
-        md::render(s.streamText, ImVec4(0.90f, 0.90f, 0.92f, 1.f),
-                   transcriptWrapW(10.f));
-    else if (s.streamActive && s.streamThinking.empty()) {
-        // Nothing decodable yet. Say WHY rather than just "waiting": a queued
-        // Platinum request, or a provider that buffers instead of streaming,
-        // legitimately sends keepalives (bytes, no text) for minutes. The
-        // liveStatus line above carries the elapsed time and byte count, so
-        // this only has to explain that silence is expected, not a hang.
-        ImGui::TextColored(COL_DIM, "Connected; waiting for text.");
-    }
-    // Blinking caret while the stream is open. On its own line: SameLine after
-    // md::render would fight the renderer's own line handling.
-    if (s.streamActive && fmodf((float)ImGui::GetTime(), 1.0f) < 0.5f)
-        ImGui::TextColored(COL_ACCENT, "|");
-    ImGui::Unindent(10.f);
-    float barBot = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y;
-    if (barBot > barTop.y) {
-        ImVec4 barCol = COL_AI; barCol.w = 0.65f;
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            ImVec2(barTop.x + 1.f, barTop.y), ImVec2(barTop.x + 4.f, barBot),
-            ImGui::GetColorU32(barCol), 2.f);
-    }
-    ImGui::PopID();
-}
-
 void composerBody(float dt);   // the "+ new chat" pane (defined below)
 
 void tabChat(float dt) {
@@ -1393,11 +1335,7 @@ void tabChat(float dt) {
             ? ImGui::GetFrameHeightWithSpacing() : 0.f);
     ImGui::BeginChild("transcript", ImVec2(0, -footerH), ImGuiChildFlags_Borders);
     if (sel) {
-        // While streaming, the content grows every frame, so the "am I at the
-        // bottom?" test needs slack — otherwise the view detaches on its own.
-        // A real scroll-up (beyond the slack) still stops the auto-follow.
-        float slack = sel->streamActive ? 48.f : 4.f;
-        bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - slack;
+        bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.f;
         // Render the newest 150 entries — full 400-entry transcripts cost
         // real CPU every frame and nobody scrolls that far back.
         size_t start = sel->transcript.size() > 150
@@ -1407,13 +1345,9 @@ void tabChat(float dt) {
                                (int)start);
         for (size_t i = start; i < sel->transcript.size(); ++i)
             renderEntry(sel->transcript[i], (int)i);
-        // In-flight turn, streamed live under everything else.
-        renderStreamingBubble(*sel);
-        // Non-streamed turn (streaming off, or a provider/platform that can't):
-        // there is no live text, so show the engine's liveness line instead —
-        // otherwise a multi-minute request looks like the mod hung.
-        if (!sel->streamActive && sel->state == GenSession::State::Running &&
-            !sel->liveStatus.empty()) {
+        // Show an elapsed-time heartbeat while the complete response is
+        // pending, so a slow model does not look like a frozen mod.
+        if (sel->state == GenSession::State::Running && !sel->liveStatus.empty()) {
             ImGui::Spacing();
             ImGui::TextColored(COL_DIM, "AI %s", sel->liveStatus.c_str());
         }
@@ -1926,9 +1860,6 @@ void tabSettings() {
     if (ImGui::CollapsingHeader("Generation")) {
         // No max-objects setting: the AI sizes to the request. The user can
         // say "about 500 objects" in their prompt if they care.
-        settingToggle("stream responses", "stream-responses",
-            "Show the AI's reply as it is written, token by token, formatted "
-            "live. Turn off to wait for the whole reply instead.");
         ImGui::TextColored(COL_DIM, "Name a reference level; the AI finds it.");
     }
 

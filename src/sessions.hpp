@@ -61,38 +61,11 @@ struct GenSession {
     // persisted with the session and re-injected into the AI context).
     std::string workingState;
 
-    // ── Live streaming (token-by-token) ───────────────────────────────────
-    // While a streamed round is in flight the engine appends decoded deltas
-    // here and the overlay renders it as a live, markdown-formatted bubble at
-    // the bottom of the transcript. Deliberately NOT persisted: a partial
-    // answer is meaningless after a restart, and the finished text lands in
-    // `transcript`/`chat` anyway.
-    //   streamText     — visible assistant text so far
-    //   streamThinking — reasoning/thinking deltas so far (collapsed in UI)
-    //   streamActive   — a stream is open right now (drives the caret)
-    std::string streamText;
-    std::string streamThinking;
-    bool        streamActive = false;
-    // One-line "what is happening right now" (elapsed time, bytes received,
-    // queue position). Written every tick, so it must NOT go through push() —
-    // a per-second transcript entry would flood the log and evict real
-    // messages from the 400-entry window. Not persisted.
+    // One-line "what is happening right now" status. Written every tick, so
+    // it must NOT go through push() — a per-second transcript entry would
+    // flood the log and evict real messages from the 400-entry window.
+    // Deliberately not persisted.
     std::string liveStatus;
-
-    void streamBegin() {
-        streamText.clear();
-        streamThinking.clear();
-        streamActive = true;
-    }
-    // Called the moment the transfer ends. The buffers are cleared too: the
-    // finished text is immediately pushed into `transcript` (as an Assistant /
-    // Thinking entry) by the engine, so keeping it here would render it twice.
-    void streamEnd() {
-        streamActive = false;
-        streamText.clear();
-        streamThinking.clear();
-        liveStatus.clear();
-    }
 
     void push(Entry::Kind k, std::string text) {
         // Rolling window: long conversations keep flowing — the OLDEST
