@@ -2100,7 +2100,7 @@ void tabSettings() {
 // a double-press before any drag could start — raw touches have no such
 // problem: press-and-move drags from the very first touch.
 //
-// Behavior: round 84 px bubble; drag freely (position saved across restarts);
+// Behavior: round ~62 px bubble; drag freely (position saved across restarts);
 // a quick tap toggles the panel; auto-dims to 50% after 5 s untouched;
 // hidden completely inside any level (PlayLayer exists).
 //
@@ -2135,7 +2135,7 @@ CCTexture2D* eaiMakeBubbleTexture() {
 class EAIBubble : public CCMenu {
 protected:
     constexpr static float DRAG_SLOP = 8.f;       // finger travel before a press counts as a drag (tap vs drag)
-    constexpr static float TOUCH_RADIUS = 52.f;   // generous round hit area (bubble visual radius is 42 px)
+    constexpr static float TOUCH_RADIUS = 40.f;   // round hit area (bubble visual radius is ~31 px)
     constexpr static float DIM_OPACITY = 0.5f;    // idle dim target
     constexpr static float IDLE_DELAY = 5.f;      // seconds untouched before dimming
 
@@ -2214,7 +2214,7 @@ protected:
         scheduleUpdate();
 
         m_sprite = CCSprite::createWithTexture(eaiMakeBubbleTexture());
-        m_sprite->setScale(0.75f);   // 112 px art -> 84 px on screen (thumb-friendly)
+        m_sprite->setScale(0.55f);   // 112 px art -> ~62 px on screen (compact, in the 55-65 px band)
         CCSize win = CCDirector::get()->getWinSize();
         m_sprite->setPosition(clampPos(CCPoint(
             (float)editoraiGetSavedInt("eai-bubble-cx", 40),
@@ -2236,7 +2236,7 @@ protected:
 
     CCPoint clampPos(CCPoint p) {
         CCSize win = CCDirector::get()->getWinSize();
-        constexpr float R = 44.f;   // visual radius 42 + 2 px margin
+        constexpr float R = 33.f;   // visual radius ~31 + 2 px margin
         p.x = std::clamp(p.x, R, std::max(R, win.width - R));
         p.y = std::clamp(p.y, R, std::max(R, win.height - R));
         return p;
