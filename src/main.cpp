@@ -2919,15 +2919,27 @@ static std::pair<std::string, std::string> parseAPIError(const std::string& erro
 // ─── Per-provider API key / model helpers ─────────────────────────────────────
 
 static std::string sanitizeStoredKey(std::string raw) {
-    // Re-use the same invisible-char/Bearer stripping as live input
-    // We can't call AIGeneratorPopup::sanitizeApiKey (defined later), so duplicate lightly
-    if (raw.size() >= 3 && (unsigned char)raw[0]==0xEF && (unsigned char)raw[1]==0xBB && (unsigned char)raw[2]==0xBF)
-        raw.erase(0,3);
+    // Same invisible-char/Bearer stripping as live input (AIGeneratorPopup::sanitizeApiKey).
+    // Pasted keys often carry trailing newline/space, BOM, zero-width spaces,
+    // NBSP, quotes or a "Bearer " prefix — the #1 cause of 401 with a "correct" key.
+    auto stripInvisible = [](std::string& str) {
+        if (str.size() >= 3 && (unsigned char)str[0]==0xEF && (unsigned char)str[1]==0xBB && (unsigned char)str[2]==0xBF)
+            str.erase(0,3);
+        std::string out; out.reserve(str.size());
+        for (size_t i=0;i<str.size();) {
+            if (i+2 < str.size() && (unsigned char)str[i]==0xE2 && (unsigned char)str[i+1]==0x80 && (unsigned char)str[i+2]==0x8B) { i+=3; continue; } // ZWSP
+            if (i+1 < str.size() && (unsigned char)str[i]==0xC2 && (unsigned char)str[i+1]==0xA0) { i+=2; continue; } // NBSP
+            out.push_back(str[i]); ++i;
+        }
+        str.swap(out);
+    };
+    stripInvisible(raw);
     const std::string ws = " \t\r\n\"'`";
     size_t s = raw.find_first_not_of(ws);
     if (s==std::string::npos) return "";
     size_t e = raw.find_last_not_of(ws);
     raw = raw.substr(s, e-s+1);
+    stripInvisible(raw);
     if (raw.rfind("Bearer ",0)==0) raw = raw.substr(7);
     else if (raw.rfind("bearer ",0)==0) raw = raw.substr(7);
     s = raw.find_first_not_of(ws);
@@ -7828,9 +7840,17 @@ protected:
     void onClose(CCObject* o) override { flushInputs(); Popup::onClose(o); }
 
     void flushInputs() {
-        for (auto& r : m_texts)
-            geode::Mod::get()->setSettingValue<std::string>(r.sid,
-                std::string(r.in->getString()));
+        for (auto& r : m_texts) {
+            std::string v = std::string(r.in->getString());
+            // Sanitize API keys on save: pasted keys often carry a trailing
+            // newline/space, BOM, zero-width chars or a "Bearer " prefix.
+            // Without this the stored key keeps the junk and every validation
+            // / generation request 401s even though the key itself is valid.
+            if (r.sid.find("api-key") != std::string::npos
+                || r.sid.find("api_key") != std::string::npos)
+                v = sanitizeStoredKey(v);
+            geode::Mod::get()->setSettingValue<std::string>(r.sid, v);
+        }
         for (auto& r : m_ints) {
             std::string s = r.in->getString();
             int64_t v = r.def;
@@ -8719,8 +8739,10 @@ protected:
     void onSaveAndTest(CCObject*) {
         flushInputs();
         std::string p = geode::Mod::get()->getSettingValue<std::string>("ai-provider");
-        std::string key = geode::Mod::get()->getSettingValue<std::string>(
-            p == "custom" ? "custom-provider-api-key" : (p + "-api-key"));
+        // Use the sanitized key (flushInputs already stored the cleaned value).
+        // The old code read the raw setting here, so a pasted key with a
+        // trailing newline/space always 401d even when the key was valid.
+        std::string key = getProviderApiKey(p);
         if (key.empty()) {
             setAuthStatus("No key to test.", ui::ERROR_COL); return;
         }
@@ -8767,8 +8789,16 @@ protected:
                 else if (resp.code() == 401)
                     setAuthStatus("✗ HTTP 401: key rejected. Re-paste key, Save & test.",
                                    ui::ERROR_COL);
-                else setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
-                                   ui::ERROR_COL);
+                else {
+                    // Show the provider's error snippet so a wrong model /
+                    // quota / permission failure isn't mistaken for a bad key.
+                    std::string body = resp.string().unwrapOr("");
+                    for (auto& c : body) if (c == '\n' || c == '\r') c = ' ';
+                    if (body.size() > 120) body = body.substr(0, 120);
+                    std::string msg = fmt::format("✗ HTTP {}.", resp.code());
+                    if (!body.empty()) msg += " " + body;
+                    setAuthStatus(msg, ui::ERROR_COL);
+                }
             });
     }
 
