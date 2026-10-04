@@ -2100,7 +2100,7 @@ void tabSettings() {
 // a double-press before any drag could start — raw touches have no such
 // problem: press-and-move drags from the very first touch.
 //
-// Behavior: round 56 px bubble; drag freely (position saved across restarts);
+// Behavior: round 84 px bubble; drag freely (position saved across restarts);
 // a quick tap toggles the panel; auto-dims to 50% after 5 s untouched;
 // hidden completely inside any level (PlayLayer exists).
 //
@@ -2134,15 +2134,16 @@ CCTexture2D* eaiMakeBubbleTexture() {
 
 class EAIBubble : public CCMenu {
 protected:
-    constexpr static float DRAG_SLOP = 5.f;     // px of finger travel before a press becomes a drag
-    constexpr static float TOUCH_RADIUS = 32.f; // generous round hit area (bubble is 28 px)
-    constexpr static float DIM_OPACITY = 0.5f;  // idle dim target
-    constexpr static float IDLE_DELAY = 5.f;    // seconds untouched before dimming
+    constexpr static float DRAG_SLOP = 8.f;       // finger travel before a press counts as a drag (tap vs drag)
+    constexpr static float TOUCH_RADIUS = 52.f;   // generous round hit area (bubble visual radius is 42 px)
+    constexpr static float DIM_OPACITY = 0.5f;    // idle dim target
+    constexpr static float IDLE_DELAY = 5.f;      // seconds untouched before dimming
 
     CCSprite* m_sprite = nullptr;
     CCLabelBMFont* m_label = nullptr;
     CCPoint m_grabOff{};   // finger-minus-sprite offset, so the bubble never jumps
     CCPoint m_pressPos{};  // finger position at press time (for the slop check)
+    CCPoint m_homePos{};   // sprite position at press time (restored if it was just a tap)
     float m_opacity = 1.f; // current opacity, eased toward m_opacityTarget
     float m_opacityTarget = 1.f;
     float m_idleT = 0.f;   // seconds since last touch
@@ -2206,10 +2207,14 @@ protected:
         setZOrder(100);
         setPosition(CCPoint(0, 0));
         setID("eai-bubble"_spr);
+        // Explicit: this node lives or dies by raw touches, make sure no
+        // GD/CCMenu default ever leaves it touch-disabled on some version.
+        setTouchEnabled(true);
+        setEnabled(true);
         scheduleUpdate();
 
         m_sprite = CCSprite::createWithTexture(eaiMakeBubbleTexture());
-        m_sprite->setScale(0.5f);   // 112 px art -> 56 px on screen
+        m_sprite->setScale(0.75f);   // 112 px art -> 84 px on screen (thumb-friendly)
         CCSize win = CCDirector::get()->getWinSize();
         m_sprite->setPosition(clampPos(CCPoint(
             (float)editoraiGetSavedInt("eai-bubble-cx", 40),
@@ -2219,7 +2224,7 @@ protected:
         this->addChild(m_sprite);
 
         m_label = CCLabelBMFont::create("AI", "bigFont.fnt");
-        m_label->setScale(0.6f);
+        m_label->setScale(0.8f);
         CCSize ss = m_sprite->getContentSize();
         m_label->setPosition(CCPoint(ss.width / 2.f, ss.height / 2.f));
         m_sprite->addChild(m_label);
@@ -2231,7 +2236,7 @@ protected:
 
     CCPoint clampPos(CCPoint p) {
         CCSize win = CCDirector::get()->getWinSize();
-        constexpr float R = 28.f;
+        constexpr float R = 44.f;   // visual radius 42 + 2 px margin
         p.x = std::clamp(p.x, R, std::max(R, win.width - R));
         p.y = std::clamp(p.y, R, std::max(R, win.height - R));
         return p;
@@ -2273,15 +2278,19 @@ protected:
         if (ccpDistance(p, sp) > TOUCH_RADIUS) return false;
         m_haveMoved = false;
         m_pressPos = p;
+        m_homePos = sp;   // restore point if the finger lifts as a tap (kills tremble jump)
         m_grabOff = CCPoint(p.x - sp.x, p.y - sp.y);
         poke();
         return true;   // claim the touch — it started inside the bubble
     }
 
     void ccTouchMoved(CCTouch* touch, CCEvent*) override {
+        // Follow the finger from the very first pixel so drag feels instant
+        // (single press-and-move, no double-tap). The slop only decides at
+        // release time whether this gesture was a tap or a drag.
         CCPoint p = convertToNodeSpace(touch->getLocation());
-        if (!m_haveMoved && ccpDistance(p, m_pressPos) < DRAG_SLOP) return;
-        m_haveMoved = true;
+        if (!m_haveMoved && ccpDistance(p, m_pressPos) >= DRAG_SLOP)
+            m_haveMoved = true;
         poke();
         m_sprite->setPosition(clampPos(CCPoint(p.x - m_grabOff.x, p.y - m_grabOff.y)));
     }
@@ -2292,6 +2301,8 @@ protected:
             editoraiSetSavedInt("eai-bubble-cx", (int64_t)sp.x);
             editoraiSetSavedInt("eai-bubble-cy", (int64_t)sp.y);
         } else {
+            // Pure tap: undo any sub-slop tremble shift, then toggle panel.
+            m_sprite->setPosition(m_homePos);
             g_st.panelOpen = !g_st.panelOpen;
         }
         poke();
