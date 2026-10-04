@@ -7735,7 +7735,7 @@ protected:
     struct TabUI { CCNode* on = nullptr; CCNode* off = nullptr; CCLabelBMFont* label = nullptr; };
     std::array<TabUI, 3> m_tabUI{};
 
-    struct TextRow  { std::string sid; TextInput* in; bool password; };
+    struct TextRow  { std::string sid; TextInput* in; bool password; int maxLen = 200; };
     struct IntRow   { std::string sid; TextInput* in; int64_t min, max, def; };
     // CycleRow stores a pointer to the value-display label so the arrow
     // handlers can update its text in place — no full tab rebuild on cycle.
@@ -8091,18 +8091,80 @@ protected:
                  const char* desc = nullptr) {
         auto row = makeRow(lbl, desc);
         float w = 150.f;
+#ifdef GEODE_IS_MOBILE
+        // Narrow the field to make room for the paste button — many mobile
+        // keyboards (especially on iOS) offer no paste action at all inside
+        // GD text boxes.
+        w = 104.f;
+#endif
         auto in = TextInput::create(w, ph, "bigFont.fnt");
         in->setScale(0.6f);
+#ifdef GEODE_IS_MOBILE
+        // Right edge pinned at x=296; the paste button owns x=300+.
+        in->setPosition({296.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
+#else
         // Right edge pinned at x=354.
         in->setPosition({354.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
+#endif
         in->setMaxCharCount(maxLen);
         if (password) in->setPasswordMode(true);
         std::string cur = geode::Mod::get()->getSettingValue<std::string>(sid);
         if (!cur.empty()) in->setString(cur);
         row->addChild(in);
-        m_texts.push_back({sid, in, password});
+        m_texts.push_back({sid, in, password, maxLen});
+#ifdef GEODE_IS_MOBILE
+        {
+            auto menu = CCMenu::create();
+            menu->setContentSize({64.f, ROW_H});
+            menu->ignoreAnchorPointForPosition(false);
+            menu->setAnchorPoint({0.5f, 0.5f});
+            menu->setPosition({330.f, ROW_H / 2.f});
+            auto spr = ButtonSprite::create("Paste", "bigFont.fnt",
+                                            "GJ_button_04.png", 0.35f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this,
+                menu_selector(AISettingsPopup::onPasteToField));
+            btn->setUserObject(CCString::create(sid));
+            btn->setPosition({32.f, ROW_H / 2.f});
+            menu->addChild(btn);
+            row->addChild(menu);
+        }
+#endif
         pushRow(row);
     }
+
+#ifdef GEODE_IS_MOBILE
+    // Mobile paste helper: pulls the system clipboard straight into the
+    // settings field. The pressed button carries its field's sid in the
+    // userObject (looked up live, so tab rebuilds can never stale it).
+    void onPasteToField(CCObject* sender) {
+        auto* node = static_cast<CCNode*>(sender);
+        auto* str = static_cast<CCString*>(node ? node->getUserObject() : nullptr);
+        if (!str) return;
+        std::string sid = str->getCString();
+        TextInput* target = nullptr;
+        int maxLen = 0;
+        for (auto& r : m_texts)
+            if (r.sid == sid) { target = r.in; maxLen = r.maxLen; break; }
+        if (!target) return;
+        std::string clip = utils::clipboard::read();
+        auto a = clip.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) {
+            Notification::create("Clipboard is empty - copy the key/URL first",
+                                 NotificationIcon::Warning)->show();
+            return;
+        }
+        auto b = clip.find_last_not_of(" \t\r\n");
+        clip = clip.substr(a, b - a + 1);
+        if (clip.size() > 2000) {
+            Notification::create("Clipboard too large to paste here",
+                                 NotificationIcon::Warning)->show();
+            return;
+        }
+        if ((int)clip.size() > maxLen) target->setMaxCharCount((int)clip.size());
+        target->setString(clip);
+        Notification::create("Pasted from clipboard", NotificationIcon::Success)->show();
+    }
+#endif
 
     void addInt(const char* lbl, const char* sid,
                 int64_t mn, int64_t mx, int64_t df,
