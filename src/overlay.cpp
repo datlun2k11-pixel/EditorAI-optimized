@@ -2257,13 +2257,26 @@ void drawOverlay() {
         else
             ImGui::TextColored(COL_DIM, "idle");
 
-        // Right-aligned dismiss hint, out of the reading path.
-        std::string hint = uiMobile()
-            ? std::string("bubble / X hides")
+        // Right-aligned dismiss hint, out of the reading path. On touch
+        // screens the title-bar X is too small to hit reliably and the
+        // full-screen panel has no other way out, so mobile also gets a
+        // big dedicated close button.
+        std::string hint = mobile
+            ? std::string("bubble hides")
             : fmt::format("{} hides", keySeqDisplayName(overlayToggleSeq()));
-        float hw = ImGui::CalcTextSize(hint.c_str()).x;
+        float btnW = mobile ? 56.f : 0.f;
+        float gap  = mobile ? 8.f : 0.f;
+        float hw = ImGui::CalcTextSize(hint.c_str()).x + btnW + gap;
         ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.f,
                                  ImGui::GetContentRegionMax().x - hw));
+        if (mobile) {
+            if (ImGui::Button("X##eai-close", ImVec2(btnW, 34.f))) {
+                g_st.panelOpen = false;
+                g_keyCapture = false;
+            }
+            tipIfHovered("Hide the panel (the AI bubble brings it back).");
+            ImGui::SameLine(0.f, gap);
+        }
         ImGui::TextColored(ImVec4(COL_DIM.x, COL_DIM.y, COL_DIM.z, 0.65f),
                            "%s", hint.c_str());
     }
