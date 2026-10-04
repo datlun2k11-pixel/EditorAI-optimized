@@ -2093,6 +2093,190 @@ void tabSettings() {
 }
 
 // ── Main draw ─────────────────────────────────────────────────────────────────
+#ifdef GEODE_IS_MOBILE
+// ── Native cocos floating bubble (mobile) ────────────────────────────────────
+// Eclipse-style: a real CCMenu targeted touch delegate, NOT an ImGui window.
+// ImGui's touch emulation only delivers hover on the first tap, which forced
+// a double-press before any drag could start — raw touches have no such
+// problem: press-and-move drags from the very first touch.
+//
+// Behavior: round 56 px bubble; drag freely (position saved across restarts);
+// a quick tap toggles the panel; auto-dims to 50% after 5 s untouched;
+// hidden completely inside any level (PlayLayer exists).
+//
+// The circle art is baked into a runtime texture once so a plain CCSprite
+// shows it — sprites honor setOpacity reliably.
+CCTexture2D* eaiMakeBubbleTexture() {
+    constexpr int S = 112;
+    constexpr float R = 54.f;
+    constexpr float RING = 6.f;
+    auto* data = new unsigned char[(size_t)S * S * 4];
+    for (int y = 0; y < S; ++y) {
+        for (int x = 0; x < S; ++x) {
+            float dx = (float)x + 0.5f - S / 2.f;
+            float dy = (float)y + 0.5f - S / 2.f;
+            float d = std::sqrt(dx * dx + dy * dy);
+            float a = std::clamp(R - d, 0.f, 1.f);
+            unsigned char r, g, b;
+            if (d > R - RING) { r = g = b = 255; }      // white ring
+            else { r = 92; g = 176; b = 255; }          // accent fill
+            size_t i = ((size_t)y * S + x) * 4;
+            data[i] = r; data[i + 1] = g; data[i + 2] = b;
+            data[i + 3] = (unsigned char)(a * 255.f);
+        }
+    }
+    auto* tex = new CCTexture2D();
+    tex->initWithData(data, kCCTexture2DPixelFormat_RGBA8888, S, S, CCSize(S, S));
+    delete[] data;
+    tex->autorelease();
+    return tex;
+}
+
+class EAIBubble : public CCMenu {
+protected:
+    constexpr static float DRAG_SLOP = 5.f;     // px of finger travel before a press becomes a drag
+    constexpr static float TOUCH_RADIUS = 32.f; // generous round hit area (bubble is 28 px)
+    constexpr static float DIM_OPACITY = 0.5f;  // idle dim target
+    constexpr static float IDLE_DELAY = 5.f;    // seconds untouched before dimming
+
+    CCSprite* m_sprite = nullptr;
+    CCLabelBMFont* m_label = nullptr;
+    CCPoint m_grabOff{};   // finger-minus-sprite offset, so the bubble never jumps
+    CCPoint m_pressPos{};  // finger position at press time (for the slop check)
+    float m_opacity = 1.f; // current opacity, eased toward m_opacityTarget
+    float m_opacityTarget = 1.f;
+    float m_idleT = 0.f;   // seconds since last touch
+    bool m_haveMoved = false;
+
+public:
+    static EAIBubble* get() {
+        static EAIBubble* s_inst = nullptr;
+        if (!s_inst) {
+            s_inst = new EAIBubble();
+            if (s_inst->init())
+                s_inst->autorelease();
+            else {
+                delete s_inst;
+                s_inst = nullptr;
+            }
+        }
+        return s_inst;
+    }
+
+protected:
+    bool init() override {
+        if (!CCMenu::init()) return false;
+        setZOrder(100);
+        setPosition({0, 0});
+        setID("eai-bubble"_spr);
+        scheduleUpdate();
+
+        m_sprite = CCSprite::createWithTexture(eaiMakeBubbleTexture());
+        m_sprite->setScale(0.5f);   // 112 px art -> 56 px on screen
+        CCSize win = CCDirector::get()->getWinSize();
+        m_sprite->setPosition(clampPos({
+            (float)editoraiGetSavedInt("eai-bubble-cx", 40),
+            (float)editoraiGetSavedInt("eai-bubble-cy",
+                (int64_t)(win.height - 120))
+        }));
+        this->addChild(m_sprite);
+
+        m_label = CCLabelBMFont::create("AI", "bigFont.fnt");
+        m_label->setScale(0.6f);
+        CCSize ss = m_sprite->getContentSize();
+        m_label->setPosition({ss.width / 2.f, ss.height / 2.f});
+        m_sprite->addChild(m_label);
+
+        CCScene::get()->addChild(this);
+        geode::SceneManager::get()->keepAcrossScenes(this);
+        return true;
+    }
+
+    CCPoint clampPos(CCPoint p) {
+        CCSize win = CCDirector::get()->getWinSize();
+        constexpr float R = 28.f;
+        p.x = std::clamp(p.x, R, std::max(R, win.width - R));
+        p.y = std::clamp(p.y, R, std::max(R, win.height - R));
+        return p;
+    }
+
+    // Any touch (re)starts the idle clock at full opacity.
+    void poke() {
+        m_idleT = 0.f;
+        m_opacityTarget = 1.f;
+    }
+
+    void applyOpacity() {
+        auto o = (GLubyte)(m_opacity * 255);
+        m_sprite->setOpacity(o);
+        m_label->setOpacity(o);
+    }
+
+    void update(float dt) override {
+        // Hidden completely inside any level — invisible, eats no taps.
+        if (PlayLayer::get()) {
+            setVisible(false);
+            // Reset the idle clock while hidden so the bubble comes back
+            // fully opaque when gameplay ends.
+            m_idleT = 0.f;
+            m_opacityTarget = 1.f;
+            m_opacity = 1.f;
+            applyOpacity();
+            return;
+        }
+        setVisible(true);
+        m_idleT += dt;
+        if (m_idleT >= IDLE_DELAY) m_opacityTarget = DIM_OPACITY;
+        if (m_opacity != m_opacityTarget) {
+            float step = dt * 3.f;
+            m_opacity += std::clamp(m_opacityTarget - m_opacity, -step, step);
+            applyOpacity();
+        }
+    }
+
+    bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
+        if (!isVisible()) return false;
+        CCPoint p = convertToNodeSpace(touch->getLocation());
+        CCPoint sp = m_sprite->getPosition();
+        if (ccpDistance(p, sp) > TOUCH_RADIUS) return false;
+        m_haveMoved = false;
+        m_pressPos = p;
+        m_grabOff = {p.x - sp.x, p.y - sp.y};
+        poke();
+        return true;   // claim the touch — it started inside the bubble
+    }
+
+    void ccTouchMoved(CCTouch* touch, CCEvent*) override {
+        CCPoint p = convertToNodeSpace(touch->getLocation());
+        if (!m_haveMoved && ccpDistance(p, m_pressPos) < DRAG_SLOP) return;
+        m_haveMoved = true;
+        poke();
+        m_sprite->setPosition(clampPos({p.x - m_grabOff.x, p.y - m_grabOff.y}));
+    }
+
+    void ccTouchEnded(CCTouch*, CCEvent*) override {
+        if (m_haveMoved) {
+            CCPoint sp = m_sprite->getPosition();
+            editoraiSetSavedInt("eai-bubble-cx", (int64_t)sp.x);
+            editoraiSetSavedInt("eai-bubble-cy", (int64_t)sp.y);
+        } else {
+            g_st.panelOpen = !g_st.panelOpen;
+        }
+        poke();
+    }
+
+    void ccTouchCancelled(CCTouch* touch, CCEvent* event) override {
+        ccTouchEnded(touch, event);
+    }
+
+    void registerWithTouchDispatcher() override {
+        // Very high priority + swallow: touches starting on the bubble reach
+        // it first; anything outside passes through untouched.
+        CCTouchDispatcher::get()->addTargetedDelegate(this, -1000, true);
+    }
+};
+#endif
+
 void drawOverlay() {
     float dt = ImGui::GetIO().DeltaTime;
     if (!g_themeLoaded) loadTheme();
@@ -2108,118 +2292,15 @@ void drawOverlay() {
         editoraiPersistSessionsIfDirty();
     }
 
-    // Floating bubble — the touch-device way in (no E key there).
-    // Hidden COMPLETELY inside any level (PlayLayer exists = playing a
-    // level): the window isn't even created, so it can never eat taps or
-    // cover gameplay. Round 56 px bubble, easy to drag: just hold it 0.1 s
-    // then move (position saved across restarts); a quick tap toggles the
-    // panel. Auto-dims to 50% opacity after 5 s without touching it;
-    // any touch/drag restores full opacity.
-    static ImVec2 s_bubblePos = ImVec2(8, 60);
-    static bool s_bubblePosLoaded = false;
-    static bool s_bubbleDragging = false;
-    static double s_bubblePressT = 0.0;
-    static ImVec2 s_bubblePressMouse = ImVec2(0, 0);
-    static ImVec2 s_bubbleGrabOff = ImVec2(0, 0);
-    static float s_bubbleMoved = 0.f;
-    static double s_bubbleLastTouch = -1e9;
-    static float s_bubbleAlpha = 1.f;
-    if (uiMobile() && !PlayLayer::get()) {
-        double bNow = ImGui::GetTime();
-        float bDt = ImGui::GetIO().DeltaTime;
-        if (!s_bubblePosLoaded) {
-            s_bubblePosLoaded = true;
-            s_bubblePos.x = (float)editoraiGetSavedInt("eai-bubble-x", 8);
-            s_bubblePos.y = (float)editoraiGetSavedInt("eai-bubble-y", 60);
-            s_bubbleLastTouch = bNow;
-        }
-        // Fade toward the target instead of snapping so the dim feels soft.
-        float bTarget = (bNow - s_bubbleLastTouch > 5.0) ? 0.5f : 1.0f;
-        if (s_bubbleAlpha < bTarget)
-            s_bubbleAlpha = std::min(bTarget, s_bubbleAlpha + bDt * 2.f);
-        else if (s_bubbleAlpha > bTarget)
-            s_bubbleAlpha = std::max(bTarget, s_bubbleAlpha - bDt * 2.f);
-        {
-            const ImVec2 disp = ImGui::GetIO().DisplaySize;
-            s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - 60.f));
-            s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - 60.f));
-            ImGui::SetNextWindowPos(s_bubblePos, ImGuiCond_Always);
-        }
-        // Zero padding + no background: the window wraps the drawn circle
-        // exactly, so the whole round bubble is the touch target.
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        if (ImGui::Begin("##eaibubble", nullptr,
-                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
-                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings)) {
-            constexpr float R = 28.f;   // 56 px round bubble
-            ImVec2 c0 = ImGui::GetCursorScreenPos();
-            ImGui::InvisibleButton("##eaibubblebtn", ImVec2(R * 2.f, R * 2.f));
-            bool bHover = ImGui::IsItemHovered();
-            bool bActive = ImGui::IsItemActive();
-            // Any touch on the bubble restores full opacity immediately.
-            if (bHover || bActive)
-                s_bubbleLastTouch = ImGui::GetTime();
-            auto& bIo = ImGui::GetIO();
-            if (ImGui::IsItemActivated()) {
-                // Fresh press: remember when/where the finger landed and the
-                // grab offset inside the bubble (keeps it glued, no jump).
-                s_bubblePressT = bNow;
-                s_bubblePressMouse = bIo.MousePos;
-                s_bubbleGrabOff = ImVec2(bIo.MousePos.x - s_bubblePos.x,
-                                         bIo.MousePos.y - s_bubblePos.y);
-                s_bubbleDragging = false;
-                s_bubbleMoved = 0.f;
-            }
-            if (bActive) {
-                float mdx = bIo.MousePos.x - s_bubblePressMouse.x;
-                float mdy = bIo.MousePos.y - s_bubblePressMouse.y;
-                float m = std::sqrt(mdx * mdx + mdy * mdy);
-                if (m > s_bubbleMoved) s_bubbleMoved = m;
-                // Arm the drag after a 0.1 s hold (or a fast swipe, which is
-                // unambiguous drag intent); a quick small tap still toggles.
-                if (!s_bubbleDragging && s_bubbleMoved > 3.f &&
-                    ((bNow - s_bubblePressT) >= 0.1 || s_bubbleMoved > 12.f))
-                    s_bubbleDragging = true;
-                if (s_bubbleDragging) {
-                    s_bubblePos.x = bIo.MousePos.x - s_bubbleGrabOff.x;
-                    s_bubblePos.y = bIo.MousePos.y - s_bubbleGrabOff.y;
-                    const ImVec2 disp = ImGui::GetIO().DisplaySize;
-                    const ImVec2 ws = ImGui::GetWindowSize();
-                    s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - ws.x));
-                    s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - ws.y));
-                    ImGui::SetWindowPos(s_bubblePos);
-                }
-            }
-            if (ImGui::IsItemDeactivated()) {
-                if (s_bubbleDragging) {
-                    editoraiSetSavedInt("eai-bubble-x", (int64_t)s_bubblePos.x);
-                    editoraiSetSavedInt("eai-bubble-y", (int64_t)s_bubblePos.y);
-                } else {
-                    g_st.panelOpen = !g_st.panelOpen;
-                }
-                s_bubbleDragging = false;
-            }
-            // Draw the round bubble (green tint while the panel is open).
-            ImVec2 center = ImVec2(c0.x + R, c0.y + R);
-            ImVec4 bBase = g_st.panelOpen ? COL_OK : COL_ACCENT;
-            auto* bDl = ImGui::GetWindowDrawList();
-            bDl->AddCircleFilled(center, R,
-                ImGui::GetColorU32(ImVec4(bBase.x, bBase.y, bBase.z, 0.95f * s_bubbleAlpha)), 32);
-            bDl->AddCircle(center, R - 1.f,
-                ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 0.85f * s_bubbleAlpha)), 32, 1.5f);
-            ImVec2 bTs = ImGui::CalcTextSize("AI");
-            bDl->AddText(ImVec2(center.x - bTs.x * 0.5f, center.y - bTs.y * 0.5f),
-                ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, s_bubbleAlpha)), "AI");
-        }
-        ImGui::End();
-        ImGui::PopStyleVar();
-    } else if (uiMobile()) {
-        // Bubble is hidden inside a level — reset the idle timer so it comes
-        // back fully opaque when gameplay ends.
-        s_bubbleLastTouch = ImGui::GetTime();
-        s_bubbleAlpha = 1.f;
-    }
+    // Floating bubble — the touch-device way in (no E key there). This is a
+    // NATIVE cocos button (Eclipse-style targeted touch delegate, created
+    // below), not an ImGui window: ImGui's touch emulation only delivers
+    // hover on the first tap, which forced a double-press before any drag.
+    // Raw touches drag from the very first press. Hidden completely inside
+    // levels, draggable (position saved), auto-dims to 50% after 5 s idle.
+#ifdef GEODE_IS_MOBILE
+    EAIBubble::get();
+#endif
 
     // "Go to level" — a finished generation is waiting for its target level.
     // Tiny, pinned bottom-right, never over GD's own corner buttons; inert
