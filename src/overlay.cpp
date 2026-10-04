@@ -2094,6 +2094,7 @@ void tabSettings() {
 
 // ── Main draw ─────────────────────────────────────────────────────────────────
 #ifdef GEODE_IS_MOBILE
+#include <Geode/loader/SceneManager.hpp>
 // ── Native cocos floating bubble (mobile) ────────────────────────────────────
 // Eclipse-style: a real CCMenu targeted touch delegate, NOT an ImGui window.
 // ImGui's touch emulation only delivers hover on the first tap, which forced
@@ -2167,24 +2168,24 @@ protected:
     bool init() override {
         if (!CCMenu::init()) return false;
         setZOrder(100);
-        setPosition({0, 0});
+        setPosition(CCPoint(0, 0));
         setID("eai-bubble"_spr);
         scheduleUpdate();
 
         m_sprite = CCSprite::createWithTexture(eaiMakeBubbleTexture());
         m_sprite->setScale(0.5f);   // 112 px art -> 56 px on screen
         CCSize win = CCDirector::get()->getWinSize();
-        m_sprite->setPosition(clampPos({
+        m_sprite->setPosition(clampPos(CCPoint(
             (float)editoraiGetSavedInt("eai-bubble-cx", 40),
             (float)editoraiGetSavedInt("eai-bubble-cy",
                 (int64_t)(win.height - 120))
-        }));
+        )));
         this->addChild(m_sprite);
 
         m_label = CCLabelBMFont::create("AI", "bigFont.fnt");
         m_label->setScale(0.6f);
         CCSize ss = m_sprite->getContentSize();
-        m_label->setPosition({ss.width / 2.f, ss.height / 2.f});
+        m_label->setPosition(CCPoint(ss.width / 2.f, ss.height / 2.f));
         m_sprite->addChild(m_label);
 
         CCScene::get()->addChild(this);
@@ -2241,7 +2242,7 @@ protected:
         if (ccpDistance(p, sp) > TOUCH_RADIUS) return false;
         m_haveMoved = false;
         m_pressPos = p;
-        m_grabOff = {p.x - sp.x, p.y - sp.y};
+        m_grabOff = CCPoint(p.x - sp.x, p.y - sp.y);
         poke();
         return true;   // claim the touch — it started inside the bubble
     }
@@ -2251,7 +2252,7 @@ protected:
         if (!m_haveMoved && ccpDistance(p, m_pressPos) < DRAG_SLOP) return;
         m_haveMoved = true;
         poke();
-        m_sprite->setPosition(clampPos({p.x - m_grabOff.x, p.y - m_grabOff.y}));
+        m_sprite->setPosition(clampPos(CCPoint(p.x - m_grabOff.x, p.y - m_grabOff.y)));
     }
 
     void ccTouchEnded(CCTouch*, CCEvent*) override {
