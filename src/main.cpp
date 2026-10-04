@@ -7735,7 +7735,7 @@ protected:
     struct TabUI { CCNode* on = nullptr; CCNode* off = nullptr; CCLabelBMFont* label = nullptr; };
     std::array<TabUI, 3> m_tabUI{};
 
-    struct TextRow  { std::string sid; TextInput* in; bool password; int maxLen = 200; };
+    struct TextRow  { std::string sid; TextInput* in; bool password; int maxLen = 200; bool revealed = false; CCMenuItemSpriteExtra* showBtn = nullptr; CCMenuItemSpriteExtra* hideBtn = nullptr; };
     struct IntRow   { std::string sid; TextInput* in; int64_t min, max, def; };
     // CycleRow stores a pointer to the value-display label so the arrow
     // handlers can update its text in place — no full tab rebuild on cycle.
@@ -8091,27 +8091,64 @@ protected:
                  const char* desc = nullptr) {
         auto row = makeRow(lbl, desc);
         float w = 150.f;
+        // Right edge of the text field. The Show/Hide key toggle (password
+        // rows) and the mobile Paste button live to its right.
+        float fieldRight = 354.f;
 #ifdef GEODE_IS_MOBILE
         // Narrow the field to make room for the paste button — many mobile
         // keyboards (especially on iOS) offer no paste action at all inside
         // GD text boxes.
         w = 104.f;
+        fieldRight = 296.f;
 #endif
+        if (password) {
+            // Make room for the Show/Hide toggle next to the field.
+            w = 118.f;
+            fieldRight = 296.f;
+#ifdef GEODE_IS_MOBILE
+            w = 70.f;
+            fieldRight = 210.f;
+#endif
+        }
         auto in = TextInput::create(w, ph, "bigFont.fnt");
         in->setScale(0.6f);
-#ifdef GEODE_IS_MOBILE
-        // Right edge pinned at x=296; the paste button owns x=300+.
-        in->setPosition({296.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
-#else
-        // Right edge pinned at x=354.
-        in->setPosition({354.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
-#endif
+        in->setPosition({fieldRight - (w * 0.6f) / 2.f, ROW_H / 2.f});
         in->setMaxCharCount(maxLen);
         if (password) in->setPasswordMode(true);
         std::string cur = geode::Mod::get()->getSettingValue<std::string>(sid);
         if (!cur.empty()) in->setString(cur);
         row->addChild(in);
         m_texts.push_back({sid, in, password, maxLen});
+        if (password) {
+            // Show/Hide toggle for masked keys: a masked field can't be
+            // proofread or repaired by hand, so reveal on demand. Keys stay
+            // masked whenever the popup (re)builds.
+            auto menu = CCMenu::create();
+            menu->setContentSize({56.f, ROW_H});
+            menu->ignoreAnchorPointForPosition(false);
+            menu->setAnchorPoint({0.5f, 0.5f});
+#ifdef GEODE_IS_MOBILE
+            menu->setPosition({240.f, ROW_H / 2.f});
+#else
+            menu->setPosition({326.f, ROW_H / 2.f});
+#endif
+            auto mkBtn = [this, sid](const char* txt, bool visible) {
+                auto spr = ButtonSprite::create(txt, "bigFont.fnt",
+                                                "GJ_button_04.png", 0.35f);
+                auto btn = CCMenuItemSpriteExtra::create(spr, this,
+                    menu_selector(AISettingsPopup::onToggleShowKey));
+                btn->setUserObject(CCString::create(sid));
+                btn->setPosition({28.f, ROW_H / 2.f});
+                btn->setVisible(visible);
+                return btn;
+            };
+            auto& tr = m_texts.back();
+            tr.showBtn = mkBtn("Show", true);
+            tr.hideBtn = mkBtn("Hide", false);
+            menu->addChild(tr.showBtn);
+            menu->addChild(tr.hideBtn);
+            row->addChild(menu);
+        }
 #ifdef GEODE_IS_MOBILE
         {
             auto menu = CCMenu::create();
@@ -8165,6 +8202,25 @@ protected:
         Notification::create("Pasted from clipboard", NotificationIcon::Success)->show();
     }
 #endif
+
+    // Show/Hide toggle for masked API key fields. Flips password mode and
+    // re-sets the string so the label redraws in the new mode (getString
+    // always returns the real text; only the display is masked).
+    void onToggleShowKey(CCObject* sender) {
+        auto* node = static_cast<CCNode*>(sender);
+        auto* str = static_cast<CCString*>(node ? node->getUserObject() : nullptr);
+        if (!str) return;
+        std::string sid = str->getCString();
+        for (auto& r : m_texts) {
+            if (r.sid != sid || !r.in) continue;
+            r.revealed = !r.revealed;
+            r.in->setPasswordMode(!r.revealed);
+            r.in->setString(std::string(r.in->getString()));
+            if (r.showBtn) r.showBtn->setVisible(!r.revealed);
+            if (r.hideBtn) r.hideBtn->setVisible(r.revealed);
+            break;
+        }
+    }
 
     void addInt(const char* lbl, const char* sid,
                 int64_t mn, int64_t mx, int64_t df,
