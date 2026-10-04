@@ -2973,7 +2973,55 @@ static std::string trimModelId(std::string s) {
     // users sometimes paste "models/gemini-..." for openai compat; keep but trim
     return s;
 }
+// One-time migration for retired model ids. mod.json defaults and presets now
+// track the latest ids from provider docs (e.g. claude-sonnet-5-5, gpt-6-astra,
+// gemini-3.8-flash), but users upgrading from older versions still have the
+// previous defaults stored (e.g. claude-sonnet-4-20250514, which is no longer
+// in any preset list and renders as a stray "custom..." entry). Map only those
+// exact retired defaults to their latest successors; arbitrary custom ids are
+// left untouched.
+static void migrateRetiredModelsOnce() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    try {
+        auto mod = Mod::get();
+        auto migrate = [&](const char* key, const std::string& cur, const std::string& latest,
+                           const std::vector<const char*>& retired) {
+            for (auto* r : retired) {
+                if (cur == r) {
+                    mod->setSettingValue<std::string>(key, latest);
+                    log::info("Migrated retired model '{}': '{}' -> '{}'", key, cur, latest);
+                    break;
+                }
+            }
+        };
+        migrate("claude-model", trimModelId(mod->getSettingValue<std::string>("claude-model")),
+            "claude-sonnet-5-5", {"claude-sonnet-4-20250514", "claude-sonnet-4-6", "claude-sonnet-4"});
+        {
+            std::string cur = trimModelId(mod->getSettingValue<std::string>("claude-model"));
+            if (cur == "claude-opus-4-6" || cur == "claude-opus-4")
+                { mod->setSettingValue<std::string>("claude-model", "claude-opus-5-5"); log::info("Migrated retired model 'claude-model': '{}' -> 'claude-opus-5-5'", cur); }
+        }
+        migrate("openai-model", trimModelId(mod->getSettingValue<std::string>("openai-model")),
+            "gpt-6-astra", {"gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini"});
+        migrate("gemini-model", trimModelId(mod->getSettingValue<std::string>("gemini-model")),
+            "gemini-3.8-flash", {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash", "gemini-3-pro"});
+        migrate("openrouter-model", trimModelId(mod->getSettingValue<std::string>("openrouter-model")),
+            "google/gemini-3.8-flash", {"google/gemini-2.5-flash"});
+        {
+            std::string cur = trimModelId(mod->getSettingValue<std::string>("openrouter-model"));
+            if (cur == "anthropic/claude-sonnet-4")
+                { mod->setSettingValue<std::string>("openrouter-model", "anthropic/claude-sonnet-5-5"); log::info("Migrated retired model 'openrouter-model': '{}' -> 'anthropic/claude-sonnet-5-5'", cur); }
+            else if (cur == "openai/gpt-4o")
+                { mod->setSettingValue<std::string>("openrouter-model", "openai/gpt-6-astra"); log::info("Migrated retired model 'openrouter-model': '{}' -> 'openai/gpt-6-astra'", cur); }
+        }
+        migrate("groq-model", trimModelId(mod->getSettingValue<std::string>("groq-model")),
+            "openai/gpt-oss-120b", {"moonshotai/kimi-k2-instruct", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"});
+    } catch (...) {}
+}
 static std::string getProviderModel(const std::string& provider) {
+    migrateRetiredModelsOnce();
     std::string raw;
     if (provider == "gemini")       raw = Mod::get()->getSettingValue<std::string>("gemini-model");
     else if (provider == "claude")       raw = Mod::get()->getSettingValue<std::string>("claude-model");
