@@ -2149,6 +2149,28 @@ protected:
     bool m_haveMoved = false;
 
 public:
+    // Central rule: the bubble is COMPLETELY hidden while a level is active
+    // (PlayLayer exists) and reappears only after the player exits the level.
+    // Called every frame from both get() (ImGui tick) and update() (cocos
+    // tick) so a missed scheduler tick or a scene-change flash can never
+    // leave it visible mid-attempt.
+    void refreshForScene() {
+        bool inLevel = PlayLayer::get() != nullptr;
+        if (inLevel) {
+            if (isVisible()) setVisible(false);
+            // Reset idle so it comes back fully opaque after the level ends.
+            m_idleT = 0.f;
+            m_opacityTarget = 1.f;
+            m_opacity = 1.f;
+            applyOpacity();
+        } else {
+            if (!isVisible()) {
+                setVisible(true);
+                poke();
+            }
+        }
+    }
+
     static EAIBubble* get() {
         static EAIBubble* s_inst = nullptr;
         if (!s_inst) {
@@ -2171,6 +2193,9 @@ public:
                     cur->addChild(s_inst);
                 }
             }
+            // Enforce hidden-in-level immediately (no 1-frame flash while
+            // waiting for the cocos update() tick).
+            s_inst->refreshForScene();
         }
         return s_inst;
     }
@@ -2226,17 +2251,11 @@ protected:
 
     void update(float dt) override {
         // Hidden completely inside any level — invisible, eats no taps.
-        if (PlayLayer::get()) {
-            setVisible(false);
-            // Reset the idle clock while hidden so the bubble comes back
-            // fully opaque when gameplay ends.
-            m_idleT = 0.f;
-            m_opacityTarget = 1.f;
-            m_opacity = 1.f;
-            applyOpacity();
-            return;
-        }
-        setVisible(true);
+        // refreshForScene() is the single source of truth (also called from
+        // get() every ImGui frame); update() just drives the idle-dim when
+        // visible.
+        refreshForScene();
+        if (!isVisible()) return;
         m_idleT += dt;
         if (m_idleT >= IDLE_DELAY) m_opacityTarget = DIM_OPACITY;
         if (m_opacity != m_opacityTarget) {
@@ -2248,6 +2267,7 @@ protected:
 
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
         if (!isVisible()) return false;
+        if (PlayLayer::get()) return false; // belt & suspenders: never eat taps in-level
         CCPoint p = convertToNodeSpace(touch->getLocation());
         CCPoint sp = m_sprite->getPosition();
         if (ccpDistance(p, sp) > TOUCH_RADIUS) return false;
