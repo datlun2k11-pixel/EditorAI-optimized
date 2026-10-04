@@ -1059,10 +1059,10 @@ void providerModelWidget(const std::string& p) {
             {"gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro", "gemma-4-31b-it"}, tip);
     else if (p == "claude")
         settingModelCombo("claude-model",
-            {"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"}, tip);
+            {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5"}, tip);
     else if (p == "openai")
         settingModelCombo("openai-model",
-            {"gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini"}, tip);
+            {"gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"}, tip);
     else if (p == "ministral")
         settingModelCombo("ministral-model",
             {"ministral-3b-latest", "ministral-8b-latest", "mistral-small-latest",
@@ -1079,8 +1079,8 @@ void providerModelWidget(const std::string& p) {
             {"meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"}, tip);
     else if (p == "openrouter")
         settingModelCombo("openrouter-model",
-            {"google/gemini-3.8-flash", "google/gemini-3.5-flash-lite", "google/gemma-4-31b-it", "anthropic/claude-sonnet-4",
-             "openai/gpt-4o", "meta-llama/llama-3.3-70b-instruct"}, tip);
+            {"google/gemini-3.8-flash", "google/gemini-3.5-flash-lite", "google/gemma-4-31b-it", "anthropic/claude-sonnet-5-5",
+             "openai/gpt-6-astra", "meta-llama/llama-3.3-70b-instruct"}, tip);
     else if (p == "ollama")
         ollamaModelSelector();
     else if (p == "lm-studio")

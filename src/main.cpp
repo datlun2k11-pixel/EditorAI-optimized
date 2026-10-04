@@ -1226,7 +1226,7 @@ inline bool supportsVision(const std::string& provider, const std::string& model
         return model.find(s) != std::string::npos;
     };
     if (provider == "openai")
-        return has("4o") || has("4.1") || has("vision");
+        return has("gpt-6") || has("gpt-5") || has("gpt-4") || has("4o") || has("4.1") || has("vision");
     // BYOPAK can front the same multimodal models. The locally tested Codex
     // OpenAI-compatible bridge exposes GPT-5/6 this way and accepts image_url
     // parts, so provider identity must not hide the vision tools.
@@ -8484,10 +8484,10 @@ protected:
         }
         else if (p == "claude")
             addModelChooser("claude-model", "type any Claude model id",
-                {"claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5"});
+                {"claude-sonnet-5-5","claude-opus-5-5","claude-haiku-4-5"});
         else if (p == "openai")
             addModelChooser("openai-model", "type any OpenAI model id",
-                {"gpt-4o","gpt-4.1-mini","gpt-4.1","o4-mini"});
+                {"gpt-6-astra","gpt-6.1-sol","gpt-6-luna"});
         else if (p == "ministral")
             addModelChooser("ministral-model", "type any Mistral model id",
                 {"ministral-3b-latest","ministral-8b-latest","mistral-small-latest",
@@ -8502,8 +8502,8 @@ protected:
         else if (p == "openrouter")
             addModelChooser("openrouter-model", "vendor/model-name",
                 {"google/gemini-3.8-flash","google/gemini-3.5-flash-lite",
-                 "google/gemma-4-31b-it","anthropic/claude-sonnet-4",
-                  "openai/gpt-4o","meta-llama/llama-3.3-70b-instruct"});
+                 "google/gemma-4-31b-it","anthropic/claude-sonnet-5-5",
+                  "openai/gpt-6-astra","meta-llama/llama-3.3-70b-instruct"});
         else if (p == "huggingface")
             addModelChooser("huggingface-model", "owner/repo",
                 {"meta-llama/Llama-3.1-8B-Instruct","Qwen/Qwen2.5-7B-Instruct"});

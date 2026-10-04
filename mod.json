@@ -227,12 +227,12 @@
    "type": "title",
    "name": "Provider — Claude"
   },
-  "claude-model": {
-   "type": "string",
-   "default": "claude-sonnet-4-20250514",
-   "name": "Claude Model",
-   "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Claude model id."
-  },
+   "claude-model": {
+    "type": "string",
+    "default": "claude-sonnet-5-5",
+    "name": "Claude Model",
+    "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any Claude model id."
+   },
   "claude-api-key": {
    "type": "string",
    "default": "",
@@ -243,12 +243,12 @@
    "type": "title",
    "name": "Provider — OpenAI"
   },
-  "openai-model": {
-   "type": "string",
-   "default": "gpt-4o",
-   "name": "OpenAI Model",
-   "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any OpenAI model id."
-  },
+   "openai-model": {
+    "type": "string",
+    "default": "gpt-6-astra",
+    "name": "OpenAI Model",
+    "description": "Use <cg>Fetch model list</c> in the in-mod Provider tab to pull the live list, or type any OpenAI model id."
+   },
   "openai-api-key": {
    "type": "string",
    "default": "",
