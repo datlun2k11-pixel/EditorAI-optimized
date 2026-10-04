@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <unordered_set>
 #include <cstring>
 #include <unordered_map>
@@ -2107,18 +2108,84 @@ void drawOverlay() {
         editoraiPersistSessionsIfDirty();
     }
 
-    // Floating bubble — the touch-device way in (no E key there). Hidden
-    // during gameplay: an always-on window would eat taps in its rect, and
-    // mid-attempt is never the moment.
+    // Floating bubble — the touch-device way in (no E key there).
+    // Hidden COMPLETELY inside any level (PlayLayer exists = playing a
+    // level): the window isn't even created, so it can never eat taps or
+    // cover gameplay. Draggable: hold and move to reposition (saved across
+    // restarts); a quick tap toggles the panel. Auto-dims to 50% opacity
+    // after 5 s without touching it; any touch/drag restores full opacity.
+    static ImVec2 s_bubblePos = ImVec2(8, 60);
+    static bool s_bubblePosLoaded = false;
+    static bool s_bubbleDragging = false;
+    static float s_bubbleDragDist = 0.f;
+    static double s_bubbleLastTouch = -1e9;
+    static float s_bubbleAlpha = 1.f;
     if (uiMobile() && !PlayLayer::get()) {
-        ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
+        double bNow = ImGui::GetTime();
+        float bDt = ImGui::GetIO().DeltaTime;
+        if (!s_bubblePosLoaded) {
+            s_bubblePosLoaded = true;
+            s_bubblePos.x = (float)editoraiGetSavedInt("eai-bubble-x", 8);
+            s_bubblePos.y = (float)editoraiGetSavedInt("eai-bubble-y", 60);
+            s_bubbleLastTouch = bNow;
+        }
+        // Fade toward the target instead of snapping so the dim feels soft.
+        float bTarget = (bNow - s_bubbleLastTouch > 5.0) ? 0.5f : 1.0f;
+        if (s_bubbleAlpha < bTarget)
+            s_bubbleAlpha = std::min(bTarget, s_bubbleAlpha + bDt * 2.f);
+        else if (s_bubbleAlpha > bTarget)
+            s_bubbleAlpha = std::max(bTarget, s_bubbleAlpha - bDt * 2.f);
+        {
+            const ImVec2 disp = ImGui::GetIO().DisplaySize;
+            s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - 52.f));
+            s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - 52.f));
+            ImGui::SetNextWindowPos(s_bubblePos, ImGuiCond_Always);
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s_bubbleAlpha);
         if (ImGui::Begin("##eaibubble", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
-                ImGuiWindowFlags_NoCollapse)) {
-            if (ImGui::Button("AI", ImVec2(44, 44)))
-                g_st.panelOpen = !g_st.panelOpen;
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::Button("AI", ImVec2(44, 44));
+            // Any touch on the bubble (hover, press, or drag) counts as
+            // interacting — restores full opacity immediately.
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                s_bubbleLastTouch = ImGui::GetTime();
+            // Tap-vs-drag: the button stays "active" while held, so finger
+            // movement accumulates here. Past the threshold it's a drag —
+            // follow the finger and skip the toggle on release.
+            if (ImGui::IsItemActive()) {
+                const ImVec2 d = ImGui::GetIO().MouseDelta;
+                s_bubbleDragDist += std::fabs(d.x) + std::fabs(d.y);
+                if (s_bubbleDragDist > 8.f) {
+                    s_bubbleDragging = true;
+                    s_bubblePos.x += d.x;
+                    s_bubblePos.y += d.y;
+                    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+                    const ImVec2 ws = ImGui::GetWindowSize();
+                    s_bubblePos.x = std::clamp(s_bubblePos.x, 0.f, std::max(0.f, disp.x - ws.x));
+                    s_bubblePos.y = std::clamp(s_bubblePos.y, 0.f, std::max(0.f, disp.y - ws.y));
+                    ImGui::SetWindowPos(s_bubblePos);
+                }
+            }
+            if (ImGui::IsItemDeactivated()) {
+                if (s_bubbleDragging) {
+                    editoraiSetSavedInt("eai-bubble-x", (int64_t)s_bubblePos.x);
+                    editoraiSetSavedInt("eai-bubble-y", (int64_t)s_bubblePos.y);
+                } else {
+                    g_st.panelOpen = !g_st.panelOpen;
+                }
+                s_bubbleDragging = false;
+                s_bubbleDragDist = 0.f;
+            }
         }
         ImGui::End();
+        ImGui::PopStyleVar();
+    } else if (uiMobile()) {
+        // Bubble is hidden inside a level — reset the idle timer so it comes
+        // back fully opaque when gameplay ends.
+        s_bubbleLastTouch = ImGui::GetTime();
+        s_bubbleAlpha = 1.f;
     }
 
     // "Go to level" — a finished generation is waiting for its target level.
