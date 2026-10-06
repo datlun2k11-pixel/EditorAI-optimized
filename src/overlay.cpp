@@ -2308,8 +2308,15 @@ protected:
         poke();
     }
 
-    void ccTouchCancelled(CCTouch* touch, CCEvent* event) override {
-        ccTouchEnded(touch, event);
+    void ccTouchCancelled(CCTouch*, CCEvent*) override {
+        // A cancelled gesture (system interruption, notification shade,
+        // multi-touch preemption, ...) is NOT a tap and NOT a completed
+        // drag: never toggle the panel and never persist a mid-drag bubble
+        // position. Just roll back to the pre-press position and clear the
+        // active-touch state.
+        if (m_sprite) m_sprite->setPosition(m_homePos);
+        m_haveMoved = false;
+        poke();
     }
 
     void registerWithTouchDispatcher() override {
