@@ -8,7 +8,7 @@
  },
  "id": "entity12208.edit-ai",
  "name": "Editor AI",
- "version": "v2.1.11",
+ "version": "v2.1.12",
  "developer": "entity12208",
  "description": "Generate Geometry Dash levels using AI!",
  "dependencies": {
@@ -341,7 +341,7 @@
   },
   "ollama-model": {
    "type": "string",
-   "default": "entity12208/editorai:deepseek",
+            "default": "entity12208/editorai:v2",
    "name": "Ollama Model Tag",
    "description": "Tag as shown by `ollama list`. e.g. entity12208/editorai:v3-7b."
   },
