@@ -2118,8 +2118,11 @@ CCTexture2D* eaiMakeBubbleTexture() {
             float d = std::sqrt(dx * dx + dy * dy);
             float a = std::clamp(R - d, 0.f, 1.f);
             unsigned char r, g, b;
-            if (d > R - RING) { r = g = b = 255; }      // white ring
-            else { r = 92; g = 176; b = 255; }          // accent fill
+            // Match inner panel: dark navy fill (COL_BG ~ #171A1F) + accent ring
+            // (#5CB0FF = COL_ACCENT). Was: white ring + light-blue fill, which
+            // clashed with the dark UI.
+            if (d > R - RING) { r = 92; g = 176; b = 255; }   // accent ring
+            else { r = 22; g = 25; b = 31; }                  // dark fill
             size_t i = ((size_t)y * S + x) * 4;
             data[i] = r; data[i + 1] = g; data[i + 2] = b;
             data[i + 3] = (unsigned char)(a * 255.f);
